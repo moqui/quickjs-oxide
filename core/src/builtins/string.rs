@@ -489,6 +489,10 @@ pub(super) fn substr(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     substring_value(cx, string, start as usize, end as usize)
 }
 
+/// The longest result [`concat`] joins flat in one allocation; a longer
+/// one is built of ropes.
+const FLAT_CONCAT_MAX: usize = 1024;
+
 /// One argument of [`concat`] after `ToString`: a string, or an int32
 /// whose digits need no string of their own.
 #[derive(Clone, Copy)]
@@ -534,6 +538,25 @@ pub(super) fn concat(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     }
     if len == first_len {
         return Ok(Value::string(string));
+    }
+    if len >= FLAT_CONCAT_MAX {
+        // A long result joins as `+` does, through ropes: a long receiver is
+        // neither flattened nor copied.
+        let mut sum = string;
+        for &part in parts.iter() {
+            let part = match part {
+                Part::String(id) => id,
+                Part::Int(n) => {
+                    let digits = ops::alloc_digits(cx, &ops::Digits::new(n))?;
+                    cx.heap.roots().push(digits);
+                    digits.as_string().expect("a string")
+                }
+            };
+            let joined = ops::concat(cx, sum, part)?;
+            cx.heap.roots().push(joined);
+            sum = joined.as_string().expect("a string");
+        }
+        return Ok(Value::string(sum));
     }
     let heap = &*cx.heap;
     let first = std::iter::once(Part::String(string));
