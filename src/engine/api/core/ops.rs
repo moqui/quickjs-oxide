@@ -12,6 +12,7 @@ use super::RuntimeError;
 use super::buffer::{TypedArrayKind, TypedArrayView};
 use super::compile::{ScriptCompileError, compile_script, syntax_location};
 use super::context::{Context, EvalOptions, FunctionBytecodeRef, ModuleBytecodeRef, QjsHelpers};
+use super::exotic::{ExoticClass, ExoticScope, HostClass};
 use super::function::{FunctionOptions, HostFunction, Raw, Scope, host_body};
 use super::promise::PromiseCapability;
 use super::property::{
@@ -193,6 +194,15 @@ impl View<'_> {
 
     /// The API key of a core key.
     pub(crate) fn lift_key(&mut self, key: oxide_core::PropertyKey) -> JsResult<PropertyKey> {
+        // A string key is copied from its flat representation once.
+        if let oxide_core::heap::atom::KeyKind::String(id) = key.kind() {
+            let text = match self.core.string_repr(oxide_core::Value::string(id)) {
+                Some(StringRepr::OneByte(units)) => JsString::try_from_latin1(units)?,
+                Some(StringRepr::TwoByte(units)) => JsString::try_from_utf16_slice(units)?,
+                None => JsString::from_static(""),
+            };
+            return Ok(PropertyKey(Key::String(text)));
+        }
         Ok(match self.core.key_name(key) {
             oxide_core::KeyName::Index(index) => PropertyKey(Key::Index(index)),
             oxide_core::KeyName::String(units) => {
@@ -242,7 +252,7 @@ impl View<'_> {
     /// A descriptor in the core's form, its values rooted until the view
     /// drops. Accessor fields that are not callable were rejected by the
     /// type already.
-    fn lower_descriptor(
+    pub(crate) fn lower_descriptor(
         &mut self,
         descriptor: &OrdinaryPropertyDescriptor,
     ) -> JsResult<oxide_core::PropertyDescriptor> {
@@ -1168,11 +1178,12 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for super::Context {}
     impl Sealed for super::Scope<'_> {}
+    impl Sealed for super::ExoticScope<'_> {}
 }
 
 /// Lists every shared operation once, with its documentation, and emits it
 /// as an inherent method of `Context` (one entry each, `Reentered` inside a
-/// host function), an inherent method of `Scope` (on the host function's
+/// host function unless it lends the engine), an inherent method of `Scope` (on the host function's
 /// view) and a method of [`Js`]. `Context` takes `&self`: its state is the
 /// runtime's, behind the `Rc`.
 macro_rules! js_ops {
@@ -1184,13 +1195,22 @@ macro_rules! js_ops {
             $(
                 $(#[$doc])*
                 pub fn $name $(<$($generic)*>)? (&self $(, $arg: $ty)*) -> $ret {
-                    let mut entry = self.runtime.enter()?;
+                    let mut entry = self.runtime.engine()?;
                     entry.view().$name($($arg),*)
                 }
             )*
         }
 
         impl Scope<'_> {
+            $(
+                $(#[$doc])*
+                pub fn $name $(<$($generic)*>)? (&mut self $(, $arg: $ty)*) -> $ret {
+                    self.view().$name($($arg),*)
+                }
+            )*
+        }
+
+        impl ExoticScope<'_> {
             $(
                 $(#[$doc])*
                 pub fn $name $(<$($generic)*>)? (&mut self $(, $arg: $ty)*) -> $ret {
@@ -1238,13 +1258,25 @@ macro_rules! js_ops {
                 Scope::throw_error(self, kind, message)
             }
         }
+
+        impl Js for ExoticScope<'_> {
+            $(
+                fn $name $(<$($generic)*>)? (&mut self $(, $arg: $ty)*) -> $ret {
+                    ExoticScope::$name(self $(, $arg)*)
+                }
+            )*
+
+            fn throw_error(&mut self, kind: NativeErrorKind, message: &str) -> RuntimeError {
+                ExoticScope::throw_error(self, kind, message)
+            }
+        }
     };
 }
 
 impl Context {
     /// [`Js::throw_error`].
     pub fn throw_error(&self, kind: NativeErrorKind, message: &str) -> RuntimeError {
-        match self.runtime.enter() {
+        match self.runtime.engine() {
             Ok(mut entry) => entry.view().throw_error(kind, message),
             Err(error) => error,
         }
@@ -1252,6 +1284,13 @@ impl Context {
 }
 
 impl Scope<'_> {
+    /// [`Js::throw_error`].
+    pub fn throw_error(&mut self, kind: NativeErrorKind, message: &str) -> RuntimeError {
+        self.view().throw_error(kind, message)
+    }
+}
+
+impl ExoticScope<'_> {
     /// [`Js::throw_error`].
     pub fn throw_error(&mut self, kind: NativeErrorKind, message: &str) -> RuntimeError {
         self.view().throw_error(kind, message)
@@ -1427,7 +1466,19 @@ js_ops! {
     /// An object inheriting from `prototype` (`None` for null) holding
     /// `value`, which drops when the object is collected.
     fn new_host_object[T: 'static](&mut self, value: T, prototype: Option<&ObjectRef>) -> JsResult<ObjectRef>;
-    /// The value a host object holds; `None` for an ordinary object or a
-    /// value of another type.
+    /// The value a host object or a host exotic object holds; `None` for
+    /// an ordinary object or a value of another type.
     fn host_data[T: 'static](&mut self, object: &ObjectRef) -> JsResult<Option<Rc<T>>>;
+
+    // ---- host exotic objects ----
+
+    /// Registers `class`, whose hooks are the internal methods of the
+    /// objects made with the returned [`HostClass`]. A class lives as long
+    /// as the runtime; register it once.
+    fn register_exotic_class[C: ExoticClass](&mut self, class: C) -> JsResult<HostClass<C>>;
+    /// An object of `class` inheriting from `prototype` (`None` for null)
+    /// holding `value` ([`Js::host_data`]), which drops when the object is
+    /// collected. Its property operations run the class's hooks, and no
+    /// inline cache fills for it or through it.
+    fn new_host_exotic[C: ExoticClass](&mut self, value: C::Data, class: &HostClass<C>, prototype: Option<&ObjectRef>) -> JsResult<ObjectRef>;
 }

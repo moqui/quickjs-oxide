@@ -94,12 +94,70 @@ impl Scope<'_> {
         Ok(())
     }
 
+    /// Lends this host function's engine to the Rust code `f` runs, which
+    /// has no way to reach this scope: while `f` runs, every `Context` and
+    /// `Runtime` operation of this runtime (`eval`, `compile`, `call`,
+    /// `run_pending_job`, the property and value operations) enters the
+    /// engine this function runs on, above its frames, instead of returning
+    /// `Reentered`. That is how a script → host function → Rust service →
+    /// script chain runs on one runtime. The scope itself is not usable
+    /// until `f` returns; a host function `f` reaches can lend again.
+    ///
+    /// As inside a host function, code compiled while lent is transient,
+    /// modules are `Unsupported`, an exception or an interrupt from a nested
+    /// call returns as its `RuntimeError` (return it to keep unwinding), and
+    /// collection, the reports, the options and the module loader stay at
+    /// the top level (`Reentered`). A lend costs two swaps of the heap's and
+    /// the services' headers (about 0.2 µs).
+    pub fn lend<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        lend(&mut self.core, &self.shared, f)
+    }
+
     /// The value a host object receiver holds ([`Js::host_data`](super::Js::host_data) of
     /// `this`); `None` when the receiver is not a host object of `T`.
     pub fn this_host_data<T: 'static>(&mut self) -> JsResult<Option<Rc<T>>> {
         match self.this() {
             Value::Object(object) => self.host_data::<T>(&object),
             _ => Ok(None),
+        }
+    }
+}
+
+/// Lends `core`'s engine to `f` ([`Scope::lend`]).
+pub(crate) fn lend<R>(core: &mut NativeCx<'_>, shared: &Shared, f: impl FnOnce() -> R) -> R {
+    let spare = shared.spares.borrow_mut().pop().unwrap_or_default();
+    let lent = core.lend(spare);
+    let previous = shared.lent.replace(Some(lent));
+    let restore = Restore {
+        core,
+        shared,
+        previous,
+    };
+    let result = f();
+    drop(restore);
+    result
+}
+
+/// Takes back a lent engine when [`Scope::lend`]'s closure returns or
+/// unwinds.
+struct Restore<'s, 'a> {
+    core: &'s mut NativeCx<'a>,
+    shared: &'s Shared,
+    previous: Option<oxide_core::Lent>,
+}
+
+impl Drop for Restore<'_, '_> {
+    fn drop(&mut self) {
+        // An entry still holding the engine dropped before this guard, on
+        // return and on unwinding alike, and gave it back.
+        let lent = std::mem::replace(&mut *self.shared.lent.borrow_mut(), self.previous.take());
+        match lent {
+            Some(lent) => {
+                let spare = self.core.restore(lent);
+                self.shared.spares.borrow_mut().push(spare);
+            }
+            // Lost: the host function's view holds the spare.
+            None => self.shared.poisoned.set(true),
         }
     }
 }
@@ -163,7 +221,7 @@ where
 }
 
 /// Marks the runtime poisoned when a panic unwinds through a host function.
-struct PoisonGuard<'a>(&'a Shared);
+pub(crate) struct PoisonGuard<'a>(pub(crate) &'a Shared);
 
 impl Drop for PoisonGuard<'_> {
     fn drop(&mut self) {
@@ -211,7 +269,7 @@ pub(crate) fn host_body<Args>(
 }
 
 /// The throw a host function's error becomes.
-fn error_throw(view: &mut View<'_>, error: RuntimeError) -> oxide_core::Throw {
+pub(crate) fn error_throw(view: &mut View<'_>, error: RuntimeError) -> oxide_core::Throw {
     let thrown = match error {
         RuntimeError::Exception(value) => view.lower(&value),
         // A nested call was interrupted: the interrupt keeps unwinding, the

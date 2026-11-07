@@ -311,8 +311,8 @@ pub struct Runtime {
     pub(crate) heap: Heap,
     /// The units published before the program runs. Beside the heap, not in
     /// it: the main loop borrows the running unit's code across heap calls.
-    pub(crate) code: CodeStore,
-    pub(crate) realm: Realm,
+    pub(crate) code: std::rc::Rc<CodeStore>,
+    pub(crate) realm: std::rc::Rc<Realm>,
     pub(crate) host: Services,
 }
 
@@ -461,8 +461,8 @@ impl Runtime {
         };
         let mut runtime = Runtime {
             heap,
-            code: CodeStore::default(),
-            realm,
+            code: std::rc::Rc::new(CodeStore::default()),
+            realm: std::rc::Rc::new(realm),
             host: Services::default(),
         };
         let out_of_memory = crate::builtins::install(&mut runtime.cx())?;
@@ -487,6 +487,8 @@ impl Runtime {
             static_code: &self.code,
             realm: &self.realm,
             host: &mut self.host,
+            code_owner: &self.code,
+            realm_owner: &self.realm,
         }
     }
 
@@ -689,7 +691,14 @@ impl Runtime {
     /// live as long as the runtime (in the code store, where the loop runs
     /// them as a plain borrow): the program and its modules.
     pub fn compiler(&mut self) -> crate::vm::compile::Compiler<'_> {
-        crate::vm::compile::Compiler::owned(&mut self.heap, &mut self.code, &self.realm)
+        // The store is shared only while a host function lends the engine,
+        // when no compilation here runs; were it shared, the code would be
+        // transient.
+        if std::rc::Rc::get_mut(&mut self.code).is_none() {
+            return crate::vm::compile::Compiler::new(&mut self.heap, &self.code, &self.realm);
+        }
+        let code = std::rc::Rc::get_mut(&mut self.code).expect("an unshared code store");
+        crate::vm::compile::Compiler::owned(&mut self.heap, code, &self.realm)
     }
 
     /// [`Runtime::compiler`] for code the embedder compiles and lets go of (a

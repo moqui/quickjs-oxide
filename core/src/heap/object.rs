@@ -29,9 +29,11 @@ pub enum ObjectKind {
     /// the key snapshot, slot 0 the object, slot 1 the key count, `payload` the
     /// cursor.
     ForInIterator,
-    /// A plain kind no builtin allocates: a host function is a
-    /// [`ObjectKind::Function`] with a `native` index.
-    Native,
+    /// An embedder's exotic object: its internal methods are the hooks of
+    /// a host class (`vm::exotic`), its record's datum is
+    /// `InternalData::HostExotic` (tag `InternalTag::HostData`). Index keys
+    /// it stores ordinarily are named properties.
+    HostExotic,
     /// `new String(s)`: internal slot 0 the string. Its indices are exotic;
     /// `length` is an own data property.
     StringWrapper,
@@ -82,6 +84,7 @@ impl ObjectKind {
                 | ObjectKind::TypedArray
                 | ObjectKind::ModuleNamespace
                 | ObjectKind::Builtin
+                | ObjectKind::HostExotic
         )
     }
 
@@ -117,6 +120,7 @@ impl ObjectKind {
                 | ObjectKind::Proxy
                 | ObjectKind::TypedArray
                 | ObjectKind::ModuleNamespace
+                | ObjectKind::HostExotic
         )
     }
 }
@@ -329,7 +333,8 @@ pub enum InternalTag {
     /// An object the `Iterator` constructor made for a subclass: QuickJS's
     /// `JS_CLASS_ITERATOR`, which its printer names.
     Iterator,
-    /// An embedder's host object: its datum is `InternalData::HostData`.
+    /// An embedder's host object: its datum is `InternalData::HostData`, or
+    /// `InternalData::HostExotic` for a host exotic object.
     HostData,
 }
 
@@ -360,6 +365,9 @@ pub enum InternalData {
     /// An embedder's value attached to a host object
     /// (`InternalTag::HostData`).
     HostData(std::rc::Rc<dyn std::any::Any>),
+    /// A host exotic object's class and datum (`InternalTag::HostData` of
+    /// an `ObjectKind::HostExotic`).
+    HostExotic(crate::vm::exotic::HostExotic),
 }
 
 /// The internal slots of a suspended activation before its registers: the
@@ -404,7 +412,8 @@ impl Internal {
                 | InternalData::View(_)
                 | InternalData::Module(_)
                 | InternalData::HostFn(_)
-                | InternalData::HostData(_) => 0,
+                | InternalData::HostData(_)
+                | InternalData::HostExotic(_) => 0,
                 InternalData::Exports(keys) => keys.len() * 8,
                 InternalData::Buffer(buffer) => buffer.owned_bytes(),
                 InternalData::Bytes(bytes) => bytes.capacity(),

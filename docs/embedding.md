@@ -11,19 +11,21 @@ Every crate keeps `unsafe_code = "forbid"`, and a runtime has one realm.
 | `builtins` (`natives!`) | `quickjs-oxide-core` | `Native::HostFunction`, `Native::HostConstructor` |
 | `heap::object` | `quickjs-oxide-core` | `InternalData::HostFn`, `InternalData::HostData`, `InternalTag::HostData` |
 | `vm::native` | `quickjs-oxide-core` | `HostFn`, `HostBody`, `NativeCall`, the trampoline `host_call` |
+| `vm::exotic` | `quickjs-oxide-core` | `ExoticHooks`, `ExoticClass`, `HostExotic`, the hook dispatch `vm::object` calls for `ObjectKind::HostExotic` |
 | `embed` | `quickjs-oxide-core` | `NativeCx`, which holds every embedder operation (`Runtime` delegates to it); host functions and objects, promise capabilities, the buffer operations, the interrupt flag |
 | `vm::error`, `vm::interp`, `bytecode` | `quickjs-oxide-core` | `vm.interrupted`, `poll_interrupts`, `catchable`, the uncatchable unwind, `Opcode::JmpBack`, the poll counter |
 | `host` | `quickjs-oxide-core` | `Host::interrupt` |
 | `vm::module` | `quickjs-oxide-core` | `ModuleSource::Synthetic` |
 | `api::core::ops` | root crate | `View`, the `js_ops!` macro, the `Js` trait |
 | `api::core::function` | root crate | `Scope`, `FunctionOptions`, `HostFunction`, the body wrapper |
+| `api::core::exotic` | root crate | `ExoticClass`, `Hook`, `HostClass`, `ExoticScope`, the hooks wrapper |
 | `api::core::value`, `api::core::runtime` | root crate | `Weak` slots, `Poisoned`, `InterruptHandle` |
 | `api::core::error` | root crate | `Exception(Value)`, `Interrupted`, `Poisoned` |
 | `api::core::module` | root crate | `ModuleScope`, `ModuleSource::Synthetic`, `Context::define_module` |
 | `api::core::promise`, `api::core::buffer`, `api::core::convert` | root crate | `PromiseCapability`; `TypedArrayView`, `TypedArrayKind`; `FromJs`, `IntoJs` and the typed `HostFunction` impls |
 | `src/engine/compiler/register` | root crate | the lowering emits `JmpBack` for a backward `Jmp` |
 
-The tests are `core/tests/host.rs` (the core's host functions and objects) and `tests/embedding_api.rs` (the API).
+The tests are `core/tests/host.rs` (the core's host functions and objects), `tests/embedding_api.rs` (the API), `tests/host_exotic.rs` (host exotic objects) and `tests/reentry.rs` (lending the engine).
 
 ## Host functions in the core
 
@@ -41,11 +43,46 @@ The body is an `Rc` because a host function is re-entrant: JavaScript calls it, 
 
 A host object is an `ObjectKind::Builtin` object with the embedder's prototype and an `InternalTag::HostData` record. It prints as `Object { … }`, is `[object Object]` to `Object.prototype.toString` unless its prototype defines `Symbol.toStringTag`, and is `typeof` `"object"`. `host_data` returns the datum as an `Rc`, so the API hands out a clone without borrowing the heap across the embedder's code. A `Drop` of a datum that releases an `ObjectRef` of the same runtime is deferred like any release made while the runtime is borrowed; a `Drop` that calls an API method gets `RuntimeError::Reentered`.
 
+## Host exotic objects
+
+A host exotic object's property operations are the embedder's Rust hooks, as QuickJS's `JSClassExoticMethods` are: `[[GetOwnProperty]]`, `[[DefineOwnProperty]]`, `[[HasProperty]]`, `[[Get]]` and `[[Set]]` with their receiver, `[[Delete]]` and `[[OwnPropertyKeys]]`. Its uses are a resolver of bare global names (the global object's prototype), records whose fields live in Rust, and maps converted on first read.
+
+**The class.** The embedder implements `ExoticClass` (its `Data` type and the hooks it needs) and registers it once with `register_exotic_class`, which returns a `HostClass<C>`; `new_host_exotic(value, &class, prototype)` makes an object of it, and `host_data::<C::Data>` reads its datum back as for a host object. In the core a class is an index into `Services::exotic_classes` (an `Rc<dyn ExoticHooks>` each, living as long as the runtime), and an object is an `ObjectKind::HostExotic` with an `InternalTag::HostData` record whose datum is `InternalData::HostExotic { class, data }`: the class costs the record no space beyond the host object's.
+
+**Declining.** Each hook returns `Hook::Handled(answer)` or `Hook::Ordinary`, which runs the ordinary internal method on the object, as QuickJS does for a method a class leaves `NULL`. `get`, `set` and `has` answer for the whole chain; when they decline, the ordinary method asks `get_own_property` (whose own decline reads the object's ordinary properties) and continues to the prototype. A `set` that declines is `OrdinarySet`, which ends in the receiver's `[[GetOwnProperty]]` and `[[DefineOwnProperty]]`; a class that answers only `get_own_property` and `define_own_property` is complete. A `define_own_property` or `delete` that declines is the ordinary method over the class's `[[GetOwnProperty]]` answer (`ValidateAndApplyPropertyDescriptor`, `OrdinaryDelete`), so a property it reports non-configurable stays; an accepted definition is stored ordinarily. `own_keys`' list and the ordinary own keys are merged without repeats in an ordinary object's order: integer indices ascending, then strings, then symbols. The engine checks none of a proxy's invariants against the answers.
+
+```rust
+struct Names;
+impl ExoticClass for Names {
+    type Data = RefCell<HashMap<JsString, Value>>;
+    fn has(&self, _: &mut ExoticScope<'_>, map: &Self::Data, key: &PropertyKey) -> JsResult<Hook<bool>> {
+        let found = key.to_js_string().is_some_and(|name| map.borrow().contains_key(&name));
+        // Not ours: `Object.prototype` behind the object answers.
+        Ok(if found { Hook::Handled(true) } else { Hook::Ordinary })
+    }
+    fn get(&self, _: &mut ExoticScope<'_>, map: &Self::Data, key: &PropertyKey) -> JsResult<Hook<Value>> {
+        let found = key.to_js_string().and_then(|name| map.borrow().get(&name).cloned());
+        Ok(found.map_or(Hook::Ordinary, Hook::Handled))
+    }
+}
+let class = context.register_exotic_class(Names)?;
+let names = context.new_host_exotic(RefCell::default(), &class, Some(&context.object_prototype()?))?;
+context.set_prototype_of(&context.global_object()?, Some(&names))?;
+```
+
+`examples/exotic_globals.rs` runs this with a `set` and times it.
+
+**`ExoticScope`.** A hook runs with an `ExoticScope`, a third handle beside `Context` and `Scope` that `js_ops!` gives every operation of `Js`, so a hook makes values, calls functions, evaluates and throws as a host function does. It reads the exotic object (`this`) and the `[[Get]]` or `[[Set]]` receiver (`receiver`, `receiver_is_this`) on demand, so a hook that does not ask makes no handle; the key arrives as a `PropertyKey`, copied once from the atom's flat text.
+
+**In the engine.** `vm::object`'s internal methods take the hook path for the kind beside the `Proxy` arms. The kind is in `ObjectKind::is_exotic`, so `vm::property`'s heap-only walks, the named and global inline caches and the element fast paths leave for those methods when they meet it on an object or a prototype, and no cache entry is filled for it or through it: a hook's answer is read on every access. It is not in `has_elements`, so an index the ordinary fallback stores is a named property, which the element fast paths do not read. A bare name the global object does not hold goes, as through a `Proxy`, to `has` and then `get` (`typeof` of a name `has` denies is `"undefined"`); a strict assignment asks `has` before `set` and throws `ReferenceError` on `false`; a sloppy one calls `set` with the global object as receiver; `delete name` deletes from the global object and does not reach the prototype.
+
+**The call.** `vm::exotic::invoke` clones the class's `Rc` out of the services (the heap is free while it runs), enters through `enter_native` (so a hook that recurses through itself throws `InternalError: stack overflow`), roots the object, the key and the values passed, and cuts the root stack back when the hook returns. The API's wrapper is the host function wrapper's: it holds the runtime weakly, its guard poisons the runtime when a hook panics, it translates an error into a throw by the same table, and it releases the handles the hook dropped.
+
 ## The API layer
 
 **One set of operations, two handles.** Every `Context` method borrows the runtime's cell for one entry, so inside a host function a `Context` method returns `Reentered`; a host function works through its `Scope`. Both run their operations on an internal `View`: a `NativeCx`, the runtime's shared state, and a root mark at which the root stack is cut back when the view drops, so temporaries a `lower` creates (a string, a BigInt, an atom) live until the operation ends. The macro `js_ops!` lists each operation once and emits the inherent methods of `Context` (`&self`, one entry each), the inherent methods of `Scope` (`&mut self`, a reborrow of its `NativeCx`), and the sealed trait `Js` for code generic over where it runs. A macro cannot give one list's methods different receivers, which is why every `Context` method takes `&self`.
 
-The job queue, the module loader, the collector, the reports and the options are not in `Js`: they belong to the runtime boundary, and a host function that needs the job queue returns to the embedder, which drains it. Inside a host function, `eval` and `compile` make transient code, and `compile_module` and `execute_module` return `RuntimeError::Unsupported("modules inside a host function")`, because a module's units go into the code store the running loop holds.
+The job queue, the module loader, the collector, the reports and the options are not in `Js`: they belong to the runtime boundary. A host function that needs the job queue either returns to the embedder, which drains it, or lends the engine and drains it from there ([Lending the engine](#lending-the-engine)). Inside a host function, `eval` and `compile` make transient code, and `compile_module` and `execute_module` return `RuntimeError::Unsupported("modules inside a host function")`, because a module's units go into the code store the running loop holds.
 
 **`Scope` and `FunctionOptions`.** A `Scope` reads its call on demand (`this`, `arg`, `argc`, `args`, `new_target`, `is_construct`, `callee`, `data`, `set_data`, `this_host_data`), so a function that takes three integers makes no handle and copies no string. `FunctionOptions` gives the `name`, `length`, whether `new` may call the function, and its captured values. A closure passed to `new_function` writes its parameter type (`|scope: &mut Scope<'_>|`): the bound is reached through the `HostFunction` impl, and the compiler does not infer the higher-ranked signature from it.
 
@@ -62,6 +99,26 @@ The job queue, the module loader, the collector, the reports and the options are
 After each call it moves the handles released during the call into the core's handle table, so a script that calls a host function millions of times with object arguments keeps the handles of one call, not of all of them. A guard whose `Drop` sees `std::thread::panicking()` marks the runtime poisoned.
 
 **Handles do not keep the runtime alive.** `Slot` holds a `Weak<Shared>`. A closure stored in the heap that captured an `ObjectRef` would otherwise make the cycle closure → handle → runtime → heap → closure, and the runtime would never drop. A value used after its runtime dropped gets `RuntimeError::Invariant("a value of a dropped runtime")`. A captured handle is a root while its function lives; a JavaScript value the collector should see goes in `FunctionOptions::data`.
+
+## Lending the engine
+
+A host function's `Scope` is a borrow of the running loop's engine, and safe Rust gives code deeper on the stack no way to reach a borrow that was not passed to it. An embedder whose host function calls its own service layer, which runs another script on the same runtime with only a `Context` in hand (script → host function → service → script), therefore gets `Reentered` from that `Context`. `Scope::lend(f)` passes the engine on through the runtime instead: while `f` runs, the runtime's `Context` and `Runtime` operations enter it.
+
+```rust
+context.define_function(&global, "callService", 1, move |scope: &mut Scope<'_>| {
+    let name = scope.arg(0);
+    let name = scope.to_js_string(&name)?.to_utf8_lossy();
+    // `services` holds a Context; it runs scripts, calls functions and
+    // drains jobs while lent.
+    scope.lend(|| services.call(&name))
+})?;
+```
+
+**The mechanism.** `NativeCx::lend` swaps the heap and the services out of the host function's view into a core `Lent`, leaving a `Spare`'s empty heap and default services behind, and clones the shared owners of the code store and the realm (`Runtime::code` and `Runtime::realm` are `Rc`s for this; `Cx` carries `code_owner` and `realm_owner` beside the plain borrows the loop reads). The API puts the `Lent` in `Shared::lent`; `Runtime::engine`, which every `Context` operation and the runtime's value, property and job operations use, starts a top-level entry when the runtime's cell is free and otherwise takes the `Lent` for the duration of the entry (`LentEntry`), building a `NativeCx` over it whose code view is shared, as a host function's is. When `f` returns or unwinds, a guard swaps the heap and the services back and keeps the spare for the next lend. Nothing is copied but the two structures' headers: the frames, the register file, the root stack and the handle table live in the heap, so a nested call runs above the host function's frames exactly as a call from its `Scope` would, against the same native-stack budget. A host function a nested script calls can lend again. A host exotic object's hook lends the same way, through `ExoticScope::lend`.
+
+**What runs.** Inside a lend, as inside a host function: `eval` and `compile` make transient code, the module operations return `Unsupported`, an exception returns as `RuntimeError::Exception` and an interrupt as `RuntimeError::Interrupted` with the flag still set (the host function returns it to keep unwinding; no `catch` runs), and `run_pending_job`, `run_jobs` and `is_job_pending` work on the shared queue (a nested job leaves `ClearKeptObjects` to the outermost script or job). Collection, the reports, the options, `define_module` and the Test262 host stay at the top level and return `Reentered`. `Runtime::is_lent` reports a lend in progress. A panic in `f` unwinds through the guard, which gives the engine back, and the host function's poison guard poisons the runtime.
+
+**Cost.** In a release build a host function that lends and returns costs about 0.2 µs more than one that does not (30 ns): the two swaps of the heap's and the services' headers into a boxed spare. A nested `eval("1")` through the lend costs about 3.3 µs.
 
 **`ModuleScope`.** The module loader's callback view is the compile-time view: it has no services and cannot build a `NativeCx`, so it does not implement `Js`. It makes objects, errors, functions and host objects, and compiles modules, which is what a loader needs to return a compiled or a synthetic module.
 
@@ -116,14 +173,19 @@ A host function call costs about 560 instructions with no arguments. With a 1 Ki
 | `JsString` | ~430 | ~630 |
 | `String` | ~1,300 | ~56,000 |
 
+A read of a bare name through an exotic global prototype is two hooks (`has`, `get`), an add (`counter += 1`) three. In `examples/exotic_globals.rs` (release build, x86-64 desktop), 1,000 adds of a name a `HashMap<JsString, Value>` holds take about 220 µs, 1,000 reads 145 µs and 1,000 writes 85 µs, against 12 µs for 1,000 adds of an ordinary global; most of the difference is the hooks' conversions and the embedder's hash lookups.
+
 ## Known issues
 
 - **Recursion depth.** Rust → JavaScript → Rust recursion through a host function fits about 725 levels in the default 1 MiB native-stack budget in a release build and about 46 in a debug build; a builtin's re-entry reaches more (`Array.prototype.map`: 1,063 in release). The 1,000-level test runs on a thread with a 256 MiB stack.
 - **UTF-16 text to `String`.** Converting wide text to a Rust `String` costs about 55 instructions per code unit, in std's `String::from_utf16_lossy`. A host function that only reads or forwards text takes `JsString` instead.
 - **Interrupt latency.** The poll runs at back-edges and calls only. One long native operation (a regular expression over a large input, a large `join`) is not interrupted until it returns to the loop.
 - **The interrupt flag stays set.** `InterruptHandle::interrupt` stops every later evaluation until `clear()`.
+- **Host exotic objects print their ordinary properties.** The printer reads the heap and calls no hook; `console.log` of one lists only what the ordinary fallback stored.
+- **An exotic prototype disables the hole fast path.** As for a `Proxy` or a prototype with index properties, a host exotic object used as a prototype clears `holes_writable`, so a write into an array hole walks the chain heap-wide from then on.
 - **Host objects print as `Object`.** The printer does not use the prototype's `constructor`; `Symbol.toStringTag` changes only `Object.prototype.toString`.
 - **`SharedArrayBuffer` bytes are copied.** `with_array_buffer_bytes` copies a shared buffer before calling the closure, since its bytes can change under the borrow.
+- **A lend is explicit.** A `Context` call from Rust code a host function calls still returns `Reentered` unless the host function lends its engine around that code with `Scope::lend`; the scope is unusable while it is lent.
 - **Modules inside a host function.** `compile_module` and `execute_module` return `Unsupported` there; `eval` and `compile` there make transient code.
 - **One thread per runtime.** Handles, host closures and host data are `Rc`; a thread pool creates a runtime on each worker.
 - **Untested behavior.** No test pins a host function's backtrace line (`at h (native)`) or the handle table's size over many calls with object arguments; both behave as described.

@@ -41,7 +41,7 @@ impl PropertyDescriptor {
         self.get.is_some() || self.set.is_some()
     }
 
-    fn to_internal(self) -> Descriptor {
+    pub(crate) fn to_internal(self) -> Descriptor {
         Descriptor {
             value: self.value,
             get: self.get,
@@ -52,7 +52,7 @@ impl PropertyDescriptor {
         }
     }
 
-    fn from_internal(descriptor: Descriptor) -> Self {
+    pub(crate) fn from_internal(descriptor: Descriptor) -> Self {
         PropertyDescriptor {
             value: descriptor.value,
             get: descriptor.get,
@@ -81,14 +81,68 @@ pub struct NativeCx<'a> {
     pub(crate) heap: &'a mut Heap,
     code: CodeView<'a>,
     pub(crate) realm: &'a Realm,
+    realm_owner: &'a Rc<Realm>,
     pub(crate) host: &'a mut Services,
 }
 
 /// The code store a [`NativeCx`] holds: the runtime's own between entries,
 /// or the running loop's, shared, inside a host function.
 enum CodeView<'a> {
-    Owned(&'a mut CodeStore),
-    Shared(&'a CodeStore),
+    Owned(&'a mut Rc<CodeStore>),
+    Shared(&'a Rc<CodeStore>),
+}
+
+/// The engine a host function lends to the Rust code it calls
+/// ([`NativeCx::lend`]): the heap and the services moved out of the host
+/// function's view, with the code store and the realm shared. A
+/// [`NativeCx`] over it ([`Lent::native_cx`]) is the host function's view
+/// for code that has no way to reach it: its loop frames, register file and
+/// root stack are the lent heap's.
+pub struct Lent {
+    parts: Box<Parts>,
+    code: Rc<CodeStore>,
+    realm: Rc<Realm>,
+}
+
+/// A heap and services, boxed so a lend moves them in place.
+struct Parts {
+    heap: Heap,
+    host: Services,
+}
+
+impl Lent {
+    /// The view of the lent engine; inside it, as inside a host function,
+    /// compiled code is transient.
+    pub fn native_cx(&mut self) -> NativeCx<'_> {
+        let parts = &mut *self.parts;
+        NativeCx {
+            heap: &mut parts.heap,
+            code: CodeView::Shared(&self.code),
+            realm: &self.realm,
+            realm_owner: &self.realm,
+            host: &mut parts.host,
+        }
+    }
+}
+
+/// What a lending view holds while its engine is lent: an empty heap and
+/// default services, never used. Kept between lends, it makes a lend two
+/// swaps.
+pub struct Spare(Box<Parts>);
+
+impl Spare {
+    pub fn new() -> Self {
+        Spare(Box::new(Parts {
+            heap: Heap::new(crate::HeapLimits::default()),
+            host: Services::default(),
+        }))
+    }
+}
+
+impl Default for Spare {
+    fn default() -> Self {
+        Spare::new()
+    }
 }
 
 impl Runtime {
@@ -99,6 +153,7 @@ impl Runtime {
             heap: &mut self.heap,
             code: CodeView::Owned(&mut self.code),
             realm: &self.realm,
+            realm_owner: &self.realm,
             host: &mut self.host,
         }
     }
@@ -179,6 +234,7 @@ impl<'a> NativeCx<'a> {
                 CodeView::Shared(code) => CodeView::Shared(code),
             },
             realm: self.realm,
+            realm_owner: self.realm_owner,
             host: self.host,
         }
     }
@@ -187,8 +243,9 @@ impl<'a> NativeCx<'a> {
     pub(crate) fn from_cx<'b>(cx: &'b mut Cx<'_>) -> NativeCx<'b> {
         NativeCx {
             heap: cx.heap,
-            code: CodeView::Shared(cx.static_code),
+            code: CodeView::Shared(cx.code_owner),
             realm: cx.realm,
+            realm_owner: cx.realm_owner,
             host: cx.host,
         }
     }
@@ -196,15 +253,17 @@ impl<'a> NativeCx<'a> {
     /// The loop's context for one operation.
     #[inline]
     pub(crate) fn cx(&mut self) -> Cx<'_> {
-        let static_code: &CodeStore = match &self.code {
+        let code_owner: &Rc<CodeStore> = match &self.code {
             CodeView::Owned(code) => code,
             CodeView::Shared(code) => code,
         };
         Cx {
             heap: self.heap,
-            static_code,
+            static_code: code_owner,
             realm: self.realm,
             host: self.host,
+            code_owner,
+            realm_owner: self.realm_owner,
         }
     }
 
@@ -216,9 +275,11 @@ impl<'a> NativeCx<'a> {
     pub fn compiler(&mut self, transient: bool) -> crate::vm::compile::Compiler<'_> {
         match &mut self.code {
             CodeView::Owned(code) => {
-                if transient {
+                // The store is shared only while the engine is lent.
+                if transient || Rc::get_mut(code).is_none() {
                     crate::vm::compile::Compiler::new(self.heap, code, self.realm)
                 } else {
+                    let code = Rc::get_mut(code).expect("an unshared code store");
                     crate::vm::compile::Compiler::owned(self.heap, code, self.realm)
                 }
             }
@@ -226,6 +287,48 @@ impl<'a> NativeCx<'a> {
                 crate::vm::compile::Compiler::new(self.heap, code, self.realm)
             }
         }
+    }
+
+    /// Lends the engine: moves the heap and the services out of this view
+    /// into a [`Lent`], leaving `spare`'s in their place, until
+    /// [`NativeCx::restore`]. Between the two this view must not be used.
+    /// A host function lends so that Rust code it calls, which has no way to
+    /// reach its view, runs scripts on the same engine.
+    pub fn lend(&mut self, Spare(mut parts): Spare) -> Lent {
+        std::mem::swap(self.heap, &mut parts.heap);
+        std::mem::swap(self.host, &mut parts.host);
+        let code = match &self.code {
+            CodeView::Owned(code) => Rc::clone(code),
+            CodeView::Shared(code) => Rc::clone(code),
+        };
+        Lent {
+            parts,
+            code,
+            realm: Rc::clone(self.realm_owner),
+        }
+    }
+
+    /// Takes back what [`NativeCx::lend`] lent and returns the spare.
+    pub fn restore(&mut self, mut lent: Lent) -> Spare {
+        std::mem::swap(self.heap, &mut lent.parts.heap);
+        std::mem::swap(self.host, &mut lent.parts.host);
+        Spare(lent.parts)
+    }
+
+    /// Runs the oldest pending job; `false` when none is queued. Inside a
+    /// host function (a lent engine) it runs above the host function's
+    /// frames, and the objects `WeakRef`s keep stay kept until the
+    /// outermost job or script ends.
+    pub fn run_pending_job(&mut self) -> Result<bool, Throw> {
+        if self.owns_code() {
+            return crate::vm::jobs::run_one_job(&mut self.cx());
+        }
+        crate::vm::jobs::run_nested_job(&mut self.cx())
+    }
+
+    /// Whether jobs are pending.
+    pub fn has_pending_jobs(&self) -> bool {
+        !self.heap.jobs.is_empty()
     }
 
     /// Whether the code store is the runtime's own (between entries), not
@@ -364,6 +467,41 @@ impl NativeCx<'_> {
         host_object(self.heap, prototype, data)
     }
 
+    /// Registers a host exotic class: objects made with the returned class
+    /// ([`NativeCx::new_host_exotic`]) run `hooks` as their internal
+    /// methods. Classes live as long as the runtime.
+    pub fn register_exotic_class(
+        &mut self,
+        hooks: Rc<dyn crate::vm::exotic::ExoticHooks>,
+    ) -> crate::vm::exotic::ExoticClass {
+        let classes = &mut self.host.exotic_classes;
+        classes.push(hooks);
+        crate::vm::exotic::ExoticClass((classes.len() - 1) as u32)
+    }
+
+    /// A host exotic object of `class` inheriting from `prototype`, holding
+    /// `data`, read back by [`NativeCx::host_data`].
+    pub fn new_host_exotic(
+        &mut self,
+        class: crate::vm::exotic::ExoticClass,
+        prototype: Option<ObjectId>,
+        data: Rc<dyn Any>,
+    ) -> Result<ObjectId, HeapError> {
+        assert!(
+            (class.0 as usize) < self.host.exotic_classes.len(),
+            "a class of this runtime"
+        );
+        self.heap.alloc_internal(
+            ObjectKind::HostExotic,
+            InternalTag::HostData,
+            prototype,
+            4,
+            &[],
+            InternalData::HostExotic(crate::vm::exotic::HostExotic { class, data }),
+            0,
+        )
+    }
+
     /// The datum of a host object, whatever its type; `None` for any other
     /// object.
     pub fn host_data(&self, object: ObjectId) -> Option<Rc<dyn Any>> {
@@ -372,6 +510,7 @@ impl NativeCx<'_> {
         }
         match &self.heap.internal(object).data {
             InternalData::HostData(data) => Some(Rc::clone(data)),
+            InternalData::HostExotic(exotic) => Some(Rc::clone(&exotic.data)),
             _ => None,
         }
     }
