@@ -81,6 +81,11 @@ pub(crate) struct Shared {
     pub(crate) debug_info: Cell<DebugInfoMode>,
     /// Execution turns in progress (`with_execution_turn`).
     turns: Cell<u32>,
+    /// The engine a host function lends ([`Scope::lend`](super::Scope::lend))
+    /// while the Rust code it calls runs; an entry made then takes it.
+    pub(crate) lent: RefCell<Option<oxide_core::Lent>>,
+    /// Spares kept between lends.
+    pub(crate) spares: RefCell<Vec<oxide_core::Spare>>,
 }
 
 impl Shared {
@@ -145,6 +150,52 @@ impl Entry<'_> {
     /// The operations' view of the entered runtime.
     pub(crate) fn view(&mut self) -> View<'_> {
         View::new(self.inner.core.native_cx(), self.shared)
+    }
+}
+
+/// An entry into the engine a host function lent: it takes the lent engine
+/// and gives it back when it drops.
+pub(crate) struct LentEntry<'a> {
+    lent: Option<oxide_core::Lent>,
+    shared: &'a Rc<Shared>,
+}
+
+impl LentEntry<'_> {
+    pub(crate) fn native_cx(&mut self) -> NativeCx<'_> {
+        self.lent.as_mut().expect("the lent engine").native_cx()
+    }
+}
+
+impl Drop for LentEntry<'_> {
+    fn drop(&mut self) {
+        *self.shared.lent.borrow_mut() = self.lent.take();
+        CURRENT.with(|current| current.borrow_mut().pop());
+    }
+}
+
+/// An entry for an operation that runs on either side of the boundary: the
+/// runtime between entries, or the engine a host function lent.
+pub(crate) enum Engine<'a> {
+    Top(Entry<'a>),
+    Lent(LentEntry<'a>),
+}
+
+impl Engine<'_> {
+    pub(crate) fn view(&mut self) -> View<'_> {
+        match self {
+            Engine::Top(entry) => entry.view(),
+            Engine::Lent(entry) => {
+                let shared = entry.shared;
+                View::new(entry.native_cx(), shared)
+            }
+        }
+    }
+
+    pub(crate) fn native_cx(&mut self) -> NativeCx<'_> {
+        match self {
+            Engine::Top(entry) => entry.inner.core.native_cx(),
+            Engine::Lent(entry) => entry.native_cx(),
+        }
     }
 }
 
@@ -273,6 +324,8 @@ impl Runtime {
                 loader: RefCell::new(None),
                 modules: RefCell::new(HashMap::new()),
                 debug_info: Cell::new(DebugInfoMode::Full),
+                lent: RefCell::new(None),
+                spares: RefCell::new(Vec::new()),
                 turns: Cell::new(0),
             }),
         }
@@ -319,6 +372,38 @@ impl Runtime {
             inner,
             shared: &self.shared,
         })
+    }
+
+    /// Starts an entry on the runtime or, while one of its host functions
+    /// lends the engine ([`Scope::lend`](super::Scope::lend)), on the lent
+    /// engine; `Reentered` when the runtime is busy and nothing is lent.
+    pub(crate) fn engine(&self) -> Result<Engine<'_>, RuntimeError> {
+        match self.enter() {
+            Ok(entry) => Ok(Engine::Top(entry)),
+            Err(RuntimeError::Reentered) => {
+                let lent = self
+                    .shared
+                    .lent
+                    .borrow_mut()
+                    .take()
+                    .ok_or(RuntimeError::Reentered)?;
+                CURRENT.with(|current| current.borrow_mut().push(Rc::clone(&self.shared)));
+                let mut entry = LentEntry {
+                    lent: Some(lent),
+                    shared: &self.shared,
+                };
+                self.shared.drain_released(&mut entry.native_cx());
+                Ok(Engine::Lent(entry))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether one of this runtime's host functions lends the engine now,
+    /// so that a `Context` or `Runtime` call made from the Rust code it runs
+    /// enters it.
+    pub fn is_lent(&self) -> bool {
+        self.shared.lent.borrow().is_some()
     }
 
     /// The runtime's one realm.
@@ -380,7 +465,7 @@ impl Runtime {
 
     /// Whether a job is pending.
     pub fn is_job_pending(&self) -> Result<bool, RuntimeError> {
-        Ok(self.enter()?.core.has_pending_jobs())
+        Ok(self.engine()?.native_cx().has_pending_jobs())
     }
 
     /// Runs the oldest pending job. A job that throws returns
@@ -393,8 +478,8 @@ impl Runtime {
                 "a job was dispatched inside an execution turn",
             ));
         }
-        let mut entry = self.enter()?;
-        let result = entry.inner.core.run_pending_job();
+        let mut entry = self.engine()?;
+        let result = entry.native_cx().run_pending_job();
         match entry.view().complete_with(result)? {
             true => Ok(PendingJobOutcome::Executed),
             false => Ok(PendingJobOutcome::NoJob),
@@ -434,7 +519,7 @@ impl Runtime {
         &self,
         promise: &ObjectRef,
     ) -> Result<Option<PromiseSnapshot>, RuntimeError> {
-        self.enter()?.view().promise_snapshot(promise)
+        self.engine()?.view().promise_snapshot(promise)
     }
 
     /// Keeps every rejected promise without a handler until one is attached
@@ -623,21 +708,21 @@ impl Runtime {
     }
 
     pub fn new_symbol(&self, description: Option<JsString>) -> Result<SymbolRef, RuntimeError> {
-        self.enter()?.view().new_symbol(description)
+        self.engine()?.view().new_symbol(description)
     }
 
     pub fn symbol_description(&self, symbol: &SymbolRef) -> Result<Option<JsString>, RuntimeError> {
-        self.enter()?.view().symbol_description(symbol)
+        self.engine()?.view().symbol_description(symbol)
     }
 
     pub fn well_known_symbol(&self, symbol: WellKnownSymbol) -> Result<SymbolRef, RuntimeError> {
-        self.enter()?.view().well_known_symbol(symbol)
+        self.engine()?.view().well_known_symbol(symbol)
     }
 
     // ---- objects ----
 
     pub fn get_prototype_of(&self, object: &ObjectRef) -> Result<Option<ObjectRef>, RuntimeError> {
-        self.enter()?.view().get_prototype_of(object)
+        self.engine()?.view().get_prototype_of(object)
     }
 
     pub fn set_prototype_of(
@@ -645,25 +730,25 @@ impl Runtime {
         object: &ObjectRef,
         prototype: Option<&ObjectRef>,
     ) -> Result<bool, RuntimeError> {
-        self.enter()?.view().set_prototype_of(object, prototype)
+        self.engine()?.view().set_prototype_of(object, prototype)
     }
 
     /// The object as a callable reference; `None` when it is not callable.
     pub fn as_callable(&self, object: &ObjectRef) -> Result<Option<CallableRef>, RuntimeError> {
-        self.enter()?.view().as_callable(object)
+        self.engine()?.view().as_callable(object)
     }
 
     pub fn is_constructor(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
-        self.enter()?.view().is_constructor(object)
+        self.engine()?.view().is_constructor(object)
     }
 
     /// `IsArray`.
     pub fn is_array_object(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
-        self.enter()?.view().is_array_object(object)
+        self.engine()?.view().is_array_object(object)
     }
 
     pub fn is_error_object(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
-        self.enter()?.view().is_error_object(object)
+        self.engine()?.view().is_error_object(object)
     }
 
     pub fn define_own_property(
@@ -688,7 +773,7 @@ impl Runtime {
         object: &ObjectRef,
         key: &PropertyKey,
     ) -> Result<bool, RuntimeError> {
-        self.enter()?.view().delete_property(object, key)
+        self.engine()?.view().delete_property(object, key)
     }
 
     pub fn has_property(
@@ -696,7 +781,7 @@ impl Runtime {
         object: &ObjectRef,
         key: &PropertyKey,
     ) -> Result<bool, RuntimeError> {
-        self.enter()?.view().has_property(object, key)
+        self.engine()?.view().has_property(object, key)
     }
 
     pub fn has_own_property(
@@ -704,28 +789,28 @@ impl Runtime {
         object: &ObjectRef,
         key: &PropertyKey,
     ) -> Result<bool, RuntimeError> {
-        self.enter()?.view().has_own_property(object, key)
+        self.engine()?.view().has_own_property(object, key)
     }
 
     pub fn own_property_keys(&self, object: &ObjectRef) -> Result<Vec<PropertyKey>, RuntimeError> {
-        self.enter()?.view().own_property_keys(object)
+        self.engine()?.view().own_property_keys(object)
     }
 
     /// `typeof value`.
     pub fn type_of(&self, value: &Value) -> Result<String, RuntimeError> {
-        self.enter()?.view().type_of(value)
+        self.engine()?.view().type_of(value)
     }
 
     /// QuickJS's `JS_PrintValue`: what `print` and an uncaught-exception dump
     /// show. Runs no JavaScript (no accessor, trap or coercion).
     pub fn print_value(&self, value: &Value) -> Result<String, RuntimeError> {
-        self.enter()?.view().print_value(value)
+        self.engine()?.view().print_value(value)
     }
 
     /// [`Runtime::print_value`] as the bytes QuickJS writes: a lone
     /// surrogate of a raw name, message or stack as its own three bytes
     /// (WTF-8) instead of U+FFFD.
     pub fn qjs_print_value_bytes(&self, value: &Value) -> Result<Vec<u8>, RuntimeError> {
-        self.enter()?.view().qjs_print_value_bytes(value)
+        self.engine()?.view().qjs_print_value_bytes(value)
     }
 }

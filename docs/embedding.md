@@ -23,7 +23,7 @@ Every crate keeps `unsafe_code = "forbid"`, and a runtime has one realm.
 | `api::core::promise`, `api::core::buffer`, `api::core::convert` | root crate | `PromiseCapability`; `TypedArrayView`, `TypedArrayKind`; `FromJs`, `IntoJs` and the typed `HostFunction` impls |
 | `src/engine/compiler/register` | root crate | the lowering emits `JmpBack` for a backward `Jmp` |
 
-The tests are `core/tests/host.rs` (the core's host functions and objects) and `tests/embedding_api.rs` (the API).
+The tests are `core/tests/host.rs` (the core's host functions and objects), `tests/embedding_api.rs` (the API) and `tests/reentry.rs` (lending the engine).
 
 ## Host functions in the core
 
@@ -45,7 +45,7 @@ A host object is an `ObjectKind::Builtin` object with the embedder's prototype a
 
 **One set of operations, two handles.** Every `Context` method borrows the runtime's cell for one entry, so inside a host function a `Context` method returns `Reentered`; a host function works through its `Scope`. Both run their operations on an internal `View`: a `NativeCx`, the runtime's shared state, and a root mark at which the root stack is cut back when the view drops, so temporaries a `lower` creates (a string, a BigInt, an atom) live until the operation ends. The macro `js_ops!` lists each operation once and emits the inherent methods of `Context` (`&self`, one entry each), the inherent methods of `Scope` (`&mut self`, a reborrow of its `NativeCx`), and the sealed trait `Js` for code generic over where it runs. A macro cannot give one list's methods different receivers, which is why every `Context` method takes `&self`.
 
-The job queue, the module loader, the collector, the reports and the options are not in `Js`: they belong to the runtime boundary, and a host function that needs the job queue returns to the embedder, which drains it. Inside a host function, `eval` and `compile` make transient code, and `compile_module` and `execute_module` return `RuntimeError::Unsupported("modules inside a host function")`, because a module's units go into the code store the running loop holds.
+The job queue, the module loader, the collector, the reports and the options are not in `Js`: they belong to the runtime boundary. A host function that needs the job queue either returns to the embedder, which drains it, or lends the engine and drains it from there ([Lending the engine](#lending-the-engine)). Inside a host function, `eval` and `compile` make transient code, and `compile_module` and `execute_module` return `RuntimeError::Unsupported("modules inside a host function")`, because a module's units go into the code store the running loop holds.
 
 **`Scope` and `FunctionOptions`.** A `Scope` reads its call on demand (`this`, `arg`, `argc`, `args`, `new_target`, `is_construct`, `callee`, `data`, `set_data`, `this_host_data`), so a function that takes three integers makes no handle and copies no string. `FunctionOptions` gives the `name`, `length`, whether `new` may call the function, and its captured values. A closure passed to `new_function` writes its parameter type (`|scope: &mut Scope<'_>|`): the bound is reached through the `HostFunction` impl, and the compiler does not infer the higher-ranked signature from it.
 
@@ -62,6 +62,26 @@ The job queue, the module loader, the collector, the reports and the options are
 After each call it moves the handles released during the call into the core's handle table, so a script that calls a host function millions of times with object arguments keeps the handles of one call, not of all of them. A guard whose `Drop` sees `std::thread::panicking()` marks the runtime poisoned.
 
 **Handles do not keep the runtime alive.** `Slot` holds a `Weak<Shared>`. A closure stored in the heap that captured an `ObjectRef` would otherwise make the cycle closure → handle → runtime → heap → closure, and the runtime would never drop. A value used after its runtime dropped gets `RuntimeError::Invariant("a value of a dropped runtime")`. A captured handle is a root while its function lives; a JavaScript value the collector should see goes in `FunctionOptions::data`.
+
+## Lending the engine
+
+A host function's `Scope` is a borrow of the running loop's engine, and safe Rust gives code deeper on the stack no way to reach a borrow that was not passed to it. An embedder whose host function calls its own service layer, which runs another script on the same runtime with only a `Context` in hand (script → host function → service → script), therefore gets `Reentered` from that `Context`. `Scope::lend(f)` passes the engine on through the runtime instead: while `f` runs, the runtime's `Context` and `Runtime` operations enter it.
+
+```rust
+context.define_function(&global, "callService", 1, move |scope: &mut Scope<'_>| {
+    let name = scope.arg(0);
+    let name = scope.to_js_string(&name)?.to_utf8_lossy();
+    // `services` holds a Context; it runs scripts, calls functions and
+    // drains jobs while lent.
+    scope.lend(|| services.call(&name))
+})?;
+```
+
+**The mechanism.** `NativeCx::lend` swaps the heap and the services out of the host function's view into a core `Lent`, leaving a `Spare`'s empty heap and default services behind, and clones the shared owners of the code store and the realm (`Runtime::code` and `Runtime::realm` are `Rc`s for this; `Cx` carries `code_owner` and `realm_owner` beside the plain borrows the loop reads). The API puts the `Lent` in `Shared::lent`; `Runtime::engine`, which every `Context` operation and the runtime's value, property and job operations use, starts a top-level entry when the runtime's cell is free and otherwise takes the `Lent` for the duration of the entry (`LentEntry`), building a `NativeCx` over it whose code view is shared, as a host function's is. When `f` returns or unwinds, a guard swaps the heap and the services back and keeps the spare for the next lend. Nothing is copied but the two structures' headers: the frames, the register file, the root stack and the handle table live in the heap, so a nested call runs above the host function's frames exactly as a call from its `Scope` would, against the same native-stack budget. A host function a nested script calls can lend again.
+
+**What runs.** Inside a lend, as inside a host function: `eval` and `compile` make transient code, the module operations return `Unsupported`, an exception returns as `RuntimeError::Exception` and an interrupt as `RuntimeError::Interrupted` with the flag still set (the host function returns it to keep unwinding; no `catch` runs), and `run_pending_job`, `run_jobs` and `is_job_pending` work on the shared queue (a nested job leaves `ClearKeptObjects` to the outermost script or job). Collection, the reports, the options, `define_module` and the Test262 host stay at the top level and return `Reentered`. `Runtime::is_lent` reports a lend in progress. A panic in `f` unwinds through the guard, which gives the engine back, and the host function's poison guard poisons the runtime.
+
+**Cost.** In a release build a host function that lends and returns costs about 0.2 µs more than one that does not (30 ns): the two swaps of the heap's and the services' headers into a boxed spare. A nested `eval("1")` through the lend costs about 3.3 µs.
 
 **`ModuleScope`.** The module loader's callback view is the compile-time view: it has no services and cannot build a `NativeCx`, so it does not implement `Js`. It makes objects, errors, functions and host objects, and compiles modules, which is what a loader needs to return a compiled or a synthetic module.
 
@@ -124,6 +144,7 @@ A host function call costs about 560 instructions with no arguments. With a 1 Ki
 - **The interrupt flag stays set.** `InterruptHandle::interrupt` stops every later evaluation until `clear()`.
 - **Host objects print as `Object`.** The printer does not use the prototype's `constructor`; `Symbol.toStringTag` changes only `Object.prototype.toString`.
 - **`SharedArrayBuffer` bytes are copied.** `with_array_buffer_bytes` copies a shared buffer before calling the closure, since its bytes can change under the borrow.
+- **A lend is explicit.** A `Context` call from Rust code a host function calls still returns `Reentered` unless the host function lends its engine around that code with `Scope::lend`; the scope is unusable while it is lent.
 - **Modules inside a host function.** `compile_module` and `execute_module` return `Unsupported` there; `eval` and `compile` there make transient code.
 - **One thread per runtime.** Handles, host closures and host data are `Rc`; a thread pool creates a runtime on each worker.
 - **Untested behavior.** No test pins a host function's backtrace line (`at h (native)`) or the handle table's size over many calls with object arguments; both behave as described.
