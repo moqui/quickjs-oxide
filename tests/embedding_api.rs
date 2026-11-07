@@ -1273,6 +1273,9 @@ fn a_counted_regexp_loop_stops_at_an_interrupt() {
         "/(?:\\b){2147483646}x/.test('a'.repeat(1000))",
         // Each attempt fails forward, 20,000 characters in, at every start.
         "new RegExp('a'.repeat(20000) + 'b').test('a'.repeat(1 << 22))",
+        // A /g loop of matches, each inside its search's first chunk.
+        "('a'.repeat(24000) + 'b').repeat(1000).match(new RegExp('a'.repeat(20000) + 'b', 'g'))",
+        "('a'.repeat(24000) + 'b').repeat(1000).replace(new RegExp('a'.repeat(20000) + 'b', 'g'), () => 'x')",
     ] {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
         let runtime = Runtime::with_host(Deadline(deadline), RuntimeOptions::default());

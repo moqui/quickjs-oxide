@@ -599,15 +599,25 @@ fn run(
                 .load(std::sync::atomic::Ordering::Relaxed)
             || services.hooks.interrupt()
     };
+    let mut countdown = heap.vm.regexp_poll;
     let compiled = heap.regexps.program(program);
     let result = match &heap.string(string).repr() {
-        StringRepr::OneByte(bytes) => {
-            oxide_regexp::execute_latin1_with_interrupt(compiled, bytes, start, interrupted)
-        }
-        StringRepr::TwoByte(units) => {
-            oxide_regexp::execute_with_interrupt(compiled, units, start, interrupted)
-        }
+        StringRepr::OneByte(bytes) => oxide_regexp::execute_latin1_with_countdown(
+            compiled,
+            bytes,
+            start,
+            &mut countdown,
+            interrupted,
+        ),
+        StringRepr::TwoByte(units) => oxide_regexp::execute_with_countdown(
+            compiled,
+            units,
+            start,
+            &mut countdown,
+            interrupted,
+        ),
     };
+    cx.heap.vm.regexp_poll = countdown;
     result.map_err(|failure| match failure {
         ExecError::OutOfMemory => error::oom(cx.realm),
         ExecError::Interrupted => error::interrupt(cx),

@@ -18,8 +18,8 @@ pub use compiler::{
     CompileError, CompileErrorKind, CompileErrorSource, CompiledRegExp, ValidatedProgram,
 };
 pub use executor::{
-    ExecError, ProgramError, RegExpMatch, execute, execute_latin1_with_interrupt,
-    execute_with_interrupt,
+    ExecError, POLL_INTERVAL, ProgramError, RegExpMatch, execute, execute_latin1_with_countdown,
+    execute_latin1_with_interrupt, execute_with_countdown, execute_with_interrupt,
 };
 pub use flags::RegExpFlags;
 pub use group_name::GroupName;

@@ -170,6 +170,9 @@ pub struct VmStack {
     /// An interrupt is unwinding: no handler catches it, and no native turns
     /// it into a completion.
     pub(crate) interrupted: bool,
+    /// The RegExp matcher's countdown to its next interrupt poll, carried
+    /// across matches so a `/g` loop of searches is polled by their work.
+    pub(crate) regexp_poll: u32,
 }
 
 /// Back-edges and calls between two interrupt polls. QuickJS's
@@ -198,6 +201,7 @@ impl Default for VmStack {
             proxy_refused: false,
             poll: INTERRUPT_INTERVAL,
             interrupted: false,
+            regexp_poll: oxide_regexp::POLL_INTERVAL,
         }
     }
 }
