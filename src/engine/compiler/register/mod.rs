@@ -447,7 +447,7 @@ struct TreeCache {
     keys: FxHashMap<usize, (JsString, PropertyKey)>,
     atoms: FxHashMap<usize, (JsString, StringId)>,
     /// The tree's file name, converted once.
-    filename: Option<(JsString, std::rc::Rc<str>)>,
+    filename: Option<(JsString, std::sync::Arc<str>)>,
     /// Buffers kept for the next function: analyses not in use (a parent's
     /// stays in use while its children lower) and the lowering's own; one
     /// function lowers at a time.
@@ -3521,7 +3521,7 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     converted.clone()
                 }
                 _ => {
-                    let converted = std::rc::Rc::<str>::from(debug.filename.to_utf8_lossy());
+                    let converted = std::sync::Arc::<str>::from(debug.filename.to_utf8_lossy());
                     self.tree.filename = Some((debug.filename.clone(), converted.clone()));
                     converted
                 }
@@ -3550,13 +3550,14 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             source,
             filename,
         });
-        unit.debug.positions = positions;
-        unit.debug.definition = self
+        let body = unit.body_mut();
+        body.debug.positions = positions;
+        body.debug.definition = self
             .function
             .debug()
             .and_then(|debug| debug.pc2line.as_ref())
             .and_then(|table| table.definition.one_based());
-        unit.direct_eval_sites = self.direct_eval_sites.into();
+        body.direct_eval_sites = self.direct_eval_sites.into();
         let tree = &mut *self.tree;
         tree.analyses.push(self.analysis);
         let scratch = &mut tree.lowering;

@@ -212,3 +212,41 @@ fn an_image_counts_its_units() {
     };
     let _ = function;
 }
+
+#[test]
+fn loads_share_the_units_bodies() {
+    let mut source = String::new();
+    for index in 0..50 {
+        source.push_str(&format!(
+            "function f{index}(a) {{ try {{ return a.b{index}.c; }} catch (e) {{ return 'caught {index} ' + e.message; }} }}\n"
+        ));
+    }
+    source.push_str("f49({})");
+    let (_, compiled) = runtime();
+    let image = compiled.compile_image(&source, "shared.js").unwrap();
+    let (first, one) = runtime();
+    let (second, two) = runtime();
+    for context in [&one, &two] {
+        let script = context.load_image(&image).unwrap();
+        assert_eq!(
+            printed(context, context.execute(&script)),
+            "caught 49 cannot read property 'c' of undefined"
+        );
+    }
+    let one_report = first.memory_report().unwrap().code;
+    let two_report = second.memory_report().unwrap().code;
+    // Each runtime holds its instructions; the handlers, positions and
+    // source text are the image's, held once.
+    assert!(one_report.shared_body_bytes > 0);
+    assert_eq!(one_report.shared_body_bytes, two_report.shared_body_bytes);
+    assert!(
+        one_report.static_bytes < one_report.shared_body_bytes,
+        "{one_report:?}"
+    );
+    // A compiled script's bodies are its own until an image shares them.
+    let (third, three) = runtime();
+    let script = three.compile(&source).unwrap();
+    assert_eq!(third.memory_report().unwrap().code.shared_body_bytes, 0);
+    let _image = three.encode_image(&script).unwrap();
+    assert!(third.memory_report().unwrap().code.shared_body_bytes > 0);
+}

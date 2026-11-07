@@ -339,6 +339,13 @@ impl Compiler<'_> {
         if count == 0 {
             return Err(LoadError::Malformed("an image without units"));
         }
+        let sites: usize = loader
+            .image
+            .units
+            .iter()
+            .map(|unit| unit.counts.ic_count as usize)
+            .sum();
+        self.heap.ics.reserve_exact(sites);
         let mark = self.heap.roots().mark();
         let result = (|| {
             let mut ids: Vec<Option<CodeUnitId>> = vec![None; count];

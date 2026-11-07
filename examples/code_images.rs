@@ -74,6 +74,14 @@ fn main() {
         load_bytes = bytes;
     }
     let load_seconds = load_seconds / LOADS as f64;
+    let shared = Runtime::new().context();
+    shared.load_image(&image).unwrap();
+    let report = shared.runtime().memory_report().unwrap();
+    println!(
+        "a loaded runtime's code store: {} KB its own, {} KB of bodies shared with the image",
+        report.code.static_bytes / 1024,
+        report.code.shared_body_bytes / 1024
+    );
     println!(
         "load: {:.0} µs ({:.1}x faster than compiling), the runtime holds {} KB more",
         load_seconds * 1e6,

@@ -65,8 +65,12 @@ pub struct CodeReport {
     pub instructions: usize,
     pub instruction_bytes: usize,
     /// Bytes the static units hold, without their cache entries (in
-    /// `table_bytes`): what the code store costs this runtime.
+    /// `table_bytes`) and without the bodies they share with a code image
+    /// or another runtime: what the code store costs this runtime.
     pub static_bytes: usize,
+    /// Bytes of the static units' bodies held with a code image or another
+    /// runtime, counted in full here and once for the process.
+    pub shared_body_bytes: usize,
     /// Bytes of the units' source-position tables.
     pub position_bytes: usize,
     /// Bytes of source text kept for `Function.prototype.toString`.

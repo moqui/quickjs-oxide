@@ -19,9 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::bytecode::{
-    Capture, CodeUnit, CodeUnitId, DebugInfo, Format, Handler, Insn, SourcePosition,
-};
+use crate::bytecode::{CodeUnit, CodeUnitId, Format, Insn, UnitBody};
 use crate::heap::Heap;
 use crate::heap::atom::KeyKind;
 use crate::heap::string::StringRepr;
@@ -49,24 +47,26 @@ pub(crate) struct ImageData {
     pub(crate) units: Box<[ImageUnit]>,
 }
 
-/// One unit: its body as the code store holds it, with its atoms and its
-/// children by index, and its constant table.
+/// One unit: its instructions with their atoms by index, its counts, its
+/// children by index, its constant table, and its body, which every runtime
+/// that loads the image shares.
 pub(crate) struct ImageUnit {
     /// The instructions; the `imm` of each one `key_sites` lists is an
     /// index into the atom table.
     pub(crate) code: Box<[Insn]>,
     pub(crate) key_sites: Box<[u32]>,
-    pub(crate) body: UnitBody,
+    pub(crate) counts: Counts,
+    pub(crate) body: Arc<UnitBody>,
     /// Indices into the image's units, in `MakeClosure` order.
     pub(crate) children: Box<[u32]>,
     pub(crate) name_atom: Option<u32>,
     pub(crate) constants: Box<[Constant]>,
 }
 
-/// The parts of a unit that name nothing of a runtime.
-#[derive(Clone)]
-pub(crate) struct UnitBody {
-    pub(crate) handlers: Box<[Handler]>,
+/// A unit's counts and flags, which the code store keeps beside its
+/// instructions.
+#[derive(Clone, Copy)]
+pub(crate) struct Counts {
     pub(crate) register_count: u16,
     pub(crate) parameter_count: u16,
     pub(crate) local_count: u16,
@@ -76,14 +76,7 @@ pub(crate) struct UnitBody {
     pub(crate) spill_register: u16,
     pub(crate) spill_slots: u16,
     pub(crate) ic_count: u32,
-    pub(crate) captures: Box<[Capture]>,
-    pub(crate) name: Box<str>,
-    pub(crate) filename: Option<Arc<str>>,
-    pub(crate) positions: Box<[SourcePosition]>,
-    pub(crate) definition: Option<(u32, u32)>,
     pub(crate) length: u16,
-    pub(crate) source: Option<Box<[u8]>>,
-    pub(crate) direct_eval_sites: Box<[u32]>,
 }
 
 /// A constant by value.
@@ -190,17 +183,6 @@ impl CodeImage {
     }
 }
 
-impl UnitBody {
-    fn bytes(&self) -> usize {
-        std::mem::size_of_val(&*self.handlers)
-            + std::mem::size_of_val(&*self.captures)
-            + std::mem::size_of_val(&*self.positions)
-            + self.name.len()
-            + self.source.as_ref().map_or(0, |source| source.len())
-            + std::mem::size_of_val(&*self.direct_eval_sites)
-    }
-}
-
 /// Whether `insn`'s `imm` is a property key.
 fn names_key(insn: &Insn) -> bool {
     matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey)
@@ -279,7 +261,8 @@ impl Encoder<'_> {
             .into_iter()
             .map(|value| self.constant(value))
             .collect::<Result<Box<[_]>, _>>()?;
-        let body = body_of(&unit);
+        let counts = counts_of(&unit);
+        let body = Arc::clone(&unit.body);
         let child_count = unit.children.len();
         drop(unit);
         let mut children = Vec::with_capacity(child_count);
@@ -290,6 +273,7 @@ impl Encoder<'_> {
         self.out[index as usize] = Some(ImageUnit {
             code: code.into(),
             key_sites: key_sites.into(),
+            counts,
             body,
             children: children.into(),
             name_atom,
@@ -376,9 +360,8 @@ impl Encoder<'_> {
     }
 }
 
-fn body_of(unit: &CodeUnit) -> UnitBody {
-    UnitBody {
-        handlers: unit.handlers.clone(),
+fn counts_of(unit: &CodeUnit) -> Counts {
+    Counts {
         register_count: unit.register_count,
         parameter_count: unit.parameter_count,
         local_count: unit.local_count,
@@ -388,24 +371,14 @@ fn body_of(unit: &CodeUnit) -> UnitBody {
         spill_register: unit.spill_register,
         spill_slots: unit.spill_slots,
         ic_count: unit.ic_count,
-        captures: unit.captures.clone(),
-        name: unit.debug.name.clone(),
-        filename: unit.debug.filename.as_deref().map(Arc::from),
-        positions: unit.debug.positions.clone(),
-        definition: unit.debug.definition,
         length: unit.length,
-        source: unit.source.clone(),
-        direct_eval_sites: unit.direct_eval_sites.clone(),
     }
 }
 
-/// What a load builds for one runtime: the atoms it interned and the
-/// filename it shares.
+/// What a load builds for one runtime: the atoms it interned.
 pub(crate) struct Loader<'i> {
     pub(crate) image: &'i ImageData,
     pub(crate) atoms: Vec<Option<crate::value::StringId>>,
-    /// The filename of the units, made once per distinct text.
-    pub(crate) filenames: Vec<(Arc<str>, std::rc::Rc<str>)>,
 }
 
 impl<'i> Loader<'i> {
@@ -413,7 +386,6 @@ impl<'i> Loader<'i> {
         Loader {
             image: &image.0,
             atoms: vec![None; image.0.atoms.len()],
-            filenames: Vec::new(),
         }
     }
 
@@ -435,20 +407,6 @@ impl<'i> Loader<'i> {
         };
         *slot = Some(id);
         Ok(id)
-    }
-
-    fn filename(&mut self, name: &Arc<str>) -> std::rc::Rc<str> {
-        if let Some((_, rc)) = self
-            .filenames
-            .iter()
-            .find(|(arc, _)| Arc::ptr_eq(arc, name))
-        {
-            return std::rc::Rc::clone(rc);
-        }
-        let rc: std::rc::Rc<str> = std::rc::Rc::from(&**name);
-        self.filenames
-            .push((Arc::clone(name), std::rc::Rc::clone(&rc)));
-        rc
     }
 
     /// The code unit of image unit `index` for this runtime, its children
@@ -474,34 +432,24 @@ impl<'i> Loader<'i> {
             .name_atom
             .map(|index| self.atom(heap, index))
             .transpose()?;
-        let body = &unit.body;
-        let filename = body.filename.as_ref().map(|name| self.filename(name));
+        let counts = unit.counts;
         Ok(CodeUnit {
             code: code.into(),
-            handlers: body.handlers.clone(),
-            register_count: body.register_count,
-            parameter_count: body.parameter_count,
-            local_count: body.local_count,
-            flags: body.flags,
-            this_slots: body.this_slots,
-            constant_count: body.constant_count,
-            spill_register: body.spill_register,
-            spill_slots: body.spill_slots,
+            register_count: counts.register_count,
+            parameter_count: counts.parameter_count,
+            local_count: counts.local_count,
+            flags: counts.flags,
+            this_slots: counts.this_slots,
+            constant_count: counts.constant_count,
+            spill_register: counts.spill_register,
+            spill_slots: counts.spill_slots,
             ic_base: 0,
-            ic_count: body.ic_count,
+            ic_count: counts.ic_count,
             children,
-            captures: body.captures.clone(),
-            debug: DebugInfo {
-                name: body.name.clone(),
-                filename,
-                positions: body.positions.clone(),
-                definition: body.definition,
-            },
             name_atom,
-            length: body.length,
-            source: body.source.clone(),
-            direct_eval_sites: body.direct_eval_sites.clone(),
+            length: counts.length,
             atoms: Box::new([]),
+            body: Arc::clone(&unit.body),
         })
     }
 
@@ -516,7 +464,7 @@ impl<'i> Loader<'i> {
     ) -> Result<Vec<Value>, LoadError> {
         let image = self.image;
         let unit = &image.units[index];
-        if unit.constants.len() != unit.body.constant_count as usize {
+        if unit.constants.len() != unit.counts.constant_count as usize {
             return Err(LoadError::Malformed("a constant table's length"));
         }
         let mut values = Vec::with_capacity(unit.constants.len());

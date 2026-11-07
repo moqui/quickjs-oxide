@@ -203,7 +203,7 @@ fn builder_patches_forward_jumps_and_decodes_operands() {
     assert_eq!(code[1].int(), i32::MIN);
     assert_eq!(code[2].imm, 0);
     let mut unit = builder.finish(layout(6));
-    unit.captures = vec![Capture::None].into();
+    unit.body_mut().captures = vec![Capture::None].into();
     assert_eq!(validate(&unit), Ok(()));
     assert_eq!(unit.temp_base(), 5);
     assert!(unit.debug.positions.is_empty());
@@ -370,7 +370,7 @@ fn validator_rejects_each_malformation() {
         Ok(())
     );
     let mut capturing = unit_returning();
-    capturing.captures = vec![Capture::Register(1)].into();
+    capturing.body_mut().captures = vec![Capture::Register(1)].into();
     assert_eq!(
         {
             let published = [capturing.clone()];
@@ -382,7 +382,7 @@ fn validator_rejects_each_malformation() {
         Err(E::ChildCapture(1)),
         "the parent has one register"
     );
-    capturing.captures = vec![Capture::Outer(0)].into();
+    capturing.body_mut().captures = vec![Capture::Outer(0)].into();
     assert_eq!(
         {
             let published = [capturing];
@@ -401,11 +401,11 @@ fn validator_rejects_each_malformation() {
         column: 1,
     };
     let mut lines = unit_returning();
-    lines.debug.positions = vec![position(0), position(9)].into();
+    lines.body_mut().debug.positions = vec![position(0), position(9)].into();
     assert_eq!(validate(&lines), Err(E::LineTable));
-    lines.debug.positions = vec![position(0), position(0)].into();
+    lines.body_mut().debug.positions = vec![position(0), position(0)].into();
     assert_eq!(validate(&lines), Err(E::LineTable));
-    lines.debug.positions = vec![position(0)].into();
+    lines.body_mut().debug.positions = vec![position(0)].into();
     assert_eq!(validate(&lines), Ok(()));
 
     let mut arrow = unit_returning();
@@ -423,7 +423,7 @@ fn validator_checks_handler_ranges_and_nesting() {
             }
             b.op(Opcode::ReturnUndefined);
         });
-        unit.handlers = handlers.into();
+        unit.body_mut().handlers = handlers.into();
         validate(&unit)
     };
     let h = |start, end, target, register| Handler {
