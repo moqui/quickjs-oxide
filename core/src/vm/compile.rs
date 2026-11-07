@@ -22,11 +22,11 @@ use crate::heap::{AtomMode, BytecodeTemplate, Heap, HeapError};
 use crate::runtime::{Intrinsic, Realm};
 use crate::value::{ObjectId, Value};
 
-/// The code store a compilation publishes into: owned before the program
-/// runs (units go in the static store), shared while it runs (units go in
-/// the heap).
+/// Where a compilation publishes: the code store, whose units live as long
+/// as the runtime, or the heap, which frees them once unreachable (`eval`'s
+/// and the embedder's transient code). Either works while the program runs.
 enum Store<'a> {
-    Owned(&'a mut CodeStore),
+    Owned(&'a CodeStore),
     Shared(&'a CodeStore),
 }
 
@@ -77,7 +77,7 @@ impl<'a> Compiler<'a> {
         Compiler::with(heap, Store::Shared(code), realm, AtomMode::Hold)
     }
 
-    pub(crate) fn owned(heap: &'a mut Heap, code: &'a mut CodeStore, realm: &'a Realm) -> Self {
+    pub(crate) fn owned(heap: &'a mut Heap, code: &'a CodeStore, realm: &'a Realm) -> Self {
         Compiler::with(heap, Store::Owned(code), realm, AtomMode::Pin)
     }
 
@@ -253,14 +253,19 @@ impl<'a> Compiler<'a> {
         match &mut self.code {
             // A static unit lives as long as the runtime, and so do its keys,
             // wherever they were interned.
-            Store::Owned(code) => {
+            // While shared, the store's overflow takes a bounded number of
+            // units; past it the code is transient.
+            Store::Owned(code) if code.has_room() => {
                 // Pinning is idempotent, so a key used twice needs no dedup.
                 for atom in unit.key_atom_uses() {
                     self.heap.pin_atom(atom);
                 }
-                code.push(unit)
+                match code.push(unit) {
+                    Ok(id) => id,
+                    Err(_) => unreachable!("room in the code store"),
+                }
             }
-            Store::Shared(_) => {
+            Store::Owned(_) | Store::Shared(_) => {
                 let (id, bytes) = self.heap.code.publish(unit);
                 self.heap.gc.allocated += bytes;
                 id

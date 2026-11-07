@@ -929,10 +929,12 @@ fn a_host_function_uses_its_scope_not_the_context() {
     context
         .define_function(&global, "nested", 0, move |scope: &mut Scope<'_>| {
             assert_eq!(outer.eval("1"), Err(RuntimeError::Reentered));
-            assert_eq!(
-                scope.compile_module("export default 1").map(drop),
-                Err(RuntimeError::Unsupported("modules inside a host function"))
-            );
+            // A module compiles and runs from a host function too.
+            let module = scope.compile_module_with_filename(
+                "export default 1; globalThis.ran = 1",
+                "inner.mjs",
+            )?;
+            scope.execute_module(&module)?;
             scope.eval("6 * 7")
         })
         .unwrap();

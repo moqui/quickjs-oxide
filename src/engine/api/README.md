@@ -117,9 +117,8 @@ the higher-ranked signature. The `Scope` reads the call (`this`, `arg`,
   calls, `run_pending_job` included, enter the host function's engine
   above its frames ([Lending the engine](../../../docs/embedding.md#lending-the-engine)).
   Collection, the reports and the options stay at the top level. Inside a
-  host function `eval` and `compile` make transient code, and
-  `compile_module*` and `execute_module` return
-  `Unsupported("modules inside a host function")`.
+  host function `eval`, `compile`, `load_image` and the module operations
+  publish into the code store as at the top level.
 - Values the closure takes from its call are handles like any other and
   outlive the call. Handles it drops are released when it returns.
 - `Err(Exception(value))` throws `value`; `scope.throw_error(kind,

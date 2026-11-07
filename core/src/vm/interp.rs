@@ -2563,11 +2563,21 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                             };
                             let site = (construct && insn.op == Opcode::New)
                                 .then(|| ic_base + insn.imm as usize);
-                            let entry = if unit_id.is_dynamic() {
-                                enter_dynamic_callee(cx, callee_frame, function, this, site)
+                            let (entry, entered) = if unit_id.is_dynamic() {
+                                let entry =
+                                    enter_dynamic_callee(cx, callee_frame, function, this, site);
+                                (entry, None)
                             } else {
                                 let callee_unit = cx.static_code.get(unit_id);
-                                enter_callee(cx, callee_unit, callee_frame, function, this, site)
+                                let entry = enter_callee(
+                                    cx,
+                                    callee_unit,
+                                    callee_frame,
+                                    function,
+                                    this,
+                                    site,
+                                );
+                                (entry, Some(callee_unit))
                             };
                             match entry {
                                 Entry::Entered => {}
@@ -2576,7 +2586,19 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                                     break 'op write!('dispatch, insn.a, result);
                                 }
                             }
-                            load_frame!();
+                            match entered {
+                                // The static callee was just looked up: the
+                                // frame takes it without a second lookup.
+                                Some(callee_unit) => {
+                                    frame = *cx.heap.vm.frames.last().expect("a frame");
+                                    held = None;
+                                    unit = callee_unit;
+                                    code = &unit.code;
+                                    base = frame.base as usize;
+                                    ic_base = unit.ic_base as usize;
+                                }
+                                None => load_frame!(),
+                            }
                             pc = 0;
                             regs = window!();
                             continue 'dispatch;

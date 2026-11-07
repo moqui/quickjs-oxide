@@ -147,7 +147,7 @@ fn every_opcode_round_trips_through_the_disassembler() {
         ..UnitLayout::default()
     });
     // `MakeClosure fn0` needs one child: publish a leaf first.
-    let mut store = CodeStore::default();
+    let store = CodeStore::default();
     let leaf = store.publish(unit_returning()).unwrap();
     let mut unit = unit;
     unit.children = vec![leaf].into();
@@ -453,7 +453,7 @@ fn validator_checks_handler_ranges_and_nesting() {
 
 #[test]
 fn publication_validates_and_the_store_walks_trees_in_pre_order() {
-    let mut store = CodeStore::default();
+    let store = CodeStore::default();
     let a = store.publish(unit_returning()).unwrap();
     let b = store.publish(unit_returning()).unwrap();
     let mut middle = unit_returning();
