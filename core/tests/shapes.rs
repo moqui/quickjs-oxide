@@ -40,7 +40,11 @@ fn lookup_table_exists_only_above_eight_properties() {
     assert_eq!(TABLE_THRESHOLD, 8);
     assert!(!heap.shape(heap.shape_of(object)).has_table());
     add(&mut heap, object, keys[8]);
+    // A hit near the top walks less than the threshold and builds nothing;
+    // a lookup that walks past it builds the table.
     assert_eq!(heap.lookup_own(object, keys[8]), Some((8, DEFAULT)));
+    assert!(!heap.shape(heap.shape_of(object)).has_table());
+    assert_eq!(heap.lookup_own(object, keys[0]), Some((0, DEFAULT)));
     assert!(heap.shape(heap.shape_of(object)).has_table());
     for (slot, &key) in keys.iter().enumerate() {
         assert_eq!(heap.lookup_own(object, key), Some((slot as u32, DEFAULT)));

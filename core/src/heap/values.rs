@@ -514,6 +514,11 @@ impl ValueHeap {
         }
     }
 
+    /// Gives back the capacity past the last slot.
+    pub fn shrink_to_fit(&mut self) {
+        self.values.shrink_to_fit();
+    }
+
     pub fn bytes(&self) -> usize {
         self.values.capacity() * 8
             + self
