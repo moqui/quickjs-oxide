@@ -310,16 +310,6 @@ impl View<'_> {
         }
     }
 
-    /// The error for an operation a host function cannot run, because the
-    /// running loop borrows what it needs.
-    fn modules_supported(&mut self) -> JsResult<()> {
-        if self.core.owns_code() {
-            Ok(())
-        } else {
-            Err(RuntimeError::Unsupported("modules inside a host function"))
-        }
-    }
-
     // ---- scripts ----
 
     pub(crate) fn eval(&mut self, source: &str) -> JsResult<Value> {
@@ -519,7 +509,6 @@ impl View<'_> {
         filename: &str,
         import_meta: Vec<(String, Value)>,
     ) -> JsResult<ModuleBytecodeRef> {
-        self.modules_supported()?;
         let debug_info = self.shared.debug_info.get();
         let compiled = {
             let mut compiler = self.core.compiler(false);
@@ -558,7 +547,6 @@ impl View<'_> {
     }
 
     pub(crate) fn execute_module(&mut self, module: &ModuleBytecodeRef) -> JsResult<Value> {
-        self.modules_supported()?;
         let result = self.core.run_module(module.name());
         self.complete(result)
     }
@@ -1333,11 +1321,11 @@ js_ops! {
     fn compile_image(&mut self, source: &str, filename: &str) -> JsResult<CodeImage>;
     /// Loads a code image without parsing: its atoms interned, its units
     /// published through the validator with fresh inline caches (static
-    /// code between entries, transient inside a host function), its root
+    /// code, inside a host function too), its root
     /// instantiated. Run it with `execute`.
     fn load_image(&mut self, image: &CodeImage) -> JsResult<FunctionBytecodeRef>;
 
-    // ---- modules (`Unsupported` inside a host function) ----
+    // ---- modules ----
 
     fn compile_module(&mut self, source: &str) -> JsResult<ModuleBytecodeRef>;
     fn compile_module_bytes(&mut self, source: &[u8]) -> JsResult<ModuleBytecodeRef>;

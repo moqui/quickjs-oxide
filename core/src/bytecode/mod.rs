@@ -372,25 +372,98 @@ impl std::ops::Deref for UnitRef<'_> {
     }
 }
 
-/// The units published before the program runs. It lives in the runtime
-/// beside the heap, not in it, so the main loop can hold `&[Insn]` across
-/// heap calls; units compiled at run time live in the heap
+/// The units that live as long as the runtime: the program's, its modules',
+/// and what the embedder compiles without the `transient` option, before
+/// the program runs or inside a host function. It lives beside the heap, not
+/// in it, so the main loop can hold `&[Insn]` across heap calls; units
+/// compiled at run time by `eval` live in the heap
 /// ([`DynamicUnits`](crate::heap::code::DynamicUnits)).
+///
+/// The store only grows, and a unit never moves while anything can borrow
+/// it. Publishing takes `&self`, so it is safe while the running loop
+/// borrows a unit: a new unit goes in the overflow, chunks of cells that are
+/// filled once (chunk `k` holds `FIRST_CHUNK << k`). The loop reads the
+/// settled units, a plain vector; [`CodeStore::settle`] moves the overflow
+/// into it whenever the store is not shared (between entries), keeping
+/// every id.
 #[derive(Default)]
 pub struct CodeStore {
     units: Vec<CodeUnit>,
+    overflow: Overflow,
+}
+
+/// Units published while the store was shared, in id order after the
+/// settled ones: `CHUNKS` chunks of `CHUNK` cells, each filled once.
+struct Overflow {
+    chunks: [std::cell::OnceCell<Box<[std::cell::OnceCell<CodeUnit>]>>; CHUNKS],
+    len: std::cell::Cell<u32>,
+}
+
+/// Units per overflow chunk.
+const CHUNK: usize = 128;
+/// Overflow chunks: the units a runtime can publish while its store is
+/// shared before it returns to the top level; past them a host function's
+/// code is transient.
+const CHUNKS: usize = 256;
+
+impl Default for Overflow {
+    fn default() -> Self {
+        Overflow {
+            chunks: std::array::from_fn(|_| std::cell::OnceCell::new()),
+            len: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl Overflow {
+    #[inline]
+    fn get(&self, index: usize) -> Option<&CodeUnit> {
+        self.chunks
+            .get(index / CHUNK)?
+            .get()?
+            .get(index % CHUNK)?
+            .get()
+    }
 }
 
 impl CodeStore {
     /// Validates `unit` and appends it. Its cache entries are the caller's:
     /// [`Runtime::publish`](crate::Runtime::publish) reserves them.
-    pub fn publish(&mut self, unit: CodeUnit) -> Result<CodeUnitId, ValidateError> {
+    pub fn publish(&self, unit: CodeUnit) -> Result<CodeUnitId, ValidateError> {
         validate::validate(&unit, &|id| self.lookup(id))?;
-        Ok(self.push(unit))
+        match self.push(unit) {
+            Ok(id) => Ok(id),
+            Err(_) => panic!("code store overflow"),
+        }
     }
 
-    /// Appends a validated unit.
-    pub(crate) fn push(&mut self, unit: CodeUnit) -> CodeUnitId {
+    /// Appends a validated unit, to the overflow; gives it back when the
+    /// overflow is full.
+    pub(crate) fn push(&self, unit: CodeUnit) -> Result<CodeUnitId, CodeUnit> {
+        if !self.has_room() {
+            return Err(unit);
+        }
+        let index = self.overflow.len.get() as usize;
+        let id = (self.units.len() + index) as u32;
+        let cells = self.overflow.chunks[index / CHUNK]
+            .get_or_init(|| (0..CHUNK).map(|_| std::cell::OnceCell::new()).collect());
+        if cells[index % CHUNK].set(unit).is_err() {
+            unreachable!("an overflow cell is filled once");
+        }
+        self.overflow.len.set(index as u32 + 1);
+        Ok(CodeUnitId(id))
+    }
+
+    /// Whether [`CodeStore::push`] has room.
+    pub(crate) fn has_room(&self) -> bool {
+        let overflow = self.overflow.len.get() as usize;
+        overflow < CHUNK * CHUNKS && self.units.len() + overflow < DYNAMIC as usize
+    }
+
+    /// Appends a validated unit to the settled units, after the overflow
+    /// (settled first): a store no one else holds has no bound.
+    pub(crate) fn push_settled(&mut self, unit: CodeUnit) -> CodeUnitId {
+        self.settle();
         let id = u32::try_from(self.units.len())
             .ok()
             .filter(|&id| id < DYNAMIC)
@@ -399,35 +472,74 @@ impl CodeStore {
         CodeUnitId(id)
     }
 
+    /// Moves the overflow into the settled units, where the loop reads them
+    /// directly. Ids do not change.
+    #[inline]
+    pub fn settle(&mut self) {
+        if self.overflow.len.get() != 0 {
+            self.settle_overflow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn settle_overflow(&mut self) {
+        let overflow = std::mem::take(&mut self.overflow);
+        let count = overflow.len.get() as usize;
+        self.units.reserve(count);
+        for chunk in overflow.chunks {
+            let Some(cells) = chunk.into_inner() else {
+                break;
+            };
+            for cell in cells.into_vec() {
+                match cell.into_inner() {
+                    Some(unit) => self.units.push(unit),
+                    None => return,
+                }
+            }
+        }
+    }
+
     /// The unit `id`, if it is a unit of this store.
+    #[inline]
     pub fn lookup(&self, id: CodeUnitId) -> Option<&CodeUnit> {
         if id.is_dynamic() {
             return None;
         }
-        self.units.get(id.0 as usize)
+        match self.units.get(id.0 as usize) {
+            Some(unit) => Some(unit),
+            None => self.overflow.get(id.0 as usize - self.units.len()),
+        }
     }
 
     /// The static unit `id`.
     #[inline]
     pub fn get(&self, id: CodeUnitId) -> &CodeUnit {
         debug_assert!(!id.is_dynamic(), "a unit of the code store");
-        &self.units[id.0 as usize]
+        let index = id.0 as usize;
+        if index >= self.units.len() {
+            return self.get_overflow(id);
+        }
+        &self.units[index]
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_overflow(&self, id: CodeUnitId) -> &CodeUnit {
+        self.lookup(id).expect("a published unit")
     }
 
     pub fn len(&self) -> usize {
-        self.units.len()
+        self.units.len() + self.overflow.len.get() as usize
     }
 
     /// Every unit with its id, in publication order.
     pub fn units(&self) -> impl Iterator<Item = (CodeUnitId, &CodeUnit)> {
-        self.units
-            .iter()
-            .enumerate()
-            .map(|(index, unit)| (CodeUnitId(index as u32), unit))
+        (0..self.len() as u32).map(|index| (CodeUnitId(index), self.get(CodeUnitId(index))))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.units.is_empty()
+        self.len() == 0
     }
 
     /// `id` and its descendants in pre-order ([`Units::tree`]).

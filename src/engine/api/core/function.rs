@@ -103,8 +103,8 @@ impl Scope<'_> {
     /// script chain runs on one runtime. The scope itself is not usable
     /// until `f` returns; a host function `f` reaches can lend again.
     ///
-    /// As inside a host function, code compiled while lent is transient,
-    /// modules are `Unsupported`, an exception or an interrupt from a nested
+    /// As inside a host function, code compiled or loaded while lent goes
+    /// in the code store, an exception or an interrupt from a nested
     /// call returns as its `RuntimeError` (return it to keep unwinding), and
     /// collection, the reports, the options and the module loader stay at
     /// the top level (`Reentered`). A lend costs two swaps of the heap's and

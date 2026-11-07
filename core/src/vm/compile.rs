@@ -22,11 +22,16 @@ use crate::heap::{AtomMode, BytecodeTemplate, Heap, HeapError};
 use crate::runtime::{Intrinsic, Realm};
 use crate::value::{ObjectId, Value};
 
-/// The code store a compilation publishes into: owned before the program
-/// runs (units go in the static store), shared while it runs (units go in
-/// the heap).
+/// Where a compilation publishes: the code store, whose units live as long
+/// as the runtime, or the heap, which frees them once unreachable (`eval`'s
+/// and the embedder's transient code). Either works while the program runs.
 enum Store<'a> {
-    Owned(&'a mut CodeStore),
+    /// The code store, this runtime's alone (between entries): units go
+    /// straight to its settled units, with no bound.
+    Unique(&'a mut CodeStore),
+    /// The code store while the running loop borrows it: units go to its
+    /// bounded overflow, then to the heap.
+    Owned(&'a CodeStore),
     Shared(&'a CodeStore),
 }
 
@@ -77,13 +82,23 @@ impl<'a> Compiler<'a> {
         Compiler::with(heap, Store::Shared(code), realm, AtomMode::Hold)
     }
 
-    pub(crate) fn owned(heap: &'a mut Heap, code: &'a mut CodeStore, realm: &'a Realm) -> Self {
+    pub(crate) fn owned(heap: &'a mut Heap, code: &'a CodeStore, realm: &'a Realm) -> Self {
+        // A full overflow makes the compilation transient from the start.
+        if !code.has_room() {
+            return Compiler::new(heap, code, realm);
+        }
         Compiler::with(heap, Store::Owned(code), realm, AtomMode::Pin)
+    }
+
+    /// [`Compiler::owned`] into a store no one else holds.
+    pub(crate) fn unique(heap: &'a mut Heap, code: &'a mut CodeStore, realm: &'a Realm) -> Self {
+        Compiler::with(heap, Store::Unique(code), realm, AtomMode::Pin)
     }
 
     /// The same parts for a shorter borrow (a host callback's view).
     pub fn reborrow(&mut self) -> Compiler<'_> {
         let code = match &mut self.code {
+            Store::Unique(code) => Store::Unique(code),
             Store::Owned(code) => Store::Owned(code),
             Store::Shared(code) => Store::Shared(code),
         };
@@ -223,8 +238,9 @@ impl<'a> Compiler<'a> {
     /// Every published unit, static and dynamic.
     pub fn units(&self) -> Units<'_> {
         let code = match &self.code {
-            Store::Owned(code) => &**code,
-            Store::Shared(code) => *code,
+            Store::Unique(code) => &**code,
+            Store::Owned(code) => code,
+            Store::Shared(code) => code,
         };
         Units {
             code,
@@ -250,15 +266,33 @@ impl<'a> Compiler<'a> {
     /// image's, checked against the image's own units).
     fn publish_validated(&mut self, mut unit: CodeUnit) -> CodeUnitId {
         self.heap.ics.reserve(&mut unit);
+        // While shared, the store's overflow takes a bounded number of
+        // units; past it the rest of the compilation is transient, its atoms
+        // held for the heap's units rather than pinned.
+        if let Store::Owned(code) = self.code
+            && !code.has_room()
+        {
+            self.heap.set_atom_mode(AtomMode::Hold);
+            self.code = Store::Shared(code);
+        }
         match &mut self.code {
             // A static unit lives as long as the runtime, and so do its keys,
-            // wherever they were interned.
-            Store::Owned(code) => {
-                // Pinning is idempotent, so a key used twice needs no dedup.
+            // wherever they were interned. Pinning is idempotent, so a key
+            // used twice needs no dedup.
+            Store::Unique(code) => {
                 for atom in unit.key_atom_uses() {
                     self.heap.pin_atom(atom);
                 }
-                code.push(unit)
+                code.push_settled(unit)
+            }
+            Store::Owned(code) => {
+                for atom in unit.key_atom_uses() {
+                    self.heap.pin_atom(atom);
+                }
+                match code.push(unit) {
+                    Ok(id) => id,
+                    Err(_) => unreachable!("room in the code store"),
+                }
             }
             Store::Shared(_) => {
                 let (id, bytes) = self.heap.code.publish(unit);
@@ -277,8 +311,9 @@ impl<'a> Compiler<'a> {
         constants: &[&[Value]],
     ) -> Result<ObjectId, HeapError> {
         let code = match &self.code {
-            Store::Owned(code) => &**code,
-            Store::Shared(code) => *code,
+            Store::Unique(code) => &**code,
+            Store::Owned(code) => code,
+            Store::Shared(code) => code,
         };
         let code = Units {
             code,

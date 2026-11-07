@@ -253,6 +253,11 @@ impl<'a> NativeCx<'a> {
     /// The loop's context for one operation.
     #[inline]
     pub(crate) fn cx(&mut self) -> Cx<'_> {
+        if let CodeView::Owned(code) = &mut self.code
+            && let Some(code) = Rc::get_mut(code)
+        {
+            code.settle();
+        }
         let code_owner: &Rc<CodeStore> = match &self.code {
             CodeView::Owned(code) => code,
             CodeView::Shared(code) => code,
@@ -268,24 +273,29 @@ impl<'a> NativeCx<'a> {
     }
 
     /// The heap, the code store and the realm for a compilation. Its units
-    /// go in the code store when the store is owned and `transient` is
-    /// false, else in the heap: inside a host function the running loop
-    /// borrows the store, so code compiled there is transient whatever
-    /// `transient` says.
+    /// go in the code store unless `transient`, else in the heap; inside a
+    /// host function too, since the store only grows and a published unit
+    /// never moves while the running loop borrows one.
     pub fn compiler(&mut self, transient: bool) -> crate::vm::compile::Compiler<'_> {
-        match &mut self.code {
-            CodeView::Owned(code) => {
-                // The store is shared only while the engine is lent.
-                if transient || Rc::get_mut(code).is_none() {
-                    crate::vm::compile::Compiler::new(self.heap, code, self.realm)
-                } else {
-                    let code = Rc::get_mut(code).expect("an unshared code store");
-                    crate::vm::compile::Compiler::owned(self.heap, code, self.realm)
-                }
-            }
-            CodeView::Shared(code) => {
-                crate::vm::compile::Compiler::new(self.heap, code, self.realm)
-            }
+        use crate::vm::compile::Compiler;
+        let unique = !transient
+            && matches!(&self.code, CodeView::Owned(code)
+                if Rc::strong_count(code) == 1 && Rc::weak_count(code) == 0);
+        if unique {
+            let CodeView::Owned(code) = &mut self.code else {
+                unreachable!("an owned store");
+            };
+            let code = Rc::get_mut(code).expect("an unshared code store");
+            return Compiler::unique(self.heap, code, self.realm);
+        }
+        let code: &CodeStore = match &self.code {
+            CodeView::Owned(code) => code,
+            CodeView::Shared(code) => code,
+        };
+        if transient {
+            Compiler::new(self.heap, code, self.realm)
+        } else {
+            Compiler::owned(self.heap, code, self.realm)
         }
     }
 
