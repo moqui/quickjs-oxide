@@ -96,6 +96,16 @@ impl<T: Record> Arena<T> {
         }
     }
 
+    /// Gives back the capacity past the last record (a growth step's slack),
+    /// for a heap that has finished a burst of allocation.
+    pub fn shrink_to_fit(&mut self) {
+        self.records.shrink_to_fit();
+        self.live.shrink_to_fit();
+        self.marks.shrink_to_fit();
+        #[cfg(feature = "gc-stress")]
+        self.quarantine.shrink_to_fit();
+    }
+
     /// Stores `value` in the lowest free slot, or past the last one. Returns
     /// its index. A growth step is charged to `room`.
     #[inline(always)]

@@ -100,12 +100,15 @@ impl fmt::Debug for PropertyFlags {
     }
 }
 
-/// A shape's outgoing transitions: a vector for up to four entries, a map
-/// beyond. Entries are weak: the collector drops those whose child died.
+/// A shape's outgoing transitions: one inline (most shapes, a builtin's
+/// prototype chain among them, have a single child), a vector for up to
+/// four, a map beyond. Entries are weak: the collector drops those whose
+/// child died.
 #[derive(Default)]
 pub enum Transitions {
     #[default]
     None,
+    One(PropertyKey, PropertyFlags, ShapeId),
     Small(Vec<(PropertyKey, PropertyFlags, ShapeId)>),
     Map(Box<FxHashMap<(PropertyKey, PropertyFlags), ShapeId>>),
 }
@@ -117,6 +120,9 @@ impl Transitions {
     pub fn find(&self, key: PropertyKey, flags: PropertyFlags) -> Option<ShapeId> {
         match self {
             Transitions::None => None,
+            Transitions::One(entry_key, entry_flags, child) => {
+                (*entry_key == key && *entry_flags == flags).then_some(*child)
+            }
             Transitions::Small(entries) => entries
                 .iter()
                 .find(|(entry_key, entry_flags, _)| *entry_key == key && *entry_flags == flags)
@@ -127,7 +133,13 @@ impl Transitions {
 
     fn insert(&mut self, key: PropertyKey, flags: PropertyFlags, child: ShapeId) {
         match self {
-            Transitions::None => *self = Transitions::Small(vec![(key, flags, child)]),
+            Transitions::None => *self = Transitions::One(key, flags, child),
+            Transitions::One(first_key, first_flags, first) => {
+                *self = Transitions::Small(vec![
+                    (*first_key, *first_flags, *first),
+                    (key, flags, child),
+                ]);
+            }
             Transitions::Small(entries) if entries.len() < SMALL_TRANSITIONS => {
                 entries.push((key, flags, child))
             }
@@ -146,6 +158,11 @@ impl Transitions {
     pub fn retain(&mut self, mut keep: impl FnMut(ShapeId) -> bool) {
         match self {
             Transitions::None => {}
+            Transitions::One(_, _, child) => {
+                if !keep(*child) {
+                    *self = Transitions::None;
+                }
+            }
             Transitions::Small(entries) => entries.retain(|entry| keep(entry.2)),
             Transitions::Map(map) => map.retain(|_, child| keep(*child)),
         }
@@ -153,18 +170,22 @@ impl Transitions {
 
     /// The child shapes.
     pub fn children(&self) -> impl Iterator<Item = ShapeId> + '_ {
-        let (entries, map) = match self {
-            Transitions::None => (&[][..], None),
-            Transitions::Small(entries) => (&entries[..], None),
-            Transitions::Map(map) => (&[][..], Some(map)),
+        let (one, entries, map) = match self {
+            Transitions::None => (None, &[][..], None),
+            Transitions::One(_, _, child) => (Some(*child), &[][..], None),
+            Transitions::Small(entries) => (None, &entries[..], None),
+            Transitions::Map(map) => (None, &[][..], Some(map)),
         };
         let mapped = map.into_iter().flat_map(|map| map.values().copied());
-        entries.iter().map(|entry| entry.2).chain(mapped)
+        one.into_iter()
+            .chain(entries.iter().map(|entry| entry.2))
+            .chain(mapped)
     }
 
     pub fn len(&self) -> usize {
         match self {
             Transitions::None => 0,
+            Transitions::One(..) => 1,
             Transitions::Small(entries) => entries.len(),
             Transitions::Map(map) => map.len(),
         }
@@ -481,14 +502,33 @@ impl Heap {
         if let Some(dictionary) = &record.dictionary {
             return dictionary.find(key);
         }
-        if record.count > TABLE_THRESHOLD {
-            return record
-                .table
-                .get_or_init(|| Box::new(self.build_table(shape)))
-                .get(&key)
-                .copied();
-        }
         let mut current = record;
+        if record.count > TABLE_THRESHOLD {
+            // Walk up to the nearest shape with a table: a chain grown one
+            // property at a time (a builtin's prototype as it is installed)
+            // builds a table every `TABLE_THRESHOLD` shapes, not one per
+            // shape.
+            let mut steps = 0;
+            while current.count > TABLE_THRESHOLD {
+                if let Some(table) = current.table.get() {
+                    return table.get(&key).copied();
+                }
+                if current.key == key {
+                    return Some((current.slot, current.flags));
+                }
+                steps += 1;
+                if steps >= TABLE_THRESHOLD {
+                    return record
+                        .table
+                        .get_or_init(|| Box::new(self.build_table(shape)))
+                        .get(&key)
+                        .copied();
+                }
+                current = self
+                    .shapes
+                    .get(current.parent.expect("non-root shape has a parent").0);
+            }
+        }
         while current.count > 0 {
             if current.key == key {
                 return Some((current.slot, current.flags));

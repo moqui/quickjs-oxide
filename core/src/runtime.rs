@@ -470,6 +470,7 @@ impl Runtime {
         // The heap pinned every atom so far: the realm's names and the
         // builtins' properties. From here atoms live as long as their holders.
         runtime.heap.set_atom_mode(crate::heap::AtomMode::Weak);
+        runtime.heap.shrink_to_fit();
         Ok(runtime)
     }
 
