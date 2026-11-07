@@ -238,8 +238,10 @@ pub struct CodeUnit {
     pub spill_register: u16,
     /// The slots of the spill scope.
     pub spill_slots: u16,
-    /// The unit's first entry in the cache store, set when it is published.
-    pub ic_base: u32,
+    /// The unit's first entry in the cache store, reserved when the unit is
+    /// first entered ([`IC_UNRESERVED`] until then): a function that never
+    /// runs holds no cache entries.
+    pub ic_base: std::cell::Cell<u32>,
     /// Cache sites, numbered by [`CodeBuilder::finish`](builder::CodeBuilder::finish).
     pub ic_count: u32,
     /// Inner functions, by `MakeClosure` index. Published before the unit.
@@ -340,6 +342,9 @@ impl CodeUnit {
         self.flags & flag != 0
     }
 }
+
+/// [`CodeUnit::ic_base`] of a unit not yet entered.
+pub const IC_UNRESERVED: u32 = u32::MAX;
 
 /// Marks a [`CodeUnitId`] of a unit compiled at run time, which the heap
 /// owns.

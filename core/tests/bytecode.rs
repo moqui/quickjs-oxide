@@ -598,9 +598,10 @@ fn field_sites_past_255_share_the_reserved_site() {
     assert_eq!(validate(&unit), Ok(()));
 }
 
-/// Publication gives each unit its own range of the cache store.
+/// Publication reserves no cache entries: a unit takes its range when it
+/// is first entered.
 #[test]
-fn publication_reserves_cache_entries() {
+fn publication_defers_cache_entries() {
     let key = PropertyKey::index(7).unwrap();
     let mut runtime = Runtime::new(HeapLimits::default()).unwrap();
     let before = runtime.heap().ics().len();
@@ -611,9 +612,13 @@ fn publication_reserves_cache_entries() {
     };
     let first = runtime.publish(unit(8, two)).unwrap();
     let second = runtime.publish(unit(8, two)).unwrap();
-    assert_eq!(runtime.code().get(first).ic_base as usize, before);
-    assert_eq!(runtime.code().get(second).ic_base as usize, before + 2);
-    assert_eq!(runtime.heap().ics().len(), before + 4);
+    for unit in [first, second] {
+        assert_eq!(
+            runtime.code().get(unit).ic_base.get(),
+            oxide_core::bytecode::IC_UNRESERVED
+        );
+    }
+    assert_eq!(runtime.heap().ics().len(), before);
     assert_eq!(runtime.heap().ics().filled(), 0);
 }
 

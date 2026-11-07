@@ -89,9 +89,19 @@ fn entry_failed(
     Ok(Value::object(promise))
 }
 
+/// Reserves the cache entries of a unit entered for the first time.
+#[cold]
+#[inline(never)]
+fn reserve_caches(cx: &mut Cx<'_>, unit: &CodeUnit) {
+    cx.heap.ics.reserve(unit);
+}
+
 /// [`enter`], inlined into the loop's call.
 #[inline(always)]
 fn enter_frame(cx: &mut Cx<'_>, unit: &CodeUnit, frame: Frame) -> Result<(), Throw> {
+    if unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+        reserve_caches(cx, unit);
+    }
     let poll = &mut cx.heap.vm.poll;
     *poll -= 1;
     if *poll == 0 {
@@ -1423,7 +1433,7 @@ fn learn_receiver_size(cx: &mut Cx<'_>, done: &Frame) {
     if insn.op != Opcode::New {
         return;
     }
-    let site = unit.ic_base as usize + insn.imm as usize;
+    let site = unit.ic_base.get() as usize + insn.imm as usize;
     let mut entry = cx.heap.ics.entries[site];
     if !entry.is_filled() || cx.heap.is_dictionary(receiver) {
         return;
@@ -1794,7 +1804,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
     set_unit!(frame.unit);
     let mut code: &[Insn] = &unit.code;
     let mut base = frame.base as usize;
-    let mut ic_base = unit.ic_base as usize;
+    let mut ic_base = unit.ic_base.get() as usize;
     let mut pc = start;
 
     macro_rules! window {
@@ -1815,7 +1825,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
             set_unit!(frame.unit);
             code = &unit.code;
             base = frame.base as usize;
-            ic_base = unit.ic_base as usize;
+            ic_base = unit.ic_base.get() as usize;
         }};
     }
     // Writes a value computed from the heap, then continues.
@@ -2612,7 +2622,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                                     unit = callee_unit;
                                     code = &unit.code;
                                     base = frame.base as usize;
-                                    ic_base = unit.ic_base as usize;
+                                    ic_base = unit.ic_base.get() as usize;
                                 }
                                 None => load_frame!(),
                             }
@@ -2670,7 +2680,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                         frame = caller;
                         code = &unit.code;
                         base = frame.base as usize;
-                        ic_base = unit.ic_base as usize;
+                        ic_base = unit.ic_base.get() as usize;
                         regs = window!();
                         continue 'dispatch;
                     }

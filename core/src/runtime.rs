@@ -766,9 +766,12 @@ impl Runtime {
         );
         let mut sites = Vec::new();
         for (id, unit) in self.units().all() {
+            if unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+                continue;
+            }
             for (pc, insn) in unit.code.iter().enumerate() {
                 if let Some(site) = insn.site() {
-                    let entry = (unit.ic_base + site) as usize;
+                    let entry = (unit.ic_base.get() + site) as usize;
                     let misses = stats.site_misses[entry];
                     if misses > 0 {
                         sites.push((misses, id, pc, *insn));

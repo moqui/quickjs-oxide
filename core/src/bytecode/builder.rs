@@ -205,7 +205,7 @@ impl CodeBuilder {
             constant_count: layout.constant_count,
             spill_register: layout.spill_register.unwrap_or(super::NO_SPILL),
             spill_slots: layout.spill_slots,
-            ic_base: 0,
+            ic_base: std::cell::Cell::new(super::IC_UNRESERVED),
             ic_count,
             children: layout.children.into(),
             name_atom: layout.name_atom,

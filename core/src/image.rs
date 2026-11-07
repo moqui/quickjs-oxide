@@ -632,7 +632,7 @@ impl<'i> Loader<'i> {
             constant_count: counts.constant_count,
             spill_register: counts.spill_register,
             spill_slots: counts.spill_slots,
-            ic_base: 0,
+            ic_base: std::cell::Cell::new(crate::bytecode::IC_UNRESERVED),
             ic_count: counts.ic_count,
             children: unit
                 .children
