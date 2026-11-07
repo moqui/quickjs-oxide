@@ -180,7 +180,7 @@ impl Digits {
 }
 
 /// A new string of `digits`.
-fn alloc_digits(cx: &mut Cx<'_>, digits: &Digits) -> Result<Value, Throw> {
+pub(crate) fn alloc_digits(cx: &mut Cx<'_>, digits: &Digits) -> Result<Value, Throw> {
     cx.heap
         .alloc_string_repr(StringRepr::OneByte(digits.as_bytes().into()))
         .map(Value::string)

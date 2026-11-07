@@ -26,3 +26,20 @@ try { 'a'.concat(Symbol('s')); } catch (e) { print(e.name); }
 var item = { id: 'I7', qty: 4, name: 'Item <7>' };
 print(`<li id="${item.id}" class="${item.qty > 3 ? 'big' : 'small'}">${item.name}: ${item.qty}</li>`);
 print(`${-1}${0}${'é'}${[1, 2]}${{}}`, `${'ü'}${'\u{1F600}'}`.length);
+// A rope receiver, more than 16 arguments with two-byte strings, a result
+// long enough to join through ropes, and the string length limit.
+var rope = 'a'.repeat(40) + 'b'.repeat(40);
+print(rope.concat(1, -2, 'c'), rope.concat(7).length);
+var args = [];
+for (var i = 0; i < 24; i++) args.push(i % 4 === 0 ? 'ж' + i : i % 4 === 1 ? i : 'p' + i);
+var joined = String.prototype.concat.apply('ü', args);
+print(joined, joined.length);
+var big = 'y'.repeat(1000).concat(12345, 'ж', 'z'.repeat(30), -7);
+print(big.length, big.slice(995, 1012), big.slice(-5));
+var d = 'x'.repeat(2 ** 20), parts = [];
+for (var k = 20; k < 30; k++) { parts.unshift(d); if (k < 29) d = d + d; }
+var near = parts.reduce(function (a, b) { return a + b; }) + 'x'.repeat(2 ** 20 - 5);
+print(near.length === 2 ** 30 - 5);
+try { near.concat(123456); } catch (e) { print(e.name, e.message); }
+print(near.concat('ab', 'cd').length === 2 ** 30 - 1, near.concat(1234).length === 2 ** 30 - 1);
+try { `${near}${123456}`; } catch (e) { print(e.name, e.message); }
