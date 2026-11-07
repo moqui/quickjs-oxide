@@ -517,6 +517,7 @@ impl Heap {
             .iter()
             .chain(&self.pending_closure_shapes)
             .chain(&self.arguments_shapes)
+            .chain(&[self.regexp_instance_shape.map(|(shape, _)| shape)])
             .flatten()
         {
             record(

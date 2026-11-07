@@ -293,15 +293,13 @@ pub(crate) fn regexp_object_with(
     )
     .map_err(|error| error::heap_error(cx, error))?;
     if prototype == cx.realm.intrinsic(Intrinsic::RegExpPrototype)
-        && cx.realm.regexp_instance_shape.get().is_none()
+        && cx.heap.regexp_instance_shape.is_none()
     {
         let (slot, _) = cx
             .heap
             .lookup_own(object, Names::key(names.last_index))
             .expect("lastIndex");
-        cx.realm
-            .regexp_instance_shape
-            .set(Some((cx.heap.shape_of(object), slot)));
+        cx.heap.regexp_instance_shape = Some((cx.heap.shape_of(object), slot));
     }
     Ok(Value::object(object))
 }
@@ -324,6 +322,47 @@ mod tests {
     #[test]
     fn program_bytes_includes_character_ranges() {
         assert_owned_payload_bytes("[aceg]", 4 * size_of::<oxide_regexp::CharacterRange>());
+    }
+
+    #[test]
+    fn the_instance_shape_outlives_every_instance() {
+        use crate::heap::gc::HeapLimits;
+        let mut runtime = crate::Runtime::new(HeapLimits::default()).unwrap();
+        let mut cx = runtime.cx();
+        let source = cx.heap.intern("a").unwrap();
+        cx.heap.roots().push(crate::Value::string(source));
+        let flags = cx.heap.intern("g").unwrap();
+        cx.heap.roots().push(crate::Value::string(flags));
+        let first = super::regexp_object(&mut cx, source, flags).unwrap();
+        let (shape, _) = cx.heap.regexp_instance_shape.unwrap();
+        assert_eq!(cx.heap.shape_of(first.as_object().unwrap()), shape);
+        // No instance is left; shapes made after the collection take the
+        // ids it frees.
+        cx.heap.collect();
+        let mark = cx.heap.roots().mark();
+        for name in ["p", "q", "r", "s"] {
+            let object = cx
+                .heap
+                .alloc_object(crate::ObjectKind::Ordinary, None, 4)
+                .unwrap();
+            cx.heap.roots().push(crate::Value::object(object));
+            let key = cx.heap.property_key(name).unwrap();
+            cx.heap
+                .add_property(
+                    object,
+                    key,
+                    crate::PropertyFlags::DEFAULT,
+                    crate::Value::int32(1),
+                )
+                .unwrap();
+        }
+        let second = super::regexp_object(&mut cx, source, flags).unwrap();
+        cx.heap.roots().truncate(mark);
+        assert_eq!(
+            cx.heap.regexp_instance_shape.map(|(shape, _)| shape),
+            Some(shape)
+        );
+        assert_eq!(cx.heap.shape_of(second.as_object().unwrap()), shape);
     }
 
     #[test]
