@@ -110,7 +110,12 @@ the higher-ranked signature. The `Scope` reads the call (`this`, `arg`,
   long as the function lives, and a cycle through it is never collected.
   The closure reaches the engine through its `Scope`; one that captures a
   `Runtime` or a `Context` keeps the runtime alive.
-- A `Context` method inside a host function returns `Reentered`. Inside a
+- A `Context` method inside a host function returns `Reentered`, unless
+  the host function lends its engine: `scope.lend(|| f())` makes every
+  `Context` and `Runtime` operation that `f` (code with no scope in hand)
+  calls, `run_pending_job` included, enter the host function's engine
+  above its frames ([Lending the engine](../../../docs/embedding.md#lending-the-engine)).
+  Collection, the reports and the options stay at the top level. Inside a
   host function `eval` and `compile` make transient code, and
   `compile_module*` and `execute_module` return
   `Unsupported("modules inside a host function")`.

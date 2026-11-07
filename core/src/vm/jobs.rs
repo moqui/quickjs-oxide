@@ -487,6 +487,15 @@ pub(crate) fn run_one_job(cx: &mut Cx<'_>) -> Result<bool, Throw> {
     result.map(|()| true)
 }
 
+/// [`run_one_job`] inside a running script or job, which keeps its kept
+/// objects: `ClearKeptObjects` waits for the outermost one to end.
+pub(crate) fn run_nested_job(cx: &mut Cx<'_>) -> Result<bool, Throw> {
+    let Some(job) = cx.heap.jobs.pop_front() else {
+        return Ok(false);
+    };
+    run_job(cx, job).map(|()| true)
+}
+
 /// Drains the job queue. A job that throws stops the drain and reports the
 /// throw (the queue keeps the jobs after it).
 pub(crate) fn run_jobs(cx: &mut Cx<'_>) -> Result<(), Throw> {

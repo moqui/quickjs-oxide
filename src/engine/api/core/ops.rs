@@ -1183,7 +1183,7 @@ mod sealed {
 
 /// Lists every shared operation once, with its documentation, and emits it
 /// as an inherent method of `Context` (one entry each, `Reentered` inside a
-/// host function), an inherent method of `Scope` (on the host function's
+/// host function unless it lends the engine), an inherent method of `Scope` (on the host function's
 /// view) and a method of [`Js`]. `Context` takes `&self`: its state is the
 /// runtime's, behind the `Rc`.
 macro_rules! js_ops {
@@ -1195,7 +1195,7 @@ macro_rules! js_ops {
             $(
                 $(#[$doc])*
                 pub fn $name $(<$($generic)*>)? (&self $(, $arg: $ty)*) -> $ret {
-                    let mut entry = self.runtime.enter()?;
+                    let mut entry = self.runtime.engine()?;
                     entry.view().$name($($arg),*)
                 }
             )*
@@ -1276,7 +1276,7 @@ macro_rules! js_ops {
 impl Context {
     /// [`Js::throw_error`].
     pub fn throw_error(&self, kind: NativeErrorKind, message: &str) -> RuntimeError {
-        match self.runtime.enter() {
+        match self.runtime.engine() {
             Ok(mut entry) => entry.view().throw_error(kind, message),
             Err(error) => error,
         }
