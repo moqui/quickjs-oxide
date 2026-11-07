@@ -40,7 +40,11 @@ fn lookup_table_exists_only_above_eight_properties() {
     assert_eq!(TABLE_THRESHOLD, 8);
     assert!(!heap.shape(heap.shape_of(object)).has_table());
     add(&mut heap, object, keys[8]);
+    // A hit near the top walks less than the threshold and builds nothing;
+    // a lookup that walks past it builds the table.
     assert_eq!(heap.lookup_own(object, keys[8]), Some((8, DEFAULT)));
+    assert!(!heap.shape(heap.shape_of(object)).has_table());
+    assert_eq!(heap.lookup_own(object, keys[0]), Some((0, DEFAULT)));
     assert!(heap.shape(heap.shape_of(object)).has_table());
     for (slot, &key) in keys.iter().enumerate() {
         assert_eq!(heap.lookup_own(object, key), Some((slot as u32, DEFAULT)));
@@ -442,4 +446,23 @@ fn accessors_take_two_slots() {
         heap.collect();
     }
     assert_eq!(heap.get_slot(object, 5), Value::int32(21));
+}
+
+#[test]
+fn a_shape_read_repeatedly_builds_its_own_table() {
+    // Every lookup is answered within the walk (a hit near the top), so
+    // none walks the threshold; the fourth builds the shape's table.
+    let mut heap = Heap::default();
+    let object = held(&mut heap, None);
+    let keys: Vec<_> = (1..=10).map(index).collect();
+    for &key in &keys {
+        add(&mut heap, object, key);
+    }
+    let shape = heap.shape_of(object);
+    for _ in 1..oxide_core::shape::TABLE_AFTER_LOOKUPS {
+        assert_eq!(heap.lookup_own(object, keys[8]), Some((8, DEFAULT)));
+        assert!(!heap.shape(shape).has_table());
+    }
+    assert_eq!(heap.lookup_own(object, keys[8]), Some((8, DEFAULT)));
+    assert!(heap.shape(shape).has_table());
 }

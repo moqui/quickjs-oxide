@@ -184,6 +184,11 @@ pub struct Heap {
     /// `callee`), sloppy then strict: learned from the first of each and
     /// marked as roots.
     pub(crate) arguments_shapes: [Option<ShapeId>; 2],
+    /// The shape of a fresh `%RegExp%` instance (only `lastIndex`) and the
+    /// slot of `lastIndex`: learned from the first and marked as a root, so
+    /// the fast paths that compare an instance's shape with it hold after
+    /// every instance has been collected.
+    pub(crate) regexp_instance_shape: Option<(ShapeId, u32)>,
     /// The job queue: roots until each runs.
     pub(crate) jobs: std::collections::VecDeque<crate::vm::jobs::Job>,
 }
@@ -251,6 +256,7 @@ impl Heap {
             closure_shapes: [None; CLOSURE_SHAPES],
             pending_closure_shapes: [None; CLOSURE_SHAPES],
             arguments_shapes: [None; 2],
+            regexp_instance_shape: None,
             jobs: std::collections::VecDeque::new(),
         };
         let cell = heap
@@ -1325,7 +1331,28 @@ impl Heap {
     }
 
     /// The atom with this content.
+    /// Gives back every arena's and the value heap's growth slack: the
+    /// realm is installed in doubling steps, and a runtime's floor should
+    /// not keep up to half of each arena empty.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.objects.shrink_to_fit();
+        self.shapes.shrink_to_fit();
+        self.strings.shrink_to_fit();
+        self.symbols.shrink_to_fit();
+        self.bigints.shrink_to_fit();
+        self.cells.shrink_to_fit();
+        self.payloads.functions.shrink_to_fit();
+        self.payloads.bytecode.shrink_to_fit();
+        self.payloads.internals.shrink_to_fit();
+        self.values.shrink_to_fit();
+    }
+
     pub fn intern(&mut self, text: &str) -> Result<StringId, HeapError> {
+        // ASCII text is its own Latin-1 bytes: an existing atom is found
+        // before anything is allocated.
+        if text.is_ascii() {
+            return self.intern_latin1(text.as_bytes());
+        }
         self.intern_repr(StringRepr::from_text(text))
     }
 
@@ -1366,6 +1393,9 @@ impl Heap {
     /// array index below 2^31 (which never enters the atom table), otherwise
     /// an atom.
     pub fn property_key(&mut self, text: &str) -> Result<PropertyKey, HeapError> {
+        if text.is_ascii() {
+            return self.property_key_latin1(text.as_bytes());
+        }
         self.key_for_repr(StringRepr::from_text(text))
     }
 

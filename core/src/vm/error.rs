@@ -563,16 +563,23 @@ pub(crate) fn stack_overflow(cx: &mut Cx<'_>) -> Throw {
 #[cold]
 #[inline(never)]
 pub(crate) fn poll_interrupts(cx: &mut Cx<'_>) -> Result<(), Throw> {
-    let interrupt = cx.heap.vm.interrupted
+    let pending = cx.heap.vm.interrupted
         || cx.host.interrupt.load(std::sync::atomic::Ordering::Relaxed)
         || cx.host.hooks.interrupt();
-    if !interrupt {
+    if !pending {
         cx.heap.vm.poll = super::INTERRUPT_INTERVAL;
         return Ok(());
     }
+    Err(interrupt(cx))
+}
+
+/// The uncatchable throw of an interrupt that a poll found (the loop's,
+/// or the RegExp matcher's).
+#[cold]
+pub(crate) fn interrupt(cx: &mut Cx<'_>) -> Throw {
     cx.heap.vm.interrupted = true;
     cx.heap.vm.poll = 1;
-    Err(throw(cx, ErrorKind::Internal, "interrupted"))
+    throw(cx, ErrorKind::Internal, "interrupted")
 }
 
 /// Whether a throw may be caught or turned into a completion (a rejection,

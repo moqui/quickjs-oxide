@@ -198,13 +198,13 @@ impl<'source> Parser<'source> {
             crate::engine::compiler::pseudo_binding::HOME_OBJECT_LOCAL_NAME,
             crate::engine::compiler::pseudo_binding::ACTIVE_FUNCTION_LOCAL_NAME,
         ] {
-            names.intern(synthetic);
+            names.intern_static(synthetic);
         }
         if is_module {
-            names.intern(crate::engine::code::module::MODULE_IMPORT_META_BINDING_NAME);
-            names.intern(crate::engine::code::module::MODULE_DEFAULT_BINDING_NAME);
+            names.intern_static(crate::engine::code::module::MODULE_IMPORT_META_BINDING_NAME);
+            names.intern_static(crate::engine::code::module::MODULE_DEFAULT_BINDING_NAME);
         }
-        let function_name = (!is_module).then(|| names.intern("<eval>"));
+        let function_name = (!is_module).then(|| names.intern_static("<eval>"));
         let root_function = FunctionBuilder::new(
             None,
             root_kind,

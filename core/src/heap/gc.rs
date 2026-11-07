@@ -506,6 +506,7 @@ impl Heap {
         shapes.extend(self.closure_shapes.iter().flatten());
         shapes.extend(self.pending_closure_shapes.iter().flatten());
         shapes.extend(self.arguments_shapes.iter().flatten());
+        shapes.extend(self.regexp_instance_shape.map(|(shape, _)| shape));
         self.mark_shapes(&mut shapes, &mut stack);
         self.gc.shape_stack = shapes;
         self.cells.mark(STATIC_CELL.0);

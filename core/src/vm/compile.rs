@@ -321,16 +321,27 @@ impl<'a> Compiler<'a> {
         };
         let order = code.tree(root);
         assert_eq!(order.len(), constants.len(), "one constant table per unit");
-        let position: FxHashMap<CodeUnitId, u32> = order
-            .iter()
-            .enumerate()
-            .map(|(index, &unit)| (unit, index as u32))
-            .collect();
+        // A short tree (an expression, a small script) finds a child's
+        // position by a scan; a long one by a map.
+        let position: Option<FxHashMap<CodeUnitId, u32>> = (order.len() > 16).then(|| {
+            order
+                .iter()
+                .enumerate()
+                .map(|(index, &unit)| (unit, index as u32))
+                .collect()
+        });
+        let position_of = |child: &CodeUnitId| match &position {
+            Some(position) => position[child],
+            None => order
+                .iter()
+                .position(|unit| unit == child)
+                .expect("a child of the tree") as u32,
+        };
         let children: Vec<Vec<u32>> = order
             .iter()
             .map(|&id| {
                 let unit = code.get(id);
-                unit.children.iter().map(|child| position[child]).collect()
+                unit.children.iter().map(position_of).collect()
             })
             .collect();
         let tree: Vec<BytecodeTemplate<'_>> = order

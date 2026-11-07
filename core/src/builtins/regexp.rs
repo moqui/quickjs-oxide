@@ -437,8 +437,7 @@ fn pristine_flags(cx: &Cx<'_>, object: ObjectId, cache: &RegExpFlagCache) -> Opt
     let heap = &*cx.heap;
     let prototype = cx.realm.intrinsic(Intrinsic::RegExpPrototype);
     if heap.object_kind(object) != ObjectKind::RegExp
-        || Some(heap.shape_of(object))
-            != cx.realm.regexp_instance_shape.get().map(|(shape, _)| shape)
+        || Some(heap.shape_of(object)) != cx.heap.regexp_instance_shape.map(|(shape, _)| shape)
         || heap.prototype_of(object) != Some(prototype)
         || heap.shape_of(prototype) != cache.shape
     {
@@ -546,7 +545,7 @@ pub(super) fn to_string(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
 /// (its only property, a writable data property).
 #[inline]
 fn last_index_slot(cx: &Cx<'_>, object: ObjectId) -> Option<u32> {
-    let (shape, slot) = cx.realm.regexp_instance_shape.get()?;
+    let (shape, slot) = cx.heap.regexp_instance_shape?;
     (cx.heap.shape_of(object) == shape).then_some(slot)
 }
 
@@ -587,15 +586,41 @@ fn run(
     string: StringId,
     start: usize,
 ) -> Result<Option<RegExpMatch>, Throw> {
-    let compiled = cx.heap.regexps.program(program);
-    let result = match &cx.heap.string(string).repr() {
-        StringRepr::OneByte(bytes) => {
-            oxide_regexp::execute_latin1_with_interrupt(compiled, bytes, start, || false)
-        }
-        StringRepr::TwoByte(units) => oxide_regexp::execute(compiled, units, start),
+    let heap = &*cx.heap;
+    let services = &mut *cx.host;
+    // The loop's interrupt sources, polled every 10,000 matcher steps as
+    // QuickJS's `lre_check_timeout` polls: a backtracking pattern stops at
+    // the embedder's deadline.
+    let already = heap.vm.interrupted;
+    let interrupted = || {
+        already
+            || services
+                .interrupt
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || services.hooks.interrupt()
     };
+    let mut countdown = heap.vm.regexp_poll;
+    let compiled = heap.regexps.program(program);
+    let result = match &heap.string(string).repr() {
+        StringRepr::OneByte(bytes) => oxide_regexp::execute_latin1_with_countdown(
+            compiled,
+            bytes,
+            start,
+            &mut countdown,
+            interrupted,
+        ),
+        StringRepr::TwoByte(units) => oxide_regexp::execute_with_countdown(
+            compiled,
+            units,
+            start,
+            &mut countdown,
+            interrupted,
+        ),
+    };
+    cx.heap.vm.regexp_poll = countdown;
     result.map_err(|failure| match failure {
         ExecError::OutOfMemory => error::oom(cx.realm),
+        ExecError::Interrupted => error::interrupt(cx),
         other => error::throw(cx, ErrorKind::Internal, &other.to_string()),
     })
 }
@@ -789,8 +814,7 @@ fn intrinsic_exec(cx: &mut Cx<'_>, object: ObjectId) -> Result<bool, Throw> {
         let heap = &*cx.heap;
         let prototype = cx.realm.intrinsic(Intrinsic::RegExpPrototype);
         if heap.object_kind(object) == ObjectKind::RegExp
-            && Some(heap.shape_of(object))
-                == cx.realm.regexp_instance_shape.get().map(|(shape, _)| shape)
+            && Some(heap.shape_of(object)) == cx.heap.regexp_instance_shape.map(|(shape, _)| shape)
             && heap.prototype_of(object) == Some(prototype)
             && heap.shape_of(prototype) == cache.shape
         {

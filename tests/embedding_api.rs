@@ -1217,6 +1217,83 @@ fn a_host_hook_sets_a_deadline() {
 }
 
 #[test]
+fn a_backtracking_regexp_stops_at_an_interrupt() {
+    // (a+)+$ on a long run of a's that does not end the input backtracks
+    // exponentially: only the matcher's own polling stops it.
+    struct Deadline(std::time::Instant);
+    impl Host for Deadline {
+        fn interrupt(&mut self) -> bool {
+            std::time::Instant::now() >= self.0
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    let timed = Runtime::with_host(Deadline(deadline), RuntimeOptions::default());
+    let timed_context = timed.context();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        timed_context.eval(
+            "try { /(a+)+$/.test('a'.repeat(40) + '!') } catch (e) { globalThis.caught = 1 }"
+        ),
+        Err(RuntimeError::Interrupted)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // Uncatchable, as the loop's interrupt is.
+    assert_eq!(
+        timed_context.eval("typeof caught").unwrap(),
+        string("undefined")
+    );
+    // A two-byte subject, through replace, and from another thread.
+    let (runtime, context) = self::runtime();
+    let thread = interrupt_later(&runtime, std::time::Duration::from_millis(50));
+    assert_eq!(
+        context.eval("('ж' + 'a'.repeat(40) + '!').replace(/(a+)+$/, () => 'x')"),
+        Err(RuntimeError::Interrupted)
+    );
+    thread.join().unwrap();
+    runtime.interrupt_handle().clear();
+    assert_eq!(
+        context.eval("/(a+)+$/.test('aaa')").unwrap(),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn a_counted_regexp_loop_stops_at_an_interrupt() {
+    // No backtracking: counted loops of empty bodies, alone and before a
+    // failing character at every start position.
+    struct Deadline(std::time::Instant);
+    impl Host for Deadline {
+        fn interrupt(&mut self) -> bool {
+            std::time::Instant::now() >= self.0
+        }
+    }
+    for source in [
+        "/(?:(?:){2147483646}){2147483646}/.test('')",
+        "/(?:){2147483646}x/.test('a'.repeat(1000))",
+        "/(?:\\b){2147483646}x/.test('a'.repeat(1000))",
+        // Each attempt fails forward, 20,000 characters in, at every start.
+        "new RegExp('a'.repeat(20000) + 'b').test('a'.repeat(1 << 22))",
+        // A /g loop of matches, each inside its search's first chunk.
+        "('a'.repeat(24000) + 'b').repeat(1000).match(new RegExp('a'.repeat(20000) + 'b', 'g'))",
+        "('a'.repeat(24000) + 'b').repeat(1000).replace(new RegExp('a'.repeat(20000) + 'b', 'g'), () => 'x')",
+    ] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let runtime = Runtime::with_host(Deadline(deadline), RuntimeOptions::default());
+        let context = runtime.context();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            context.eval(source),
+            Err(RuntimeError::Interrupted),
+            "{source}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn an_interrupt_unwinds_through_a_host_function() {
     let (runtime, context) = runtime();
     let global = context.global_object().unwrap();
@@ -1850,4 +1927,42 @@ fn into_js_makes_javascript_values() {
     );
     let failed: Result<i32, RuntimeError> = Err(RuntimeError::Invariant("x"));
     assert_eq!(failed.into_js(js), Err(RuntimeError::Invariant("x")));
+}
+
+#[test]
+fn call_and_construct_pass_every_argument_few_or_many() {
+    let (_runtime, context) = runtime();
+    let Value::Object(function) = context
+        .eval("(function F() { var s = [].join.call(arguments); if (new.target) this.s = s; return s; })")
+        .unwrap()
+    else {
+        panic!("a function")
+    };
+    let function = context.as_callable(&function).unwrap().unwrap();
+    let key = context.runtime().intern_property_key("s").unwrap();
+    for count in [0, 1, 4, 8, 9, 20] {
+        let arguments: Vec<Value> = (0..count).map(Value::Int).collect();
+        let expected = (0..count)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let Value::String(called) = context
+            .call(&function, Value::Undefined, &arguments)
+            .unwrap()
+        else {
+            panic!("a string")
+        };
+        assert_eq!(called.to_utf8_lossy(), expected, "call with {count}");
+        let Value::Object(made) = context.construct(&function, &arguments).unwrap() else {
+            panic!("an object")
+        };
+        let Value::String(constructed) = context.get_property(&made, &key).unwrap() else {
+            panic!("a string")
+        };
+        assert_eq!(
+            constructed.to_utf8_lossy(),
+            expected,
+            "construct with {count}"
+        );
+    }
 }

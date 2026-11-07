@@ -44,7 +44,7 @@ fn run_api(source: &str) -> String {
 #[test]
 fn the_corpus_prints_through_the_api_what_the_driver_prints() {
     let programs = corpus();
-    assert_eq!(programs.len(), 46);
+    assert_eq!(programs.len(), 49);
     let mut failures = Vec::new();
     for (name, source) in programs {
         let expected = run_on_core(&source);
@@ -232,4 +232,22 @@ fn handles_a_host_function_drops_are_released_after_each_call() {
         .eval("var o = {}; for (var i = 0; i < 10000000; i++) touch(o);")
         .unwrap();
     assert!(highest.get() < 16, "{} live handles", highest.get());
+}
+
+#[test]
+fn a_key_text_lasts_until_the_next_collection() {
+    use super::runtime::KeyTexts;
+    use crate::engine::value::JsString;
+    let mut texts = KeyTexts::default();
+    assert!(texts.get(0, 7).is_none());
+    texts.put(0, 7, &JsString::from_static("seven"));
+    assert_eq!(texts.get(0, 7).unwrap().to_utf8_lossy(), "seven");
+    // Another id in the same slot replaces it.
+    texts.put(0, 7 + 128, &JsString::from_static("other"));
+    assert!(texts.get(0, 7).is_none());
+    texts.put(0, 7, &JsString::from_static("seven"));
+    // A collection may have freed the atom and given its id to another.
+    assert!(texts.get(1, 7).is_none());
+    texts.put(1, 7, &JsString::from_static("reused"));
+    assert_eq!(texts.get(1, 7).unwrap().to_utf8_lossy(), "reused");
 }

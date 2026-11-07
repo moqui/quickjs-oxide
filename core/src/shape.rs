@@ -17,7 +17,7 @@
 //! lists, every cell downstream. A shape caches its prototype's cell; the
 //! prototype IC records `(holder, slot, cell)` and tests one boolean.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::fmt;
 
 use crate::heap::arena::Record;
@@ -29,6 +29,10 @@ use crate::value::{ObjectId, ShapeId, ValidityCellId, Value};
 
 /// Past this many properties a transition shape builds a lookup table.
 pub const TABLE_THRESHOLD: u32 = 8;
+
+/// The lookups past [`TABLE_THRESHOLD`] after which a shape builds its own
+/// table even when each was answered within the walk.
+pub const TABLE_AFTER_LOOKUPS: u8 = 4;
 /// Adding a property beyond this count moves the object to dictionary mode.
 pub const DICTIONARY_THRESHOLD: u32 = 64;
 /// The always-valid cell of shapes without a prototype.
@@ -100,12 +104,15 @@ impl fmt::Debug for PropertyFlags {
     }
 }
 
-/// A shape's outgoing transitions: a vector for up to four entries, a map
-/// beyond. Entries are weak: the collector drops those whose child died.
+/// A shape's outgoing transitions: one inline (most shapes, a builtin's
+/// prototype chain among them, have a single child), a vector for up to
+/// four, a map beyond. Entries are weak: the collector drops those whose
+/// child died.
 #[derive(Default)]
 pub enum Transitions {
     #[default]
     None,
+    One(PropertyKey, PropertyFlags, ShapeId),
     Small(Vec<(PropertyKey, PropertyFlags, ShapeId)>),
     Map(Box<FxHashMap<(PropertyKey, PropertyFlags), ShapeId>>),
 }
@@ -117,6 +124,9 @@ impl Transitions {
     pub fn find(&self, key: PropertyKey, flags: PropertyFlags) -> Option<ShapeId> {
         match self {
             Transitions::None => None,
+            Transitions::One(entry_key, entry_flags, child) => {
+                (*entry_key == key && *entry_flags == flags).then_some(*child)
+            }
             Transitions::Small(entries) => entries
                 .iter()
                 .find(|(entry_key, entry_flags, _)| *entry_key == key && *entry_flags == flags)
@@ -127,7 +137,13 @@ impl Transitions {
 
     fn insert(&mut self, key: PropertyKey, flags: PropertyFlags, child: ShapeId) {
         match self {
-            Transitions::None => *self = Transitions::Small(vec![(key, flags, child)]),
+            Transitions::None => *self = Transitions::One(key, flags, child),
+            Transitions::One(first_key, first_flags, first) => {
+                *self = Transitions::Small(vec![
+                    (*first_key, *first_flags, *first),
+                    (key, flags, child),
+                ]);
+            }
             Transitions::Small(entries) if entries.len() < SMALL_TRANSITIONS => {
                 entries.push((key, flags, child))
             }
@@ -146,6 +162,11 @@ impl Transitions {
     pub fn retain(&mut self, mut keep: impl FnMut(ShapeId) -> bool) {
         match self {
             Transitions::None => {}
+            Transitions::One(_, _, child) => {
+                if !keep(*child) {
+                    *self = Transitions::None;
+                }
+            }
             Transitions::Small(entries) => entries.retain(|entry| keep(entry.2)),
             Transitions::Map(map) => map.retain(|_, child| keep(*child)),
         }
@@ -153,18 +174,22 @@ impl Transitions {
 
     /// The child shapes.
     pub fn children(&self) -> impl Iterator<Item = ShapeId> + '_ {
-        let (entries, map) = match self {
-            Transitions::None => (&[][..], None),
-            Transitions::Small(entries) => (&entries[..], None),
-            Transitions::Map(map) => (&[][..], Some(map)),
+        let (one, entries, map) = match self {
+            Transitions::None => (None, &[][..], None),
+            Transitions::One(_, _, child) => (Some(*child), &[][..], None),
+            Transitions::Small(entries) => (None, &entries[..], None),
+            Transitions::Map(map) => (None, &[][..], Some(map)),
         };
         let mapped = map.into_iter().flat_map(|map| map.values().copied());
-        entries.iter().map(|entry| entry.2).chain(mapped)
+        one.into_iter()
+            .chain(entries.iter().map(|entry| entry.2))
+            .chain(mapped)
     }
 
     pub fn len(&self) -> usize {
         match self {
             Transitions::None => 0,
+            Transitions::One(..) => 1,
             Transitions::Small(entries) => entries.len(),
             Transitions::Map(map) => map.len(),
         }
@@ -331,6 +356,9 @@ pub struct Shape {
     /// Key → (slot, flags), built on the first lookup past
     /// [`TABLE_THRESHOLD`] properties.
     pub table: OnceCell<Box<FxHashMap<PropertyKey, (u32, PropertyFlags)>>>,
+    /// Lookups past [`TABLE_THRESHOLD`] answered without this shape's own
+    /// table; the table is built at [`TABLE_AFTER_LOOKUPS`].
+    pub lookups: Cell<u8>,
     /// The prototype's validity cell as last seen, or [`NONE`].
     pub validity: ValidityCellId,
     pub dictionary: Option<Box<Dictionary>>,
@@ -349,6 +377,7 @@ impl Shape {
             kind,
             transitions: Transitions::None,
             table: OnceCell::new(),
+            lookups: Cell::new(0),
             validity: ValidityCellId(NONE),
             dictionary: None,
         }
@@ -481,17 +510,43 @@ impl Heap {
         if let Some(dictionary) = &record.dictionary {
             return dictionary.find(key);
         }
-        if record.count > TABLE_THRESHOLD {
-            return record
-                .table
-                .get_or_init(|| Box::new(self.build_table(shape)))
-                .get(&key)
-                .copied();
+        // Above the threshold the walk stops at the nearest shape with a
+        // table, and builds one only after walking `TABLE_THRESHOLD`
+        // shapes: a chain grown one property at a time (a builtin's
+        // prototype as it is installed) builds a table every
+        // `TABLE_THRESHOLD` shapes, not one per shape.
+        let tabled = record.count > TABLE_THRESHOLD;
+        if tabled && record.table.get().is_none() && record.transitions.is_empty() {
+            // A leaf read repeatedly (a prototype's last shape) gets its own
+            // table. A shape with a child is on the way to another (a
+            // constructor's instances pass it on every add), so its lookups
+            // do not count.
+            let lookups = record.lookups.get() + 1;
+            if lookups >= TABLE_AFTER_LOOKUPS {
+                return record
+                    .table
+                    .get_or_init(|| Box::new(self.build_table(shape)))
+                    .get(&key)
+                    .copied();
+            }
+            record.lookups.set(lookups);
         }
         let mut current = record;
+        let mut steps = 0;
         while current.count > 0 {
+            if tabled && let Some(table) = current.table.get() {
+                return table.get(&key).copied();
+            }
             if current.key == key {
                 return Some((current.slot, current.flags));
+            }
+            steps += 1;
+            if tabled && steps >= TABLE_THRESHOLD {
+                return record
+                    .table
+                    .get_or_init(|| Box::new(self.build_table(shape)))
+                    .get(&key)
+                    .copied();
             }
             current = self
                 .shapes

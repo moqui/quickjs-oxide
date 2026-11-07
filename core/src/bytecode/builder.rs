@@ -231,17 +231,35 @@ impl CodeBuilder {
 /// Moves the property keys the instructions name into the unit's key table,
 /// each once in order of first use, and leaves each key operand its index.
 fn key_table(code: &mut [Insn]) -> Box<[crate::PropertyKey]> {
-    let mut keys: Vec<crate::PropertyKey> = Vec::new();
-    let mut index: crate::FxHashMap<u32, u32> = crate::FxHashMap::default();
-    for insn in code
-        .iter_mut()
-        .filter(|insn| matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey))
-    {
+    let names_key =
+        |insn: &Insn| matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey);
+    let uses = code.iter().filter(|insn| names_key(insn)).count();
+    if uses == 0 {
+        return Box::new([]);
+    }
+    let mut keys: Vec<crate::PropertyKey> = Vec::with_capacity(uses);
+    // A short unit's few keys are found by a scan; a long one's by a map.
+    let mut index: Option<crate::FxHashMap<u32, u32>> = (uses > 32).then(crate::FxHashMap::default);
+    for insn in code.iter_mut().filter(|insn| names_key(insn)) {
         let raw = insn.imm;
-        insn.imm = *index.entry(raw).or_insert_with(|| {
-            keys.push(crate::PropertyKey::from_raw(raw));
-            keys.len() as u32 - 1
-        });
+        let found = match &index {
+            Some(index) => index.get(&raw).copied(),
+            None => keys
+                .iter()
+                .position(|key| key.raw() == raw)
+                .map(|at| at as u32),
+        };
+        insn.imm = match found {
+            Some(at) => at,
+            None => {
+                keys.push(crate::PropertyKey::from_raw(raw));
+                let at = keys.len() as u32 - 1;
+                if let Some(index) = &mut index {
+                    index.insert(raw, at);
+                }
+                at
+            }
+        };
     }
     keys.into()
 }

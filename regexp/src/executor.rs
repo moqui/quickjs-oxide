@@ -13,7 +13,8 @@ use std::ops::Range;
 use super::{CharacterRange, CompiledRegExp, Instruction, RegExpFlags};
 use crate::unicode::case::regexp_canonicalize as canonicalize;
 
-const INTERRUPT_POLL_INTERVAL: u32 = 10_000;
+/// The steps between polls of the interrupt callback.
+pub const POLL_INTERVAL: u32 = 10_000;
 
 /// One successful match. Every range is measured in UTF-16 code units.
 /// Capture zero is the complete match; an unmatched group is `None`.
@@ -183,7 +184,7 @@ pub fn execute_with_interrupt<F>(
 where
     F: FnMut() -> bool,
 {
-    execute_units(program, input, start, interrupted)
+    execute_units(program, input, start, &mut { POLL_INTERVAL }, interrupted)
 }
 
 /// Execute a borrowed Latin-1 leaf directly; offsets remain UTF-16 units.
@@ -193,13 +194,39 @@ pub fn execute_latin1_with_interrupt<F: FnMut() -> bool>(
     start: usize,
     interrupted: F,
 ) -> Result<Option<RegExpMatch>, ExecError> {
-    execute_units(program, input, start, interrupted)
+    execute_units(program, input, start, &mut { POLL_INTERVAL }, interrupted)
+}
+
+/// [`execute_with_interrupt`] with the caller's countdown to the next poll
+/// (start it at [`POLL_INTERVAL`]), carried from one call to the next so a
+/// `/g` loop of short searches is polled by their total work.
+pub fn execute_with_countdown<F: FnMut() -> bool>(
+    program: &CompiledRegExp,
+    input: &[u16],
+    start: usize,
+    countdown: &mut u32,
+    interrupted: F,
+) -> Result<Option<RegExpMatch>, ExecError> {
+    execute_units(program, input, start, countdown, interrupted)
+}
+
+/// [`execute_latin1_with_interrupt`] with the caller's countdown, as
+/// [`execute_with_countdown`].
+pub fn execute_latin1_with_countdown<F: FnMut() -> bool>(
+    program: &CompiledRegExp,
+    input: &[u8],
+    start: usize,
+    countdown: &mut u32,
+    interrupted: F,
+) -> Result<Option<RegExpMatch>, ExecError> {
+    execute_units(program, input, start, countdown, interrupted)
 }
 
 fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
     program: &CompiledRegExp,
     input: &[T],
     start: usize,
+    countdown: &mut u32,
     mut interrupted: F,
 ) -> Result<Option<RegExpMatch>, ExecError> {
     #[cfg(test)]
@@ -215,20 +242,58 @@ fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
     let unicode = flags.is_unicode();
     let sticky = flags.contains(RegExpFlags::STICKY);
     let mut candidate = normalize_start(input, start, unicode);
-    let mut poller = Poller::new(&mut interrupted);
+    let mut poller = Poller::new(&mut interrupted, *countdown);
 
     let mut state =
         AttemptState::new(program.capture_count(), program.register_count(), candidate)?;
-    loop {
-        state.reset(candidate);
-        if let Some(result) = run_attempt(program, input, unicode, &mut poller, &mut state)? {
-            return Ok(Some(result));
+    let filter = if sticky { None } else { program.first_units() };
+    // An attempt is polled at every backtrack and jump back; between them it
+    // runs forward, at most the program's length. The starts go in chunks,
+    // and each chunk counts that bound for its starts: the search is polled
+    // by the work it can do, with no cost per attempt.
+    let length = program.instructions().len();
+    // About one poll interval of work per chunk.
+    let chunk = (POLL_INTERVAL as usize / length.max(1)).max(1);
+    let found = 'search: loop {
+        let end = candidate.saturating_add(chunk).min(input.len());
+        let first = candidate;
+        loop {
+            if let Some(filter) = filter {
+                // No attempt from a unit the first instruction rejects.
+                match input[candidate..]
+                    .iter()
+                    .position(|&unit| filter.contains(unit.into()))
+                {
+                    Some(skip) => candidate += skip,
+                    None => return Ok(None),
+                }
+            }
+            state.reset(candidate);
+            if let Some(result) = run_attempt(program, input, unicode, &mut poller, &mut state)? {
+                // The chunk's work so far counts toward the next search's
+                // poll (a /g loop of matches).
+                poller.step_by(chunk_work(candidate - first, length))?;
+                break 'search Some(result);
+            }
+            if sticky || candidate >= end {
+                break;
+            }
+            candidate = advance_string_index(input, candidate, unicode);
         }
-        if sticky || candidate == input.len() {
-            return Ok(None);
+        if sticky || candidate >= input.len() {
+            break 'search None;
         }
+        poller.step_by(chunk_work(candidate - first, length))?;
         candidate = advance_string_index(input, candidate, unicode);
-    }
+    };
+    *countdown = poller.remaining;
+    Ok(found)
+}
+
+/// The most steps the starts `first ..= first + starts` ran unpolled.
+#[inline]
+fn chunk_work(starts: usize, length: usize) -> u32 {
+    u32::try_from((starts + 1).saturating_mul(length)).unwrap_or(u32::MAX)
 }
 
 pub(super) fn validate_program(program: &CompiledRegExp) -> Result<(), ExecError> {
@@ -397,20 +462,28 @@ impl<'a, F> Poller<'a, F>
 where
     F: FnMut() -> bool,
 {
-    fn new(interrupted: &'a mut F) -> Self {
+    fn new(interrupted: &'a mut F, remaining: u32) -> Self {
         Self {
-            remaining: INTERRUPT_POLL_INTERVAL,
+            remaining: remaining.clamp(1, POLL_INTERVAL),
             interrupted,
         }
     }
 
     fn step(&mut self) -> Result<(), ExecError> {
-        self.remaining -= 1;
-        if self.remaining == 0 {
-            self.remaining = INTERRUPT_POLL_INTERVAL;
-            if (self.interrupted)() {
-                return Err(ExecError::Interrupted);
-            }
+        self.step_by(1)
+    }
+
+    /// Counts `work` steps at once: a failed attempt's instructions, which
+    /// ran without a poll.
+    #[inline]
+    fn step_by(&mut self, work: u32) -> Result<(), ExecError> {
+        if work < self.remaining {
+            self.remaining -= work;
+            return Ok(());
+        }
+        self.remaining = POLL_INTERVAL;
+        if (self.interrupted)() {
+            return Err(ExecError::Interrupted);
         }
         Ok(())
     }
@@ -734,9 +807,13 @@ where
 {
     let instructions = program.instructions();
 
+    // The interrupt is polled on backtracking, on a jump back and on a
+    // counted loop's repeat, as QuickJS's `lre_poll_timeout` is: an attempt
+    // that passes none of them is bounded by the program's length.
     macro_rules! fail_branch {
         () => {{
             if state.restore_backtrack() {
+                poller.step()?;
                 continue;
             }
             return Ok(None);
@@ -744,7 +821,6 @@ where
     }
 
     loop {
-        poller.step()?;
         let instruction_pc = state.pc;
         let instruction = instructions
             .get(instruction_pc)
@@ -905,7 +981,13 @@ where
                 state.reject_negative_lookahead(instruction_pc)?;
                 fail_branch!();
             }
-            Instruction::Jump { target } => state.pc = *target,
+            Instruction::Jump { target } => {
+                // A jump back closes a loop: polled too.
+                if *target <= instruction_pc {
+                    poller.step()?;
+                }
+                state.pc = *target;
+            }
             Instruction::Split { first, second } => {
                 state.push_backtrack(*second)?;
                 state.pc = *first;
@@ -938,6 +1020,8 @@ where
                 let value = value.wrapping_sub(1);
                 state.set_register(register_index, RegisterValue::Counter(value))?;
                 if value != 0 {
+                    // A counted loop may run 2^31 times, nested twice.
+                    poller.step()?;
                     state.pc = *target;
                 }
             }
@@ -1128,6 +1212,71 @@ fn is_word(character: u32, ignore_case: bool) -> bool {
         || character >= u32::from(b'A') && character <= u32::from(b'Z')
         || character >= u32::from(b'a') && character <= u32::from(b'z')
         || ignore_case && matches!(character, 0x017f | 0x212a)
+}
+
+/// The code units a match can start with: those of the first instruction
+/// that reads input, when it is a case-sensitive character or a positive
+/// class and only captures and registers come before it. In Unicode mode
+/// only a set below the surrogates qualifies, where a unit is its own
+/// character. A match can start only at such a unit, so the search skips
+/// the others without an attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FirstUnits {
+    latin1: [u64; 4],
+    wide: Box<[CharacterRange]>,
+}
+
+impl FirstUnits {
+    pub(super) fn of(flags: RegExpFlags, instructions: &[Instruction]) -> Option<Self> {
+        let limit = if flags.is_unicode() { 0xd7ff } else { 0xffff };
+        for instruction in instructions {
+            let ranges: &[CharacterRange] = match instruction {
+                Instruction::SaveStart { .. }
+                | Instruction::SaveEnd { .. }
+                | Instruction::ResetCaptures { .. }
+                | Instruction::SetRegister { .. } => continue,
+                Instruction::Char {
+                    value,
+                    ignore_case: false,
+                } => &[CharacterRange::new(*value, *value)],
+                Instruction::Range {
+                    ranges,
+                    inverted: false,
+                    ignore_case: false,
+                } => ranges,
+                _ => return None,
+            };
+            if ranges.iter().any(|range| range.end > limit) {
+                return None;
+            }
+            let mut latin1 = [0u64; 4];
+            for range in ranges {
+                for unit in range.start..=range.end.min(0xff) {
+                    latin1[(unit >> 6) as usize] |= 1 << (unit & 63);
+                }
+            }
+            let wide = ranges
+                .iter()
+                .filter(|range| range.end > 0xff)
+                .map(|range| CharacterRange::new(range.start.max(0x100), range.end))
+                .collect();
+            return Some(FirstUnits { latin1, wide });
+        }
+        None
+    }
+
+    pub(super) fn owned_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.wide)
+    }
+
+    #[inline]
+    pub(super) fn contains(&self, unit: u16) -> bool {
+        if unit < 0x100 {
+            self.latin1[usize::from(unit >> 6)] >> (unit & 63) & 1 != 0
+        } else {
+            range_contains(&self.wide, u32::from(unit))
+        }
+    }
 }
 
 fn range_contains(ranges: &[CharacterRange], character: u32) -> bool {

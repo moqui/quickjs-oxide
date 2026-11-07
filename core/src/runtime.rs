@@ -285,9 +285,6 @@ pub struct Realm {
     /// `%RegExp.prototype%`'s flag accessors as installed, for the `flags`
     /// getter's fast path.
     pub(crate) regexp_flags: std::cell::Cell<Option<crate::builtins::RegExpFlagCache>>,
-    /// The shape of a fresh `%RegExp%` instance (only `lastIndex`) and the
-    /// slot of `lastIndex`.
-    pub(crate) regexp_instance_shape: std::cell::Cell<Option<(crate::value::ShapeId, u32)>>,
 }
 
 impl Realm {
@@ -457,7 +454,6 @@ impl Runtime {
             symbols,
             brand,
             regexp_flags: std::cell::Cell::new(None),
-            regexp_instance_shape: std::cell::Cell::new(None),
         };
         let mut runtime = Runtime {
             heap,
@@ -470,6 +466,7 @@ impl Runtime {
         // The heap pinned every atom so far: the realm's names and the
         // builtins' properties. From here atoms live as long as their holders.
         runtime.heap.set_atom_mode(crate::heap::AtomMode::Weak);
+        runtime.heap.shrink_to_fit();
         Ok(runtime)
     }
 
