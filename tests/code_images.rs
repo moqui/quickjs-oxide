@@ -2,7 +2,7 @@
 //! value, runs as the compiled script does.
 
 use quickjs_oxide::engine::api::core::{
-    CodeImage, Context, Runtime, RuntimeError, Value, front_end_parses,
+    CodeImage, Context, Runtime, RuntimeError, Scope, Value, front_end_parses,
 };
 
 fn runtime() -> (Runtime, Context) {
@@ -206,11 +206,123 @@ fn an_image_counts_its_units() {
     let image = context.encode_image(&script).unwrap();
     assert_eq!(image.unit_count(), 3);
     assert!(image.bytes() > 0);
-    // A function value is not a compiled script.
-    let Value::Object(function) = context.eval("(function () {})").unwrap() else {
-        panic!()
-    };
-    let _ = function;
+    // Only a compiled script reaches `encode_image` here; the core's encoder
+    // refuses a closure or any other object (`only_a_script_encodes` in
+    // `api::core::image`).
+}
+
+/// A script with every part the corruptions break: several string keys,
+/// children, constants and a generator.
+const RICH: &str =
+    "var o = { alpha: 1, beta: 2 }; function* g(a, b) { yield o.alpha + a; yield o.beta + b; }
+                    function f(x) { return [...g(x, 'k')].join('|') + 1.5; } f(o.alpha)";
+
+#[test]
+fn a_malformed_image_fails_to_load_and_changes_nothing() {
+    let (_, compiled) = runtime();
+    let image = compiled.compile_image(RICH, "rich.js").unwrap();
+    for which in [
+        "key-site-missing",
+        "key-site-extra",
+        "key-site-unsorted",
+        "atom-index",
+        "child-index",
+        "child-twice",
+        "constant-count",
+        "constant-bits",
+        "ic-count",
+        "root-captures",
+        "root-flags",
+        "yield-flag",
+        "register",
+    ] {
+        let broken = image
+            .corrupted(which)
+            .unwrap_or_else(|| panic!("{which}: nothing to break"));
+        let (runtime, context) = runtime();
+        let before = runtime.memory_report().unwrap();
+        let result = context.load_image(&broken);
+        assert!(
+            matches!(result, Err(RuntimeError::Internal(_))),
+            "{which}: {result:?}"
+        );
+        let after = runtime.memory_report().unwrap();
+        assert_eq!(after.code.static_units, before.code.static_units, "{which}");
+        assert_eq!(after.ic_entries, before.ic_entries, "{which}");
+        assert_eq!(after.atoms, before.atoms, "{which}");
+        assert_eq!(after.pinned_atoms, before.pinned_atoms, "{which}");
+        // The intact image still loads into that runtime.
+        let script = context.load_image(&image).unwrap();
+        assert_eq!(printed(&context, context.execute(&script)), "2|2k1.5");
+    }
+}
+
+#[test]
+fn a_script_encodes_after_it_ran() {
+    let (_, compiled) = runtime();
+    let script = compiled.compile_with_filename(RICH, "ran.js").unwrap();
+    assert_eq!(printed(&compiled, compiled.execute(&script)), "2|2k1.5");
+    // Running mutated `o`; the code and its constants did not change.
+    compiled.eval("o.alpha = 100").unwrap();
+    let image = compiled.encode_image(&script).unwrap();
+    let (_, loaded) = runtime();
+    let script = loaded.load_image(&image).unwrap();
+    assert_eq!(printed(&loaded, loaded.execute(&script)), "2|2k1.5");
+}
+
+#[test]
+fn a_host_function_and_a_lend_load_images() {
+    let (_, compiled) = runtime();
+    let image = compiled.compile_image(RICH, "nested.js").unwrap();
+    let (runtime, context) = runtime();
+    let global = context.global_object().unwrap();
+    let in_scope = image.clone();
+    context
+        .define_function(&global, "loadHere", 0, move |scope: &mut Scope<'_>| {
+            let script = scope.load_image(&in_scope)?;
+            scope.execute(&script)
+        })
+        .unwrap();
+    let nested = context.clone();
+    context
+        .define_function(&global, "loadLent", 0, move |scope: &mut Scope<'_>| {
+            scope.lend(|| {
+                let script = nested.load_image(&image)?;
+                nested.execute(&script)
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        printed(&context, context.eval("loadHere() + ' ' + loadLent()")),
+        "2|2k1.5 2|2k1.5"
+    );
+    runtime.run_gc().unwrap();
+    // The loaded functions outlive the host functions and the collection.
+    assert_eq!(printed(&context, context.eval("f(1)")), "2|2k1.5");
+}
+
+#[test]
+fn a_second_thread_keeps_source_text_and_filenames() {
+    let source = "function shown(a, b) { return a + b; }\nfunction thrower() {\n  throw new Error('here');\n}\n[shown.toString(), (() => { try { thrower(); } catch (e) { return e.stack; } })()].join('#')";
+    let (_, compiled) = runtime();
+    let script = compiled
+        .compile_with_filename(source, "threaded.js")
+        .unwrap();
+    let expected = printed(&compiled, compiled.execute(&script));
+    assert!(
+        expected.contains("function shown(a, b) { return a + b; }"),
+        "{expected}"
+    );
+    let image = compiled.encode_image(&script).unwrap();
+    let actual = std::thread::spawn(move || {
+        let (_, context) = runtime();
+        let script = context.load_image(&image).unwrap();
+        printed(&context, context.execute(&script))
+    })
+    .join()
+    .unwrap();
+    assert!(actual.contains("threaded.js:3:"), "{actual}");
+    assert_eq!(actual, expected);
 }
 
 #[test]

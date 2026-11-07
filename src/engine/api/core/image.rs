@@ -23,6 +23,13 @@ impl CodeImage {
     pub fn bytes(&self) -> usize {
         self.0.bytes()
     }
+
+    /// A copy with one part broken, for the loader's tests
+    /// (`oxide_core::CodeImage::corrupted` names the parts).
+    #[doc(hidden)]
+    pub fn corrupted(&self, which: &str) -> Option<CodeImage> {
+        self.0.corrupted(which).map(CodeImage)
+    }
 }
 
 /// The scripts, modules and `eval` sources this thread's front end has
@@ -71,9 +78,38 @@ impl View<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Runtime, Value};
+
     #[test]
     fn an_image_is_send_and_sync() {
         fn check<T: Send + Sync>() {}
         check::<super::CodeImage>();
+    }
+
+    /// Only a script's root encodes: a closure's cells, a plain function's
+    /// unit and any other object are refused, never encoded.
+    #[test]
+    fn only_a_script_encodes() {
+        let runtime = Runtime::new();
+        let context = runtime.context();
+        for source in [
+            "(function () { let x = 1; return () => x; })()",
+            "(function plain(a) { return a; })",
+            "({})",
+            "[1, 2]",
+            "Math.max",
+        ] {
+            let Value::Object(object) = context.eval(source).unwrap() else {
+                panic!("{source}: not an object")
+            };
+            let mut entry = runtime.enter().unwrap();
+            let mut view = entry.view();
+            let id = view.object(&object).unwrap();
+            assert_eq!(
+                view.core.encode_image(id).map(drop),
+                Err(oxide_core::EncodeError::NotBytecode),
+                "{source}"
+            );
+        }
     }
 }

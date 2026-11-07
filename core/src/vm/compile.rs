@@ -241,8 +241,14 @@ impl<'a> Compiler<'a> {
     /// the heap (pinned until the compilation ends, its bytes charged to the
     /// collection trigger) while it runs. Its children must be published
     /// first.
-    pub fn publish(&mut self, mut unit: CodeUnit) -> Result<CodeUnitId, ValidateError> {
+    pub fn publish(&mut self, unit: CodeUnit) -> Result<CodeUnitId, ValidateError> {
         validate::validate(&unit, &|id| self.units().lookup(id))?;
+        Ok(self.publish_validated(unit))
+    }
+
+    /// [`Compiler::publish`] of a unit the validator already passed (an
+    /// image's, checked against the image's own units).
+    fn publish_validated(&mut self, mut unit: CodeUnit) -> CodeUnitId {
         self.heap.ics.reserve(&mut unit);
         match &mut self.code {
             // A static unit lives as long as the runtime, and so do its keys,
@@ -252,12 +258,12 @@ impl<'a> Compiler<'a> {
                 for atom in unit.key_atom_uses() {
                     self.heap.pin_atom(atom);
                 }
-                Ok(code.push(unit))
+                code.push(unit)
             }
             Store::Shared(_) => {
                 let (id, bytes) = self.heap.code.publish(unit);
                 self.heap.gc.allocated += bytes;
-                Ok(id)
+                id
             }
         }
     }
@@ -335,46 +341,35 @@ impl Compiler<'_> {
     ) -> Result<ObjectId, crate::image::LoadError> {
         use crate::image::LoadError;
         let mut loader = crate::image::Loader::new(image);
+        // Everything is checked before anything is published, interned or
+        // reserved, so a malformed image changes nothing.
+        crate::image::check(loader.image)?;
         let count = loader.image.units.len();
-        if count == 0 {
-            return Err(LoadError::Malformed("an image without units"));
+        let mut provisional: Vec<CodeUnit> =
+            (0..count).map(|index| loader.provisional(index)).collect();
+        for unit in &provisional {
+            validate::validate(unit, &|id| provisional.get(id.0 as usize))
+                .map_err(LoadError::Invalid)?;
         }
-        let sites: usize = loader
-            .image
-            .units
-            .iter()
-            .map(|unit| unit.counts.ic_count as usize)
-            .sum();
+        let sites: usize = provisional.iter().map(|unit| unit.ic_count as usize).sum();
         self.heap.ics.reserve_exact(sites);
         let mark = self.heap.roots().mark();
         let result = (|| {
-            let mut ids: Vec<Option<CodeUnitId>> = vec![None; count];
+            let mut ids: Vec<CodeUnitId> = Vec::with_capacity(count);
             // Children follow their parent in pre-order and have higher
             // indices, so publishing from the last unit back publishes every
             // child before its parent.
             for index in (0..count).rev() {
-                let mut children = Vec::new();
-                for &child in loader.image.units[index].children.iter() {
-                    let child = child as usize;
-                    if child <= index {
-                        return Err(LoadError::Malformed("a child index"));
-                    }
-                    children.push(
-                        ids.get(child)
-                            .copied()
-                            .flatten()
-                            .ok_or(LoadError::Malformed("a child index"))?,
-                    );
-                }
-                let unit = loader.unit(self.heap, index, children.into())?;
-                ids[index] = Some(self.publish(unit).map_err(LoadError::Invalid)?);
+                let mut unit = provisional.pop().expect("a unit per index");
+                let children = loader.image.units[index]
+                    .children
+                    .iter()
+                    .map(|&child| ids[count - 1 - child as usize])
+                    .collect();
+                loader.patch(self.heap, index, &mut unit, children)?;
+                ids.push(self.publish_validated(unit));
             }
-            let root = ids[0].expect("the root published");
-            // The tree from the root must be the image's pre-order.
-            let order = self.units().tree(root);
-            if order.len() != count || order.iter().zip(&ids).any(|(a, b)| Some(*a) != *b) {
-                return Err(LoadError::Malformed("the unit tree"));
-            }
+            let root = ids[count - 1];
             let mut tables = Vec::with_capacity(count);
             for index in 0..count {
                 tables.push(loader.constants(self.heap, self.realm, index, template_object)?);

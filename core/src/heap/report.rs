@@ -69,7 +69,10 @@ pub struct CodeReport {
     /// or another runtime: what the code store costs this runtime.
     pub static_bytes: usize,
     /// Bytes of the static units' bodies held with a code image or another
-    /// runtime, counted in full here and once for the process.
+    /// runtime, each body once, though the process holds it once for all
+    /// its runtimes. `dynamic_bytes`, `position_bytes` and `source_bytes`
+    /// count every unit's body in full, shared or not, so a transient load
+    /// charges the collector a body the image already holds.
     pub shared_body_bytes: usize,
     /// Bytes of the units' source-position tables.
     pub position_bytes: usize,

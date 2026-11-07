@@ -39,6 +39,7 @@ impl std::fmt::Debug for CodeImage {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ImageData {
     /// The atom table: every atom the units name, by text.
     pub(crate) atoms: Box<[StringRepr]>,
@@ -50,6 +51,7 @@ pub(crate) struct ImageData {
 /// One unit: its instructions with their atoms by index, its counts, its
 /// children by index, its constant table, and its body, which every runtime
 /// that loads the image shares.
+#[derive(Clone)]
 pub(crate) struct ImageUnit {
     /// The instructions; the `imm` of each one `key_sites` lists is an
     /// index into the atom table.
@@ -80,6 +82,7 @@ pub(crate) struct Counts {
 }
 
 /// A constant by value.
+#[derive(Clone)]
 pub(crate) enum Constant {
     /// A number, a boolean, `undefined` or `null`: the value's bits.
     Bits(u64),
@@ -149,6 +152,99 @@ impl std::fmt::Display for EncodeError {
 impl std::error::Error for EncodeError {}
 
 impl CodeImage {
+    /// A copy of the image with one part broken, for the loader's tests:
+    /// `key-site-missing`, `key-site-extra`, `key-site-unsorted`,
+    /// `atom-index`, `child-index`, `child-twice`, `constant-count`,
+    /// `constant-bits`, `ic-count`, `root-captures`, `root-flags`,
+    /// `yield-flag` or `register`. `None` when the image has nothing of that
+    /// part to break.
+    #[doc(hidden)]
+    pub fn corrupted(&self, which: &str) -> Option<CodeImage> {
+        let mut data = (*self.0).clone();
+        let atoms = data.atoms.len() as u32;
+        let units = &mut data.units;
+        let with_sites = units.iter().position(|unit| unit.key_sites.len() >= 2);
+        let with_children = units.iter().position(|unit| !unit.children.is_empty());
+        match which {
+            "key-site-missing" => {
+                let unit = &mut units[with_sites?];
+                unit.key_sites = unit.key_sites[1..].into();
+            }
+            "key-site-extra" => {
+                let unit = units.iter_mut().find(|unit| {
+                    unit.code.iter().enumerate().any(|(pc, insn)| {
+                        !names_key(insn) && !unit.key_sites.contains(&(pc as u32))
+                    })
+                })?;
+                let pc = unit.code.iter().position(|insn| !names_key(insn))? as u32;
+                let mut sites = unit.key_sites.to_vec();
+                sites.push(pc);
+                sites.sort_unstable();
+                unit.key_sites = sites.into();
+            }
+            "key-site-unsorted" => {
+                let unit = &mut units[with_sites?];
+                let mut sites = unit.key_sites.to_vec();
+                sites.swap(0, 1);
+                unit.key_sites = sites.into();
+            }
+            "atom-index" => {
+                let unit = &mut units[with_sites?];
+                let pc = unit.key_sites[0] as usize;
+                let mut code = unit.code.to_vec();
+                code[pc].imm = atoms;
+                unit.code = code.into();
+            }
+            "child-index" => {
+                let unit = &mut units[with_children?];
+                let mut children = unit.children.to_vec();
+                children[0] = 0;
+                unit.children = children.into();
+            }
+            "child-twice" => {
+                let unit = &mut units[with_children?];
+                let mut children = unit.children.to_vec();
+                children.push(children[0]);
+                unit.children = children.into();
+            }
+            "constant-count" => units[0].counts.constant_count += 1,
+            "constant-bits" => {
+                let unit = units.iter_mut().find(|unit| !unit.constants.is_empty())?;
+                let mut constants = unit.constants.to_vec();
+                constants[0] = Constant::Bits(Value::object(ObjectId(0)).bits());
+                unit.constants = constants.into();
+            }
+            "ic-count" => units[0].counts.ic_count = u32::MAX,
+            "root-captures" => {
+                let mut body = (*units[0].body).clone();
+                body.captures = vec![crate::bytecode::Capture::Register(0)].into();
+                units[0].body = Arc::new(body);
+            }
+            "root-flags" => units[0].counts.flags |= crate::bytecode::flags::GENERATOR,
+            "yield-flag" => {
+                let unit = units
+                    .iter_mut()
+                    .find(|unit| unit.counts.flags & crate::bytecode::flags::GENERATOR != 0)?;
+                unit.counts.flags &= !crate::bytecode::flags::GENERATOR;
+            }
+            "register" => {
+                let unit = units.iter_mut().find(|unit| {
+                    unit.code
+                        .iter()
+                        .any(|insn| insn.op.format() == crate::bytecode::Format::AB)
+                })?;
+                let mut code = unit.code.to_vec();
+                let insn = code
+                    .iter_mut()
+                    .find(|insn| insn.op.format() == crate::bytecode::Format::AB)?;
+                insn.b = 255;
+                unit.code = code.into();
+            }
+            _ => return None,
+        }
+        Some(CodeImage(Arc::new(data)))
+    }
+
     /// The number of units.
     pub fn unit_count(&self) -> usize {
         self.0.units.len()
@@ -188,16 +284,30 @@ fn names_key(insn: &Insn) -> bool {
     matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey)
 }
 
-/// Encodes the script whose function object is `function`.
+/// Encodes the script whose function object is `function`: a script's
+/// root, which captures no cell (its captures are the globals it names). Any other value, a closure among them
+/// (its captured cells are its runtime's), is [`EncodeError::NotBytecode`].
 pub(crate) fn encode(
     heap: &Heap,
     units: crate::Units<'_>,
     realm: &Realm,
     function: ObjectId,
 ) -> Result<CodeImage, EncodeError> {
+    if heap.object_kind(function) != crate::ObjectKind::Function {
+        return Err(EncodeError::NotBytecode);
+    }
     let root = heap
         .function_bytecode(function)
         .ok_or(EncodeError::NotBytecode)?;
+    let unit = units.get(heap.bytecode_unit(root));
+    let captures_nothing = unit
+        .captures
+        .iter()
+        .all(|capture| *capture == crate::bytecode::Capture::None);
+    if !unit.has(crate::bytecode::flags::SCRIPT) || !captures_nothing {
+        return Err(EncodeError::NotBytecode);
+    }
+    drop(unit);
     let mut encoder = Encoder {
         heap,
         units,
@@ -248,11 +358,17 @@ impl Encoder<'_> {
         let mut code = unit.code.to_vec();
         let mut key_sites = Vec::new();
         for (pc, insn) in code.iter_mut().enumerate() {
-            if names_key(insn)
-                && let KeyKind::String(atom) = insn.key().kind()
-            {
-                insn.imm = self.atom(atom);
-                key_sites.push(pc as u32);
+            if !names_key(insn) {
+                continue;
+            }
+            match insn.key().kind() {
+                KeyKind::String(atom) => {
+                    insn.imm = self.atom(atom);
+                    key_sites.push(pc as u32);
+                }
+                KeyKind::Index(_) => {}
+                // A symbol is its runtime's.
+                KeyKind::Symbol(_) => return Err(EncodeError::Constant("symbol key")),
             }
         }
         let name_atom = unit.name_atom.map(|atom| self.atom(atom));
@@ -375,6 +491,107 @@ fn counts_of(unit: &CodeUnit) -> Counts {
     }
 }
 
+/// Checks what the validator does not see before a load changes anything:
+/// the unit tree is the image's pre-order, every atom and constant index is
+/// in range, the key sites are exactly the instructions with string keys,
+/// the counts fit the code, the root is a script that captures no cell, and
+/// only a generator yields and only an async function awaits.
+pub(crate) fn check(image: &ImageData) -> Result<(), LoadError> {
+    use crate::bytecode::{Opcode, flags};
+    let malformed = LoadError::Malformed;
+    let count = image.units.len();
+    let atoms = image.atoms.len();
+    let root = image
+        .units
+        .first()
+        .ok_or(malformed("an image without units"))?;
+    if root.counts.flags & flags::SCRIPT == 0
+        || root.counts.flags & (flags::MODULE | flags::GENERATOR | flags::ASYNC) != 0
+        || root
+            .body
+            .captures
+            .iter()
+            .any(|capture| *capture != crate::bytecode::Capture::None)
+    {
+        return Err(malformed("the root"));
+    }
+    // The pre-order walk from the root names every unit once, in order.
+    let mut next = 0usize;
+    let mut pending = vec![0u32];
+    while let Some(index) = pending.pop() {
+        if index as usize != next {
+            return Err(malformed("the unit tree"));
+        }
+        next += 1;
+        let unit = &image.units[index as usize];
+        for &child in unit.children.iter().rev() {
+            if child as usize >= count || child <= index {
+                return Err(malformed("a child index"));
+            }
+            pending.push(child);
+        }
+        if next > count {
+            return Err(malformed("the unit tree"));
+        }
+    }
+    if next != count {
+        return Err(malformed("the unit tree"));
+    }
+    for unit in image.units.iter() {
+        let counts = unit.counts;
+        if counts.ic_count as usize > unit.code.len() + 1
+            || unit.constants.len() != counts.constant_count as usize
+        {
+            return Err(malformed("a unit's counts"));
+        }
+        let mut sites = unit.key_sites.iter().copied().peekable();
+        for (pc, insn) in unit.code.iter().enumerate() {
+            let site = sites.next_if_eq(&(pc as u32)).is_some();
+            if site {
+                if !names_key(insn) || insn.imm as usize >= atoms {
+                    return Err(malformed("a key site"));
+                }
+            } else if names_key(insn) && !matches!(insn.key().kind(), KeyKind::Index(_)) {
+                return Err(malformed("a key site"));
+            }
+            let generator = matches!(
+                insn.op,
+                Opcode::InitialYield | Opcode::Yield | Opcode::YieldStar
+            );
+            let awaits = matches!(insn.op, Opcode::Await | Opcode::AsyncStart);
+            if (generator && counts.flags & flags::GENERATOR == 0)
+                || (awaits && counts.flags & flags::ASYNC == 0)
+            {
+                return Err(malformed("an instruction the unit's flags do not allow"));
+            }
+        }
+        if sites.next().is_some() {
+            return Err(malformed("a key site"));
+        }
+        if unit.name_atom.is_some_and(|atom| atom as usize >= atoms) {
+            return Err(malformed("an atom index"));
+        }
+        for constant in unit.constants.iter() {
+            let in_range = |atom: &u32| (*atom as usize) < atoms;
+            let valid = match constant {
+                Constant::Bits(bits) => matches!(
+                    Value::from_bits(*bits).kind(),
+                    Kind::Number | Kind::Int32 | Kind::Bool | Kind::Undefined | Kind::Null
+                ),
+                Constant::Atom(atom) => in_range(atom),
+                Constant::String(_) | Constant::BigInt { .. } => true,
+                Constant::Template { cooked, raw } => {
+                    cooked.iter().flatten().all(in_range) && raw.iter().all(in_range)
+                }
+            };
+            if !valid {
+                return Err(malformed("a constant"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// What a load builds for one runtime: the atoms it interned.
 pub(crate) struct Loader<'i> {
     pub(crate) image: &'i ImageData,
@@ -409,32 +626,14 @@ impl<'i> Loader<'i> {
         Ok(id)
     }
 
-    /// The code unit of image unit `index` for this runtime, its children
-    /// already published as `children`.
-    pub(crate) fn unit(
-        &mut self,
-        heap: &mut Heap,
-        index: usize,
-        children: Box<[CodeUnitId]>,
-    ) -> Result<CodeUnit, LoadError> {
-        let image = self.image;
-        let unit = &image.units[index];
-        let mut code = unit.code.to_vec();
-        for &pc in &unit.key_sites {
-            let insn = code
-                .get_mut(pc as usize)
-                .filter(|insn| names_key(insn))
-                .ok_or(LoadError::Malformed("a key site"))?;
-            let atom = self.atom(heap, insn.imm)?;
-            insn.imm = crate::PropertyKey::atom(atom).raw();
-        }
-        let name_atom = unit
-            .name_atom
-            .map(|index| self.atom(heap, index))
-            .transpose()?;
+    /// The code unit of image unit `index` before it names this runtime:
+    /// its instructions with the image's atom indices, its children as
+    /// image indices (`CodeUnitId(child)`), for the validator.
+    pub(crate) fn provisional(&self, index: usize) -> CodeUnit {
+        let unit = &self.image.units[index];
         let counts = unit.counts;
-        Ok(CodeUnit {
-            code: code.into(),
+        CodeUnit {
+            code: unit.code.clone(),
             register_count: counts.register_count,
             parameter_count: counts.parameter_count,
             local_count: counts.local_count,
@@ -445,12 +644,42 @@ impl<'i> Loader<'i> {
             spill_slots: counts.spill_slots,
             ic_base: 0,
             ic_count: counts.ic_count,
-            children,
-            name_atom,
+            children: unit
+                .children
+                .iter()
+                .map(|&child| CodeUnitId(child))
+                .collect(),
+            name_atom: None,
             length: counts.length,
             atoms: Box::new([]),
             body: Arc::clone(&unit.body),
-        })
+        }
+    }
+
+    /// Makes the provisional unit of image unit `index` this runtime's: its
+    /// keys and name its atoms, its children their published ids.
+    pub(crate) fn patch(
+        &mut self,
+        heap: &mut Heap,
+        index: usize,
+        unit: &mut CodeUnit,
+        children: Box<[CodeUnitId]>,
+    ) -> Result<(), LoadError> {
+        let image = self.image;
+        let source = &image.units[index];
+        let mut code = std::mem::take(&mut unit.code);
+        for &pc in source.key_sites.iter() {
+            let insn = &mut code[pc as usize];
+            let atom = self.atom(heap, insn.imm)?;
+            insn.imm = crate::PropertyKey::atom(atom).raw();
+        }
+        unit.code = code;
+        unit.name_atom = source
+            .name_atom
+            .map(|index| self.atom(heap, index))
+            .transpose()?;
+        unit.children = children;
+        Ok(())
     }
 
     /// The constant table of image unit `index`, each value pushed on the
