@@ -516,7 +516,8 @@ impl Heap {
         // prototype as it is installed) builds a table every
         // `TABLE_THRESHOLD` shapes, not one per shape.
         let tabled = record.count > TABLE_THRESHOLD;
-        if tabled && record.table.get().is_none() && record.transitions.len() == 0 {
+        if tabled && record.table.get().is_none() && matches!(record.transitions, Transitions::None)
+        {
             // A leaf read repeatedly (a prototype's last shape) gets its own
             // table. A shape with a child is on the way to another (a
             // constructor's instances pass it on every add), so its lookups
