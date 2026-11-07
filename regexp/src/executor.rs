@@ -13,9 +13,8 @@ use std::ops::Range;
 use super::{CharacterRange, CompiledRegExp, Instruction, RegExpFlags};
 use crate::unicode::case::regexp_canonicalize as canonicalize;
 
-const INTERRUPT_POLL_INTERVAL: u32 = 10_000;
-/// The start positions a search tries between counts of their work.
-const SEARCH_CHUNK: usize = 4096;
+/// The steps between polls of the interrupt callback.
+pub const POLL_INTERVAL: u32 = 10_000;
 
 /// One successful match. Every range is measured in UTF-16 code units.
 /// Capture zero is the complete match; an unmatched group is `None`.
@@ -185,7 +184,7 @@ pub fn execute_with_interrupt<F>(
 where
     F: FnMut() -> bool,
 {
-    execute_units(program, input, start, interrupted)
+    execute_units(program, input, start, &mut { POLL_INTERVAL }, interrupted)
 }
 
 /// Execute a borrowed Latin-1 leaf directly; offsets remain UTF-16 units.
@@ -195,13 +194,39 @@ pub fn execute_latin1_with_interrupt<F: FnMut() -> bool>(
     start: usize,
     interrupted: F,
 ) -> Result<Option<RegExpMatch>, ExecError> {
-    execute_units(program, input, start, interrupted)
+    execute_units(program, input, start, &mut { POLL_INTERVAL }, interrupted)
+}
+
+/// [`execute_with_interrupt`] with the caller's countdown to the next poll
+/// (start it at [`POLL_INTERVAL`]), carried from one call to the next so a
+/// `/g` loop of short searches is polled by their total work.
+pub fn execute_with_countdown<F: FnMut() -> bool>(
+    program: &CompiledRegExp,
+    input: &[u16],
+    start: usize,
+    countdown: &mut u32,
+    interrupted: F,
+) -> Result<Option<RegExpMatch>, ExecError> {
+    execute_units(program, input, start, countdown, interrupted)
+}
+
+/// [`execute_latin1_with_interrupt`] with the caller's countdown, as
+/// [`execute_with_countdown`].
+pub fn execute_latin1_with_countdown<F: FnMut() -> bool>(
+    program: &CompiledRegExp,
+    input: &[u8],
+    start: usize,
+    countdown: &mut u32,
+    interrupted: F,
+) -> Result<Option<RegExpMatch>, ExecError> {
+    execute_units(program, input, start, countdown, interrupted)
 }
 
 fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
     program: &CompiledRegExp,
     input: &[T],
     start: usize,
+    countdown: &mut u32,
     mut interrupted: F,
 ) -> Result<Option<RegExpMatch>, ExecError> {
     #[cfg(test)]
@@ -217,7 +242,7 @@ fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
     let unicode = flags.is_unicode();
     let sticky = flags.contains(RegExpFlags::STICKY);
     let mut candidate = normalize_start(input, start, unicode);
-    let mut poller = Poller::new(&mut interrupted);
+    let mut poller = Poller::new(&mut interrupted, *countdown);
 
     let mut state =
         AttemptState::new(program.capture_count(), program.register_count(), candidate)?;
@@ -226,13 +251,18 @@ fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
     // and each chunk counts that bound for its starts: the search is polled
     // by the work it can do, with no cost per attempt.
     let length = program.instructions().len();
-    loop {
-        let end = candidate.saturating_add(SEARCH_CHUNK).min(input.len());
+    // About one poll interval of work per chunk.
+    let chunk = (POLL_INTERVAL as usize / length.max(1)).max(1);
+    let found = 'search: loop {
+        let end = candidate.saturating_add(chunk).min(input.len());
         let first = candidate;
         loop {
             state.reset(candidate);
             if let Some(result) = run_attempt(program, input, unicode, &mut poller, &mut state)? {
-                return Ok(Some(result));
+                // The chunk's work so far counts toward the next search's
+                // poll (a /g loop of matches).
+                poller.step_by(chunk_work(candidate - first, length))?;
+                break 'search Some(result);
             }
             if sticky || candidate >= end {
                 break;
@@ -240,12 +270,19 @@ fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
             candidate = advance_string_index(input, candidate, unicode);
         }
         if sticky || candidate >= input.len() {
-            return Ok(None);
+            break 'search None;
         }
-        let work = (candidate - first + 1).saturating_mul(length);
-        poller.step_by(u32::try_from(work).unwrap_or(u32::MAX))?;
+        poller.step_by(chunk_work(candidate - first, length))?;
         candidate = advance_string_index(input, candidate, unicode);
-    }
+    };
+    *countdown = poller.remaining;
+    Ok(found)
+}
+
+/// The most steps the starts `first ..= first + starts` ran unpolled.
+#[inline]
+fn chunk_work(starts: usize, length: usize) -> u32 {
+    u32::try_from((starts + 1).saturating_mul(length)).unwrap_or(u32::MAX)
 }
 
 pub(super) fn validate_program(program: &CompiledRegExp) -> Result<(), ExecError> {
@@ -414,9 +451,9 @@ impl<'a, F> Poller<'a, F>
 where
     F: FnMut() -> bool,
 {
-    fn new(interrupted: &'a mut F) -> Self {
+    fn new(interrupted: &'a mut F, remaining: u32) -> Self {
         Self {
-            remaining: INTERRUPT_POLL_INTERVAL,
+            remaining: remaining.clamp(1, POLL_INTERVAL),
             interrupted,
         }
     }
@@ -433,7 +470,7 @@ where
             self.remaining -= work;
             return Ok(());
         }
-        self.remaining = INTERRUPT_POLL_INTERVAL;
+        self.remaining = POLL_INTERVAL;
         if (self.interrupted)() {
             return Err(ExecError::Interrupted);
         }
