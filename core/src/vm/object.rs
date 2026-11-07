@@ -21,6 +21,7 @@
 
 use super::arguments;
 use super::error::{self, ErrorKind};
+use super::exotic;
 use super::ops;
 use super::property::{self, length_value};
 use super::proxy;
@@ -165,6 +166,7 @@ pub(crate) fn get_own_property(
     materialize_for(cx, object, key)?;
     match cx.heap.object_kind(object) {
         ObjectKind::Proxy => proxy::get_own_property(cx, object, key),
+        ObjectKind::HostExotic => host_get_own(cx, object, key),
         ObjectKind::StringWrapper => {
             if let Some(descriptor) = string_index(cx, object, key)? {
                 return Ok(Some(descriptor));
@@ -184,6 +186,19 @@ pub(crate) fn get_own_property(
             None => Ok(ordinary_get_own(cx, object, key)),
         },
         _ => Ok(ordinary_get_own(cx, object, key)),
+    }
+}
+
+/// A host exotic object's own property: its class's hook, else the
+/// ordinary one.
+fn host_get_own(
+    cx: &mut Cx<'_>,
+    object: ObjectId,
+    key: PropertyKey,
+) -> Result<Option<Descriptor>, Throw> {
+    match exotic::get_own_property(cx, object, key)? {
+        Some(own) => Ok(own),
+        None => Ok(ordinary_get_own(cx, object, key)),
     }
 }
 
@@ -271,6 +286,10 @@ pub(crate) fn define_own_property(
 ) -> Result<bool, Throw> {
     match cx.heap.object_kind(object) {
         ObjectKind::Proxy => proxy::define_own_property(cx, object, key, descriptor),
+        ObjectKind::HostExotic => match exotic::define_own_property(cx, object, key, descriptor)? {
+            Some(done) => Ok(done),
+            None => ordinary_define(cx, object, key, descriptor),
+        },
         ObjectKind::Array => array_define(cx, object, key, descriptor),
         ObjectKind::Arguments => arguments_define(cx, object, key, descriptor),
         ObjectKind::StringWrapper => {
@@ -767,6 +786,21 @@ pub(crate) fn has_property(
         materialize_for(cx, current, key)?;
         match cx.heap.object_kind(current) {
             ObjectKind::Proxy => return proxy::has(cx, current, key),
+            ObjectKind::HostExotic => {
+                if let Some(found) = exotic::has(cx, current, key)? {
+                    return Ok(found);
+                }
+                if host_get_own(cx, current, key)?.is_some() {
+                    return Ok(true);
+                }
+                match cx.heap.prototype_of(current) {
+                    Some(prototype) => {
+                        current = prototype;
+                        continue;
+                    }
+                    None => return Ok(false),
+                }
+            }
             ObjectKind::StringWrapper => {
                 if string_index(cx, current, key)?.is_some() {
                     return Ok(true);
@@ -806,6 +840,12 @@ pub(crate) fn get(
         materialize_for(cx, current, key)?;
         let descriptor = match cx.heap.object_kind(current) {
             ObjectKind::Proxy => return proxy::get(cx, current, key, receiver),
+            ObjectKind::HostExotic => {
+                if let Some(value) = exotic::get(cx, current, key, receiver)? {
+                    return Ok(value);
+                }
+                host_get_own(cx, current, key)?
+            }
             ObjectKind::StringWrapper => match string_index(cx, current, key)? {
                 Some(descriptor) => Some(descriptor),
                 None => ordinary_get_own(cx, current, key),
@@ -854,6 +894,12 @@ pub(crate) fn set(
         materialize_for(cx, current, key)?;
         let descriptor = match cx.heap.object_kind(current) {
             ObjectKind::Proxy => return proxy::set(cx, current, key, value, receiver),
+            ObjectKind::HostExotic => {
+                if let Some(done) = exotic::set(cx, current, key, value, receiver)? {
+                    return Ok(done);
+                }
+                host_get_own(cx, current, key)?
+            }
             ObjectKind::ModuleNamespace => return Ok(false),
             ObjectKind::StringWrapper => match string_index(cx, current, key)? {
                 Some(descriptor) => Some(descriptor),
@@ -921,6 +967,11 @@ pub(crate) fn set(
 pub(crate) fn delete(cx: &mut Cx<'_>, object: ObjectId, key: PropertyKey) -> Result<bool, Throw> {
     match cx.heap.object_kind(object) {
         ObjectKind::Proxy => return proxy::delete(cx, object, key),
+        ObjectKind::HostExotic => {
+            if let Some(done) = exotic::delete(cx, object, key)? {
+                return Ok(done);
+            }
+        }
         ObjectKind::StringWrapper => {
             if string_index(cx, object, key)?.is_some() {
                 return Ok(false);
@@ -1017,6 +1068,18 @@ pub(crate) fn own_property_keys(
 ) -> Result<Vec<PropertyKey>, Throw> {
     let keys = match cx.heap.object_kind(object) {
         ObjectKind::Proxy => return proxy::own_keys(cx, object),
+        ObjectKind::HostExotic => match exotic::own_keys(cx, object)? {
+            Some(mut keys) => {
+                let ordinary = ordinary_own_keys(cx, object);
+                if !ordinary.is_empty() {
+                    let listed: std::collections::HashSet<PropertyKey> =
+                        keys.iter().copied().collect();
+                    keys.extend(ordinary.into_iter().filter(|key| !listed.contains(key)));
+                }
+                keys
+            }
+            None => ordinary_own_keys(cx, object),
+        },
         ObjectKind::StringWrapper => {
             let string = cx
                 .heap

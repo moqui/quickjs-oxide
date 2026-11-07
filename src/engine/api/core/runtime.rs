@@ -95,6 +95,9 @@ impl Shared {
 
     /// Releases the handles dropped while the runtime was borrowed.
     pub(crate) fn drain_released(&self, core: &mut NativeCx<'_>) {
+        if self.released.borrow().is_empty() {
+            return;
+        }
         let released = std::mem::take(&mut *self.released.borrow_mut());
         for handle in released {
             core.release(handle);

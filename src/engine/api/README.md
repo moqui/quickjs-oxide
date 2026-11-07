@@ -22,6 +22,7 @@ options and report types.
 | `TypedArrayKind`, `TypedArrayView` | a typed array's element type and its window on its buffer |
 | `Js`, `JsResult` | the operations `Context` and `Scope` share, as a sealed trait for code generic over either; both also have each as an inherent method |
 | `Scope`, `FunctionOptions`, `HostFunction`, `Raw` | host functions: the function's view of its call and of the engine, how it is made, what `new_function` takes |
+| `ExoticClass`, `Hook`, `HostClass`, `ExoticScope` | host exotic objects: a class's internal-method hooks, a hook's answer or decline, a registered class, a hook's view of the engine |
 | `Value` | `Undefined`, `Null`, `Bool`, `Int`, `Float`, `BigInt(JsBigInt)` and `String(JsString)` as Rust data copied out of the core; `Symbol(SymbolRef)` and `Object(ObjectRef)` as handles |
 | `ObjectRef`, `SymbolRef`, `CallableRef` | a handle in the core's handle table, released on the last drop |
 | `PropertyKey`, `OrdinaryPropertyDescriptor`, `CompleteOrdinaryPropertyDescriptor`, `DescriptorField`, `AccessorValue`, `WellKnownSymbol` | keys and descriptors |
@@ -136,6 +137,21 @@ goes through a `Cell` or `RefCell` inside it. It drops when the object is
 collected. A host object prints as `Object` and is `[object Object]` to
 `Object.prototype.toString` unless its prototype defines
 `Symbol.toStringTag`.
+
+## Host exotic objects
+
+`register_exotic_class(class)` registers an `ExoticClass` once and returns
+its `HostClass`; `new_host_exotic(value, &class, prototype)` makes an object
+whose `[[GetOwnProperty]]`, `[[DefineOwnProperty]]`, `[[HasProperty]]`,
+`[[Get]]`, `[[Set]]`, `[[Delete]]` and `[[OwnPropertyKeys]]` are the class's
+hooks, with `value` as its host datum (`host_data`). Each hook receives an
+`ExoticScope` (every `Js` operation, the object as `this`, the receiver of a
+get or set as `receiver`), the datum and the key, and returns
+`Hook::Handled(answer)` or `Hook::Ordinary` to run the ordinary method; an
+error throws and a panic poisons the runtime as in a host function. No
+inline cache holds an answer, and as the global object's prototype the
+object resolves bare names. [Embedding internals](../../../docs/embedding.md#host-exotic-objects)
+gives the fallback rules and the cost.
 
 ## Promises and the event loop
 
