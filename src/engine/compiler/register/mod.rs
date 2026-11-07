@@ -120,7 +120,7 @@ pub(crate) fn lower_script_into(
     runtime: &mut Compiler<'_>,
     script: &UnlinkedFunction,
 ) -> Result<LoweredScript, LowerError> {
-    lower_script_with(runtime, script, TreeCache::default())
+    lower_script_with(runtime, script, TreeCache::take())
 }
 
 /// [`lower_script_into`] for a script the caller no longer needs: each
@@ -131,10 +131,8 @@ pub(crate) fn lower_owned_script_into(
 ) -> Result<LoweredScript, LowerError> {
     let mut sources = Vec::new();
     script.take_sources(&mut sources);
-    let tree = TreeCache {
-        sources: Some(sources.into_iter()),
-        ..TreeCache::default()
-    };
+    let mut tree = TreeCache::take();
+    tree.sources = Some(sources.into_iter());
     lower_script_with(runtime, &script, tree)
 }
 
@@ -156,6 +154,7 @@ fn lower_script_with(
         Ok(LoweredScript { root, function })
     })();
     runtime.heap_mut().roots().truncate(mark);
+    tree.give_back();
     result
 }
 
@@ -457,6 +456,31 @@ struct TreeCache {
     /// Each function's source text moved out of an owned tree, in the order
     /// the functions lower (children first); `None` copies it from the tree.
     sources: Option<std::vec::IntoIter<Option<Box<[u8]>>>>,
+}
+
+thread_local! {
+    /// The last compilation's buffers on this thread, emptied, for the next
+    /// one: a short script then allocates no lowering buffers at all.
+    static SPARE_TREE: std::cell::Cell<Option<Box<TreeCache>>> = const { std::cell::Cell::new(None) };
+}
+
+impl TreeCache {
+    /// The thread's spare buffers, or new ones.
+    fn take() -> TreeCache {
+        SPARE_TREE
+            .with(std::cell::Cell::take)
+            .map_or_else(TreeCache::default, |tree| *tree)
+    }
+
+    /// Empties the buffers and keeps them for the thread's next
+    /// compilation; the maps keep their capacity, not their strings.
+    fn give_back(mut self) {
+        self.keys.clear();
+        self.atoms.clear();
+        self.filename = None;
+        self.sources = None;
+        SPARE_TREE.with(|spare| spare.set(Some(Box::new(self))));
+    }
 }
 
 /// A [`Lowerer`]'s buffers between functions, empty.

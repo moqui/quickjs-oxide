@@ -15,6 +15,16 @@ pub(in crate::engine::compiler) struct NameId(u32);
 
 const RECENT_NAMES: usize = 256;
 
+/// The names a [`NameTable`] has room for before it grows.
+const INITIAL_NAMES: usize = 32;
+
+thread_local! {
+    /// The texts of the compiler's own names, shared by every parse on the
+    /// thread.
+    static STATIC_NAMES: std::cell::RefCell<HashMap<&'static str, Rc<str>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 #[derive(Debug)]
 pub(in crate::engine::compiler) struct NameTable {
     names: Vec<Rc<str>>,
@@ -26,12 +36,14 @@ pub(in crate::engine::compiler) struct NameTable {
 
 impl NameTable {
     pub(in crate::engine::compiler) fn new() -> Self {
+        // A short script interns a dozen names: room for them up front
+        // keeps the table from growing three times.
         Self {
-            names: Vec::new(),
-            by_name: HashMap::new(),
+            names: Vec::with_capacity(INITIAL_NAMES),
+            by_name: HashMap::with_capacity(INITIAL_NAMES),
             ascii_names: [None; 128],
             recent_names: [const { Cell::new(None) }; RECENT_NAMES],
-            js_strings: Vec::new(),
+            js_strings: Vec::with_capacity(INITIAL_NAMES),
         }
     }
 
@@ -39,9 +51,31 @@ impl NameTable {
         if let Some(id) = self.lookup(name) {
             return id;
         }
+        let owned: Rc<str> = name.into();
+        self.insert(name, owned)
+    }
+
+    /// [`NameTable::intern`] of a name the compiler itself spells (the
+    /// synthetic locals every parse pre-interns): its text is shared by
+    /// every parse on the thread, so interning it allocates nothing.
+    pub(in crate::engine::compiler) fn intern_static(&mut self, name: &'static str) -> NameId {
+        if let Some(id) = self.lookup(name) {
+            return id;
+        }
+        let owned = STATIC_NAMES.with(|names| {
+            Rc::clone(
+                names
+                    .borrow_mut()
+                    .entry(name)
+                    .or_insert_with(|| Rc::from(name)),
+            )
+        });
+        self.insert(name, owned)
+    }
+
+    fn insert(&mut self, name: &str, owned: Rc<str>) -> NameId {
         let id =
             NameId(u32::try_from(self.names.len()).expect("interned name count must fit in u32"));
-        let owned: Rc<str> = name.into();
         self.names.push(owned.clone());
         self.by_name.insert(owned, id);
         self.js_strings.push(None);
