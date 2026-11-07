@@ -1003,3 +1003,40 @@ fn a_hook_lends_its_engine() {
         "computed 3, computed 5"
     );
 }
+
+#[test]
+fn a_key_text_is_its_own_after_a_collection_reuses_the_atom() {
+    // The API keeps each string key's text until the next collection; a
+    // collection frees the names below and the next round's take their
+    // string ids.
+    struct Echo;
+    impl ExoticClass for Echo {
+        type Data = ();
+        fn get(&self, _: &mut ExoticScope<'_>, _: &(), key: &PropertyKey) -> JsResult<Hook<Value>> {
+            Ok(Hook::Handled(text(&name(key))))
+        }
+    }
+    let (_runtime, context) = runtime();
+    let class = context.register_exotic_class(Echo).unwrap();
+    let echo = context.new_host_exotic((), &class, None).unwrap();
+    let global = context.global_object().unwrap();
+    let key = context.runtime().intern_property_key("echo").unwrap();
+    context
+        .set_property(&global, &key, Value::Object(echo))
+        .unwrap();
+    for round in 0..3 {
+        let source = format!(
+            "(function () {{ var out = []; for (var i = 0; i < 300; i++) \
+             out.push(echo['r{round}_' + i] + echo['r{round}_' + i]); return out.join(); }})()"
+        );
+        let expected: Vec<String> = (0..300)
+            .map(|i| format!("r{round}_{i}r{round}_{i}"))
+            .collect();
+        assert_eq!(
+            eval_string(&context, &source),
+            expected.join(","),
+            "round {round}"
+        );
+        context.runtime().run_gc().unwrap();
+    }
+}

@@ -12,7 +12,8 @@
 //! compiled from new text each time), `execute` (a cached compile of
 //! `a + b * 2` executed, `a` and `b` globals), `exotic` (the same with `a`
 //! and `b` resolved by an exotic prototype of the global object), `call` (a
-//! cached function called with two arguments).
+//! cached function called with two arguments), `call4` (one called with
+//! four).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -118,6 +119,24 @@ fn main() {
                     .call(&function, Value::Undefined, &[Value::Int(1), Value::Int(2)])
                     .unwrap();
                 assert_eq!(result, Value::Int(5));
+            }
+        }
+        "call4" => {
+            let runtime = Runtime::new();
+            let context = runtime.context();
+            let Value::Object(function) = context
+                .eval("(function (a, b, c, d) { return a + b * 2 + c - d; })")
+                .unwrap()
+            else {
+                panic!()
+            };
+            let function = context.as_callable(&function).unwrap().unwrap();
+            let arguments = [Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)];
+            for _ in 0..count {
+                let result = context
+                    .call(&function, Value::Undefined, &arguments)
+                    .unwrap();
+                assert_eq!(result, Value::Int(4));
             }
         }
         other => panic!("unknown mode {other}"),
