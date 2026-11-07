@@ -864,3 +864,108 @@ fn a_set_site_never_caches_an_add_through_a_proxy_prototype() {
         Value::Int(8)
     );
 }
+
+/// A class that answers only `[[GetOwnProperty]]`: `fixed` is a
+/// non-configurable, read-only 1 and `loose` a configurable 2.
+struct OwnOnly;
+
+impl ExoticClass for OwnOnly {
+    type Data = ();
+
+    fn get_own_property(
+        &self,
+        _: &mut ExoticScope<'_>,
+        _: &(),
+        key: &PropertyKey,
+    ) -> JsResult<Hook<Option<CompleteOrdinaryPropertyDescriptor>>> {
+        let own = |value: i32, configurable: bool| {
+            Hook::Handled(Some(CompleteOrdinaryPropertyDescriptor::Data {
+                value: Value::Int(value),
+                writable: configurable,
+                enumerable: true,
+                configurable,
+            }))
+        };
+        Ok(match name(key).as_str() {
+            "fixed" => own(1, false),
+            "loose" => own(2, true),
+            _ => Hook::Ordinary,
+        })
+    }
+}
+
+#[test]
+fn a_declined_delete_or_define_honours_get_own_property() {
+    let (_, context) = runtime();
+    let class = context.register_exotic_class(OwnOnly).unwrap();
+    let object = context.new_host_exotic((), &class, None).unwrap();
+    context
+        .set_property(
+            &context.global_object().unwrap(),
+            &context.runtime().intern_property_key("own").unwrap(),
+            Value::Object(object),
+        )
+        .unwrap();
+    assert_eq!(
+        eval_string(
+            &context,
+            "[delete own.fixed, delete own.loose,
+              Reflect.defineProperty(own, 'fixed', { value: 2 }),
+              Reflect.defineProperty(own, 'fixed', { value: 1 }),
+              Reflect.defineProperty(own, 'fixed', { configurable: true }),
+              Reflect.defineProperty(own, 'loose', { value: 5 }),
+              own.fixed].join()"
+        ),
+        "false,true,false,true,false,true,1"
+    );
+    assert_eq!(
+        thrown(&context, context.eval("'use strict'; delete own.fixed")),
+        "TypeError: could not delete property"
+    );
+}
+
+/// A class whose key list repeats keys and mixes their kinds.
+struct Keys;
+
+impl ExoticClass for Keys {
+    type Data = ();
+
+    fn own_keys(&self, scope: &mut ExoticScope<'_>, _: &()) -> JsResult<Hook<Vec<PropertyKey>>> {
+        let symbol =
+            scope.well_known_symbol(quickjs_oxide::engine::api::core::WellKnownSymbol::Iterator)?;
+        let key = |text: &str| PropertyKey::from_js_string(JsString::try_from_utf8(text).unwrap());
+        Ok(Hook::Handled(vec![
+            PropertyKey::from(symbol),
+            key("b"),
+            key("10"),
+            key("a"),
+            key("b"),
+            key("2"),
+            key("own"),
+        ]))
+    }
+}
+
+#[test]
+fn own_keys_are_unique_and_ordered_as_an_ordinary_objects() {
+    let (_, context) = runtime();
+    let class = context.register_exotic_class(Keys).unwrap();
+    let object = context.new_host_exotic((), &class, None).unwrap();
+    context
+        .set_property(
+            &context.global_object().unwrap(),
+            &context.runtime().intern_property_key("keys").unwrap(),
+            Value::Object(object),
+        )
+        .unwrap();
+    assert_eq!(
+        eval_string(
+            &context,
+            "Object.defineProperty(keys, 'own', { value: 1, enumerable: true });
+             Object.defineProperty(keys, 'z', { value: 1, enumerable: true });
+             Object.defineProperty(keys, '1', { value: 1, enumerable: true });
+             Reflect.ownKeys(keys).map(String).join()"
+        ),
+        "1,2,10,b,a,own,z,Symbol(Symbol.iterator)"
+    );
+}
