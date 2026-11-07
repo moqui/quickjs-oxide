@@ -1,0 +1,20 @@
+[{"id":"I-3","qty":-3000,"name":"Item -3"},{"id":"I-2","qty":-2000,"name":"Item -2"},{"id":"I-1","qty":-1000,"name":"Item -1"},{"id":"I0","qty":0,"name":"Item 0"},{"id":"I1","qty":1000,"name":"Item 1"},{"id":"I2","qty":2000,"name":"Item 2"},{"id":"I3","qty":3000,"name":"Item 3"}]
+true Item 3
+[2147483647,-2147483648,0,0,1.5,1e+21,null,null]
+{"é":"ü","ж":"Ω","a\"b":"c\\d","\n":"\u0001\u001f","s":"𐀀\ud800x\udfff"}
+text "a\"b\\c/d\n\téЖ" 1 true 2 plain,esc,Akey,emptyy,w
+2 d x
+2 {"__proto__":[]}
+SyntaxError Unexpected end of JSON input
+SyntaxError Bad escaped character
+SyntaxError Bad control character in string literal
+{
+  "a": [
+    1,
+    {
+      "b": "c"
+    }
+  ]
+}
+"é " "s" "j"
+{"a":"x!","b":["y!","z\n!"]}

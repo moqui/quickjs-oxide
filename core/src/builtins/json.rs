@@ -4,11 +4,14 @@
 //! `SerializeJSONProperty` over the internal methods, so proxies, getters and
 //! `toJSON` are observed in spec order.
 
+use std::borrow::Cow;
+
 use super::{Native, define, methods, to_string_tag};
 use crate::ErrorKind;
 use crate::PropertyKey;
-use crate::heap::HeapError;
 use crate::heap::object::{InternalTag, ObjectKind};
+use crate::heap::string::StringRepr;
+use crate::heap::{Heap, HeapError};
 use crate::runtime::{Intrinsic, Names};
 use crate::shape::PropertyFlags;
 use crate::value::{Kind, ObjectId, Value};
@@ -117,7 +120,7 @@ fn heap_failure(cx: &mut Cx<'_>, error: HeapError) -> Failure {
     Failure::Throw(error::heap_error(cx, error))
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn peek(&self) -> Option<u16> {
         self.units.get(self.cursor).copied()
     }
@@ -330,7 +333,7 @@ impl Parser<'_> {
                         while self.peek().is_some_and(is_identifier_continue) {
                             self.cursor += 1;
                         }
-                        self.units[start..self.cursor].to_vec()
+                        Cow::Borrowed(&self.units[start..self.cursor])
                     }
                     Some(unit) if unit >= 0x80 => return self.syntax("unexpected character"),
                     None => return self.syntax("expecting property name"),
@@ -409,10 +412,13 @@ impl Parser<'_> {
         Ok((value, record))
     }
 
-    fn string(&mut self) -> Parsed<Vec<u16>> {
+    /// A string literal's contents: borrowed from the text when it has no
+    /// escape, so most strings and keys copy nothing before their record.
+    fn string(&mut self) -> Parsed<Cow<'a, [u16]>> {
         let separator = self.peek().unwrap_or(0x22);
         self.cursor += 1;
-        let mut output = Vec::new();
+        let (units, start) = (self.units, self.cursor);
+        let mut output: Option<Vec<u16>> = None;
         loop {
             let Some(unit) = self.peek() else {
                 return self.syntax("Unexpected end of JSON input");
@@ -422,12 +428,19 @@ impl Parser<'_> {
             }
             self.cursor += 1;
             match unit {
-                _ if unit == separator => return Ok(output),
+                _ if unit == separator => {
+                    return Ok(match output {
+                        Some(output) => Cow::Owned(output),
+                        None => Cow::Borrowed(&units[start..self.cursor - 1]),
+                    });
+                }
                 0x00..=0x1f => {
                     return self
                         .syntax_at("Bad control character in string literal", self.cursor - 1);
                 }
                 0x5c => {
+                    let backslash = self.cursor - 1;
+                    let output = output.get_or_insert_with(|| units[start..backslash].to_vec());
                     let Some(escaped) = self.peek() else {
                         return self.syntax("Unexpected end of JSON input");
                     };
@@ -456,7 +469,11 @@ impl Parser<'_> {
                         _ => return self.syntax_at("Bad escaped character", self.cursor - 1),
                     });
                 }
-                _ => output.push(unit),
+                _ => {
+                    if let Some(output) = &mut output {
+                        output.push(unit);
+                    }
+                }
             }
         }
     }
@@ -1064,8 +1081,7 @@ impl Serializer {
             self.separator();
             if is_object {
                 let name = super::object::key_string(cx, member)?;
-                let units = ops::units(cx.heap, name.as_string().unwrap());
-                quote(&mut self.out, &units);
+                quote_string(&mut self.out, cx.heap, name);
                 self.out.push(0x3a);
                 if !self.gap.is_empty() {
                     self.out.push(0x20);
@@ -1151,11 +1167,9 @@ impl Serializer {
             } else {
                 "false"
             }),
-            Kind::String => {
-                let units = ops::units(cx.heap, value.as_string().unwrap());
-                quote(&mut self.out, &units);
-            }
-            Kind::Int32 | Kind::Number => {
+            Kind::String => quote_string(&mut self.out, cx.heap, value),
+            Kind::Int32 => push_int(&mut self.out, value.as_int32().unwrap()),
+            Kind::Number => {
                 let number = value.as_f64().unwrap();
                 if number.is_finite() {
                     let text = number::to_string(number);
@@ -1236,12 +1250,41 @@ impl Serializer {
     }
 }
 
+/// An int32's digits, written without a `String`.
+fn push_int(out: &mut Vec<u16>, value: i32) {
+    let mut digits = [0u16; 11];
+    let mut at = digits.len();
+    let mut rest = value.unsigned_abs();
+    loop {
+        at -= 1;
+        digits[at] = u16::from(b'0') + (rest % 10) as u16;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        at -= 1;
+        digits[at] = u16::from(b'-');
+    }
+    out.extend_from_slice(&digits[at..]);
+}
+
+/// [`quote`] of the string `value`, read in place.
+fn quote_string(out: &mut Vec<u16>, heap: &Heap, value: Value) {
+    match heap.string(value.as_string().expect("a string")).repr() {
+        StringRepr::OneByte(bytes) => quote(out, bytes),
+        StringRepr::TwoByte(units) => quote(out, units),
+    }
+}
+
 /// `QuoteJSONString`: lone surrogates and control characters escaped.
-fn quote(out: &mut Vec<u16>, units: &[u16]) {
+fn quote<T: Copy + Into<u16>>(out: &mut Vec<u16>, units: &[T]) {
+    out.reserve(units.len() + 2);
     out.push(0x22);
     let mut index = 0;
     while index < units.len() {
-        let unit = units[index];
+        let unit: u16 = units[index].into();
         index += 1;
         let escape = match unit {
             0x08 => "\\b",
@@ -1254,10 +1297,10 @@ fn quote(out: &mut Vec<u16>, units: &[u16]) {
             0xd800..=0xdbff
                 if units
                     .get(index)
-                    .is_some_and(|next| (0xdc00..=0xdfff).contains(next)) =>
+                    .is_some_and(|&next| (0xdc00..=0xdfff).contains(&next.into())) =>
             {
                 out.push(unit);
-                out.push(units[index]);
+                out.push(units[index].into());
                 index += 1;
                 continue;
             }
