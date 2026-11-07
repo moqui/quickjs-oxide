@@ -138,6 +138,94 @@ pub(crate) fn alloc_units(cx: &mut Cx<'_>, units: &[u16]) -> Result<Value, Throw
 /// The shortest concatenation made a rope.
 const ROPE_MIN: usize = 64;
 
+/// An int32's decimal digits (`Number::toString`), written in place.
+#[derive(Clone, Copy)]
+pub(crate) struct Digits {
+    bytes: [u8; 11],
+    start: u8,
+}
+
+impl Digits {
+    pub(crate) fn new(value: i32) -> Self {
+        let mut bytes = [0; 11];
+        let mut at = bytes.len();
+        let mut rest = value.unsigned_abs();
+        loop {
+            at -= 1;
+            bytes[at] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            at -= 1;
+            bytes[at] = b'-';
+        }
+        Digits {
+            bytes,
+            start: at as u8,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes[self.start as usize..]
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len() - self.start as usize
+    }
+}
+
+/// A new string of `digits`.
+fn alloc_digits(cx: &mut Cx<'_>, digits: &Digits) -> Result<Value, Throw> {
+    cx.heap
+        .alloc_string_repr(StringRepr::OneByte(digits.as_bytes().into()))
+        .map(Value::string)
+        .map_err(|error| heap_error(cx, error))
+}
+
+/// `string + n` (or `n + string` when `digits_first`) for an int32 `n`: a
+/// short one-byte result is joined in one allocation, without a string for
+/// the digits.
+fn concat_digits(
+    cx: &mut Cx<'_>,
+    string: StringId,
+    n: i32,
+    digits_first: bool,
+) -> Result<Value, Throw> {
+    let digits = Digits::new(n);
+    let len = cx.heap.string_len(string);
+    if len + digits.len() < ROPE_MIN
+        && let StringRepr::OneByte(text) = cx.heap.string(string).repr()
+    {
+        let mut joined = Vec::with_capacity(len + digits.len());
+        if digits_first {
+            joined.extend_from_slice(digits.as_bytes());
+            joined.extend_from_slice(text);
+        } else {
+            joined.extend_from_slice(text);
+            joined.extend_from_slice(digits.as_bytes());
+        }
+        return cx
+            .heap
+            .alloc_string_repr(StringRepr::OneByte(joined.into()))
+            .map(Value::string)
+            .map_err(|error| heap_error(cx, error));
+    }
+    scoped(cx, |cx| {
+        root(cx, Value::string(string));
+        let digits = alloc_digits(cx, &digits)?.as_string().unwrap();
+        if digits_first {
+            concat(cx, digits, string)
+        } else {
+            concat(cx, string, digits)
+        }
+    })
+}
+
 /// QuickJS's `JS_STRING_LEN_MAX`.
 pub(crate) const MAX_STRING_LEN: usize = (1 << 30) - 1;
 
@@ -412,7 +500,7 @@ pub(crate) fn to_string(cx: &mut Cx<'_>, value: Value) -> Result<Value, Throw> {
     let names = &cx.realm.names;
     match value.kind() {
         Kind::String => Ok(value),
-        Kind::Int32 => alloc_text(cx, &value.as_int32().unwrap().to_string()),
+        Kind::Int32 => alloc_digits(cx, &Digits::new(value.as_int32().unwrap())),
         Kind::Number => alloc_text(cx, &number::to_string(value.as_f64().unwrap())),
         Kind::Bool => Ok(Value::string(if value == Value::TRUE {
             names.true_
@@ -580,6 +668,12 @@ pub(crate) enum Arith {
 pub(crate) fn add(cx: &mut Cx<'_>, x: Value, y: Value) -> Result<Value, Throw> {
     if let (Some(a), Some(b)) = (x.as_string(), y.as_string()) {
         return concat(cx, a, b);
+    }
+    if let (Some(a), Some(n)) = (x.as_string(), y.as_int32()) {
+        return concat_digits(cx, a, n, false);
+    }
+    if let (Some(n), Some(b)) = (x.as_int32(), y.as_string()) {
+        return concat_digits(cx, b, n, true);
     }
     scoped(cx, |cx| {
         let px = to_primitive(cx, x, Hint::Default)?;
