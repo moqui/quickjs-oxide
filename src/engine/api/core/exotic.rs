@@ -199,6 +199,14 @@ impl ExoticScope<'_> {
         self.view().lift(receiver).unwrap_or(Value::Undefined)
     }
 
+    /// Lends the engine to the Rust code `f` runs, as
+    /// [`Scope::lend`](super::Scope::lend) does for a host function: a hook
+    /// whose answer comes from code that runs scripts through a `Context`
+    /// (an entity's service) wraps that code in it.
+    pub fn lend<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        super::function::lend(&mut self.core, &self.shared, f)
+    }
+
     /// Whether the receiver is the exotic object itself.
     pub fn receiver_is_this(&self) -> bool {
         self.receiver.as_object() == Some(self.this)

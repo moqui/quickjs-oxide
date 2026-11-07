@@ -969,3 +969,37 @@ fn own_keys_are_unique_and_ordered_as_an_ordinary_objects() {
         "1,2,10,b,a,own,z,Symbol(Symbol.iterator)"
     );
 }
+
+/// A class whose `get` answers by running a script through a `Context`,
+/// as an embedder's service would.
+struct Scripted(Context);
+
+impl ExoticClass for Scripted {
+    type Data = ();
+
+    fn get(&self, scope: &mut ExoticScope<'_>, _: &(), key: &PropertyKey) -> JsResult<Hook<Value>> {
+        let source = format!("'computed ' + {:?}.length", name(key));
+        let context = &self.0;
+        scope.lend(|| context.eval(&source)).map(Hook::Handled)
+    }
+}
+
+#[test]
+fn a_hook_lends_its_engine() {
+    let (_, context) = runtime();
+    let class = context
+        .register_exotic_class(Scripted(context.clone()))
+        .unwrap();
+    let object = context.new_host_exotic((), &class, None).unwrap();
+    context
+        .set_property(
+            &context.global_object().unwrap(),
+            &context.runtime().intern_property_key("scripted").unwrap(),
+            Value::Object(object),
+        )
+        .unwrap();
+    assert_eq!(
+        eval_string(&context, "scripted.abc + ', ' + scripted.hello"),
+        "computed 3, computed 5"
+    );
+}

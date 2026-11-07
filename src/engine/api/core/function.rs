@@ -110,17 +110,7 @@ impl Scope<'_> {
     /// the top level (`Reentered`). A lend costs two swaps of the heap's and
     /// the services' headers (about 0.2 µs).
     pub fn lend<R>(&mut self, f: impl FnOnce() -> R) -> R {
-        let spare = self.shared.spares.borrow_mut().pop().unwrap_or_default();
-        let lent = self.core.lend(spare);
-        let previous = self.shared.lent.replace(Some(lent));
-        let restore = Restore {
-            core: &mut self.core,
-            shared: &self.shared,
-            previous,
-        };
-        let result = f();
-        drop(restore);
-        result
+        lend(&mut self.core, &self.shared, f)
     }
 
     /// The value a host object receiver holds ([`Js::host_data`](super::Js::host_data) of
@@ -131,6 +121,21 @@ impl Scope<'_> {
             _ => Ok(None),
         }
     }
+}
+
+/// Lends `core`'s engine to `f` ([`Scope::lend`]).
+pub(crate) fn lend<R>(core: &mut NativeCx<'_>, shared: &Shared, f: impl FnOnce() -> R) -> R {
+    let spare = shared.spares.borrow_mut().pop().unwrap_or_default();
+    let lent = core.lend(spare);
+    let previous = shared.lent.replace(Some(lent));
+    let restore = Restore {
+        core,
+        shared,
+        previous,
+    };
+    let result = f();
+    drop(restore);
+    result
 }
 
 /// Takes back a lent engine when [`Scope::lend`]'s closure returns or
