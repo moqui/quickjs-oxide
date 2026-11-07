@@ -86,6 +86,48 @@ pub(crate) struct Shared {
     pub(crate) lent: RefCell<Option<oxide_core::Lent>>,
     /// Spares kept between lends.
     pub(crate) spares: RefCell<Vec<oxide_core::Spare>>,
+    /// The text of string keys lifted for hooks (`View::lift_key`).
+    pub(crate) key_texts: RefCell<KeyTexts>,
+}
+
+/// The `JsString` of each string key lifted recently, so a hook that reads
+/// the same name on every run (a bare name an exotic global prototype
+/// resolves) gets it without copying the atom's text. Direct-mapped by the
+/// atom's string id; a collection may free an atom and reuse its id, so the
+/// table is emptied when the collector's count moves.
+#[derive(Default)]
+pub(crate) struct KeyTexts {
+    collections: u64,
+    slots: Vec<Option<(u32, JsString)>>,
+}
+
+impl KeyTexts {
+    const SLOTS: usize = 128;
+
+    /// The cached text of string `id`, valid while the collector has run
+    /// `collections` times.
+    pub(crate) fn get(&mut self, collections: u64, id: u32) -> Option<JsString> {
+        if self.collections != collections {
+            self.collections = collections;
+            self.slots.clear();
+            return None;
+        }
+        match self.slots.get(id as usize % Self::SLOTS) {
+            Some(Some((cached, text))) if *cached == id => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put(&mut self, collections: u64, id: u32, text: &JsString) {
+        if self.collections != collections {
+            self.collections = collections;
+            self.slots.clear();
+        }
+        if self.slots.is_empty() {
+            self.slots.resize(Self::SLOTS, None);
+        }
+        self.slots[id as usize % Self::SLOTS] = Some((id, text.clone()));
+    }
 }
 
 impl Shared {
@@ -329,6 +371,7 @@ impl Runtime {
                 debug_info: Cell::new(DebugInfoMode::Full),
                 lent: RefCell::new(None),
                 spares: RefCell::new(Vec::new()),
+                key_texts: RefCell::new(KeyTexts::default()),
                 turns: Cell::new(0),
             }),
         }

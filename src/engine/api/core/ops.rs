@@ -39,6 +39,27 @@ pub(crate) struct View<'a> {
     mark: RootMark,
 }
 
+/// Lowered call arguments ([`View::lower_arguments`]).
+pub(crate) enum Arguments {
+    Inline([oxide_core::Value; Arguments::INLINE], usize),
+    Heap(Vec<oxide_core::Value>),
+}
+
+impl Arguments {
+    const INLINE: usize = 8;
+}
+
+impl std::ops::Deref for Arguments {
+    type Target = [oxide_core::Value];
+
+    fn deref(&self) -> &[oxide_core::Value] {
+        match self {
+            Arguments::Inline(values, len) => &values[..*len],
+            Arguments::Heap(values) => values,
+        }
+    }
+}
+
 impl Drop for View<'_> {
     fn drop(&mut self) {
         self.core.heap_mut().roots().truncate(self.mark);
@@ -136,6 +157,19 @@ impl View<'_> {
         values.iter().map(|value| self.lower(value)).collect()
     }
 
+    /// The arguments of a call, lowered: up to [`Arguments::INLINE`] in
+    /// place, so a call with a few arguments allocates nothing for them.
+    pub(crate) fn lower_arguments(&mut self, values: &[Value]) -> JsResult<Arguments> {
+        if values.len() > Arguments::INLINE {
+            return Ok(Arguments::Heap(self.lower_all(values)?));
+        }
+        let mut inline = [oxide_core::Value::UNDEFINED; Arguments::INLINE];
+        for (slot, value) in inline.iter_mut().zip(values) {
+            *slot = self.lower(value)?;
+        }
+        Ok(Arguments::Inline(inline, values.len()))
+    }
+
     /// The value a handle of this runtime holds.
     pub(crate) fn own(&self, slot: &Slot) -> JsResult<oxide_core::Value> {
         if slot.of(self.shared) {
@@ -195,13 +229,27 @@ impl View<'_> {
 
     /// The API key of a core key.
     pub(crate) fn lift_key(&mut self, key: oxide_core::PropertyKey) -> JsResult<PropertyKey> {
-        // A string key is copied from its flat representation once.
+        // A string key is copied from its flat representation once, and
+        // kept until the next collection for the next lift of the same atom.
         if let oxide_core::heap::atom::KeyKind::String(id) = key.kind() {
+            let collections = self.core.heap().gc().stats.collections;
+            let cached = self
+                .shared
+                .key_texts
+                .borrow_mut()
+                .get(collections, id.index());
+            if let Some(text) = cached {
+                return Ok(PropertyKey(Key::String(text)));
+            }
             let text = match self.core.string_repr(oxide_core::Value::string(id)) {
                 Some(StringRepr::OneByte(units)) => JsString::try_from_latin1(units)?,
                 Some(StringRepr::TwoByte(units)) => JsString::try_from_utf16_slice(units)?,
                 None => JsString::from_static(""),
             };
+            self.shared
+                .key_texts
+                .borrow_mut()
+                .put(collections, id.index(), &text);
             return Ok(PropertyKey(Key::String(text)));
         }
         Ok(match self.core.key_name(key) {
@@ -561,7 +609,7 @@ impl View<'_> {
     ) -> JsResult<Value> {
         let function = self.function(callable)?;
         let this = self.lower(&this_value)?;
-        let args = self.lower_all(arguments)?;
+        let args = self.lower_arguments(arguments)?;
         let result = self.core.call(function, this, &args);
         self.complete(result)
     }
@@ -582,7 +630,7 @@ impl View<'_> {
     ) -> JsResult<Value> {
         let function = self.function(constructor)?;
         let target = self.function(new_target)?;
-        let args = self.lower_all(arguments)?;
+        let args = self.lower_arguments(arguments)?;
         if !self.core.is_constructor(function) {
             let error = self
                 .core

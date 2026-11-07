@@ -1851,3 +1851,41 @@ fn into_js_makes_javascript_values() {
     let failed: Result<i32, RuntimeError> = Err(RuntimeError::Invariant("x"));
     assert_eq!(failed.into_js(js), Err(RuntimeError::Invariant("x")));
 }
+
+#[test]
+fn call_and_construct_pass_every_argument_few_or_many() {
+    let (_runtime, context) = runtime();
+    let Value::Object(function) = context
+        .eval("(function F() { var s = [].join.call(arguments); if (new.target) this.s = s; return s; })")
+        .unwrap()
+    else {
+        panic!("a function")
+    };
+    let function = context.as_callable(&function).unwrap().unwrap();
+    let key = context.runtime().intern_property_key("s").unwrap();
+    for count in [0, 1, 4, 8, 9, 20] {
+        let arguments: Vec<Value> = (0..count).map(Value::Int).collect();
+        let expected = (0..count)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let Value::String(called) = context
+            .call(&function, Value::Undefined, &arguments)
+            .unwrap()
+        else {
+            panic!("a string")
+        };
+        assert_eq!(called.to_utf8_lossy(), expected, "call with {count}");
+        let Value::Object(made) = context.construct(&function, &arguments).unwrap() else {
+            panic!("an object")
+        };
+        let Value::String(constructed) = context.get_property(&made, &key).unwrap() else {
+            panic!("a string")
+        };
+        assert_eq!(
+            constructed.to_utf8_lossy(),
+            expected,
+            "construct with {count}"
+        );
+    }
+}
