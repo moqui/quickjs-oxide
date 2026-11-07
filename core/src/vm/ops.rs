@@ -666,13 +666,18 @@ pub(crate) enum Arith {
 /// addition after `ToPrimitive`.
 #[inline(never)]
 pub(crate) fn add(cx: &mut Cx<'_>, x: Value, y: Value) -> Result<Value, Throw> {
-    if let (Some(a), Some(b)) = (x.as_string(), y.as_string()) {
-        return concat(cx, a, b);
-    }
-    if let (Some(a), Some(n)) = (x.as_string(), y.as_int32()) {
-        return concat_digits(cx, a, n, false);
-    }
-    if let (Some(n), Some(b)) = (x.as_int32(), y.as_string()) {
+    // Strings first, then a string and an int32; anything else costs only
+    // the two string tests.
+    if let Some(a) = x.as_string() {
+        if let Some(b) = y.as_string() {
+            return concat(cx, a, b);
+        }
+        if let Some(n) = y.as_int32() {
+            return concat_digits(cx, a, n, false);
+        }
+    } else if let Some(b) = y.as_string()
+        && let Some(n) = x.as_int32()
+    {
         return concat_digits(cx, b, n, true);
     }
     scoped(cx, |cx| {
