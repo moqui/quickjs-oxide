@@ -14,6 +14,8 @@ use super::{CharacterRange, CompiledRegExp, Instruction, RegExpFlags};
 use crate::unicode::case::regexp_canonicalize as canonicalize;
 
 const INTERRUPT_POLL_INTERVAL: u32 = 10_000;
+/// The start positions a search tries between counts of their work.
+const SEARCH_CHUNK: usize = 4096;
 
 /// One successful match. Every range is measured in UTF-16 code units.
 /// Capture zero is the complete match; an unmatched group is `None`.
@@ -219,14 +221,29 @@ fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
 
     let mut state =
         AttemptState::new(program.capture_count(), program.register_count(), candidate)?;
+    // An attempt is polled at every backtrack and jump back; between them it
+    // runs forward, at most the program's length. The starts go in chunks,
+    // and each chunk counts that bound for its starts: the search is polled
+    // by the work it can do, with no cost per attempt.
+    let length = program.instructions().len();
     loop {
-        state.reset(candidate);
-        if let Some(result) = run_attempt(program, input, unicode, &mut poller, &mut state)? {
-            return Ok(Some(result));
+        let end = candidate.saturating_add(SEARCH_CHUNK).min(input.len());
+        let first = candidate;
+        loop {
+            state.reset(candidate);
+            if let Some(result) = run_attempt(program, input, unicode, &mut poller, &mut state)? {
+                return Ok(Some(result));
+            }
+            if sticky || candidate >= end {
+                break;
+            }
+            candidate = advance_string_index(input, candidate, unicode);
         }
-        if sticky || candidate == input.len() {
+        if sticky || candidate >= input.len() {
             return Ok(None);
         }
+        let work = (candidate - first + 1).saturating_mul(length);
+        poller.step_by(u32::try_from(work).unwrap_or(u32::MAX))?;
         candidate = advance_string_index(input, candidate, unicode);
     }
 }
@@ -405,12 +422,20 @@ where
     }
 
     fn step(&mut self) -> Result<(), ExecError> {
-        self.remaining -= 1;
-        if self.remaining == 0 {
-            self.remaining = INTERRUPT_POLL_INTERVAL;
-            if (self.interrupted)() {
-                return Err(ExecError::Interrupted);
-            }
+        self.step_by(1)
+    }
+
+    /// Counts `work` steps at once: a failed attempt's instructions, which
+    /// ran without a poll.
+    #[inline]
+    fn step_by(&mut self, work: u32) -> Result<(), ExecError> {
+        if work < self.remaining {
+            self.remaining -= work;
+            return Ok(());
+        }
+        self.remaining = INTERRUPT_POLL_INTERVAL;
+        if (self.interrupted)() {
+            return Err(ExecError::Interrupted);
         }
         Ok(())
     }
