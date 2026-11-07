@@ -13,6 +13,7 @@ pub(crate) mod bigint;
 pub(crate) mod class;
 pub mod compile;
 pub(crate) mod error;
+pub mod exotic;
 pub mod ic;
 mod interp;
 pub(crate) mod iter;
@@ -308,6 +309,8 @@ pub struct Services {
     /// Set from any thread to interrupt the running script at the next
     /// poll; it stays set until cleared.
     pub(crate) interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The host exotic classes, by `vm::exotic::ExoticClass` index.
+    pub(crate) exotic_classes: Vec<std::rc::Rc<dyn exotic::ExoticHooks>>,
 }
 
 impl std::fmt::Debug for Services {
@@ -337,6 +340,7 @@ impl Default for Services {
             agent: None,
             track_rejections: false,
             interrupt: Default::default(),
+            exotic_classes: Vec::new(),
         }
     }
 }

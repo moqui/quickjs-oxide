@@ -41,7 +41,7 @@ impl PropertyDescriptor {
         self.get.is_some() || self.set.is_some()
     }
 
-    fn to_internal(self) -> Descriptor {
+    pub(crate) fn to_internal(self) -> Descriptor {
         Descriptor {
             value: self.value,
             get: self.get,
@@ -52,7 +52,7 @@ impl PropertyDescriptor {
         }
     }
 
-    fn from_internal(descriptor: Descriptor) -> Self {
+    pub(crate) fn from_internal(descriptor: Descriptor) -> Self {
         PropertyDescriptor {
             value: descriptor.value,
             get: descriptor.get,
@@ -364,6 +364,41 @@ impl NativeCx<'_> {
         host_object(self.heap, prototype, data)
     }
 
+    /// Registers a host exotic class: objects made with the returned class
+    /// ([`NativeCx::new_host_exotic`]) run `hooks` as their internal
+    /// methods. Classes live as long as the runtime.
+    pub fn register_exotic_class(
+        &mut self,
+        hooks: Rc<dyn crate::vm::exotic::ExoticHooks>,
+    ) -> crate::vm::exotic::ExoticClass {
+        let classes = &mut self.host.exotic_classes;
+        classes.push(hooks);
+        crate::vm::exotic::ExoticClass((classes.len() - 1) as u32)
+    }
+
+    /// A host exotic object of `class` inheriting from `prototype`, holding
+    /// `data`, read back by [`NativeCx::host_data`].
+    pub fn new_host_exotic(
+        &mut self,
+        class: crate::vm::exotic::ExoticClass,
+        prototype: Option<ObjectId>,
+        data: Rc<dyn Any>,
+    ) -> Result<ObjectId, HeapError> {
+        assert!(
+            (class.0 as usize) < self.host.exotic_classes.len(),
+            "a class of this runtime"
+        );
+        self.heap.alloc_internal(
+            ObjectKind::HostExotic,
+            InternalTag::HostData,
+            prototype,
+            4,
+            &[],
+            InternalData::HostExotic(crate::vm::exotic::HostExotic { class, data }),
+            0,
+        )
+    }
+
     /// The datum of a host object, whatever its type; `None` for any other
     /// object.
     pub fn host_data(&self, object: ObjectId) -> Option<Rc<dyn Any>> {
@@ -372,6 +407,7 @@ impl NativeCx<'_> {
         }
         match &self.heap.internal(object).data {
             InternalData::HostData(data) => Some(Rc::clone(data)),
+            InternalData::HostExotic(exotic) => Some(Rc::clone(&exotic.data)),
             _ => None,
         }
     }

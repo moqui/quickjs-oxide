@@ -163,7 +163,7 @@ where
 }
 
 /// Marks the runtime poisoned when a panic unwinds through a host function.
-struct PoisonGuard<'a>(&'a Shared);
+pub(crate) struct PoisonGuard<'a>(pub(crate) &'a Shared);
 
 impl Drop for PoisonGuard<'_> {
     fn drop(&mut self) {
@@ -211,7 +211,7 @@ pub(crate) fn host_body<Args>(
 }
 
 /// The throw a host function's error becomes.
-fn error_throw(view: &mut View<'_>, error: RuntimeError) -> oxide_core::Throw {
+pub(crate) fn error_throw(view: &mut View<'_>, error: RuntimeError) -> oxide_core::Throw {
     let thrown = match error {
         RuntimeError::Exception(value) => view.lower(&value),
         // A nested call was interrupted: the interrupt keeps unwinding, the

@@ -423,7 +423,6 @@ impl Heap {
         match kind {
             ObjectKind::Ordinary
             | ObjectKind::Array
-            | ObjectKind::Native
             | ObjectKind::Arguments
             | ObjectKind::ForInIterator => self.alloc_plain(kind, prototype, slot_capacity, 0),
             // No program until `vm::regexp::set_program` names one.

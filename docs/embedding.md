@@ -11,19 +11,21 @@ Every crate keeps `unsafe_code = "forbid"`, and a runtime has one realm.
 | `builtins` (`natives!`) | `quickjs-oxide-core` | `Native::HostFunction`, `Native::HostConstructor` |
 | `heap::object` | `quickjs-oxide-core` | `InternalData::HostFn`, `InternalData::HostData`, `InternalTag::HostData` |
 | `vm::native` | `quickjs-oxide-core` | `HostFn`, `HostBody`, `NativeCall`, the trampoline `host_call` |
+| `vm::exotic` | `quickjs-oxide-core` | `ExoticHooks`, `ExoticClass`, `HostExotic`, the hook dispatch `vm::object` calls for `ObjectKind::HostExotic` |
 | `embed` | `quickjs-oxide-core` | `NativeCx`, which holds every embedder operation (`Runtime` delegates to it); host functions and objects, promise capabilities, the buffer operations, the interrupt flag |
 | `vm::error`, `vm::interp`, `bytecode` | `quickjs-oxide-core` | `vm.interrupted`, `poll_interrupts`, `catchable`, the uncatchable unwind, `Opcode::JmpBack`, the poll counter |
 | `host` | `quickjs-oxide-core` | `Host::interrupt` |
 | `vm::module` | `quickjs-oxide-core` | `ModuleSource::Synthetic` |
 | `api::core::ops` | root crate | `View`, the `js_ops!` macro, the `Js` trait |
 | `api::core::function` | root crate | `Scope`, `FunctionOptions`, `HostFunction`, the body wrapper |
+| `api::core::exotic` | root crate | `ExoticClass`, `Hook`, `HostClass`, `ExoticScope`, the hooks wrapper |
 | `api::core::value`, `api::core::runtime` | root crate | `Weak` slots, `Poisoned`, `InterruptHandle` |
 | `api::core::error` | root crate | `Exception(Value)`, `Interrupted`, `Poisoned` |
 | `api::core::module` | root crate | `ModuleScope`, `ModuleSource::Synthetic`, `Context::define_module` |
 | `api::core::promise`, `api::core::buffer`, `api::core::convert` | root crate | `PromiseCapability`; `TypedArrayView`, `TypedArrayKind`; `FromJs`, `IntoJs` and the typed `HostFunction` impls |
 | `src/engine/compiler/register` | root crate | the lowering emits `JmpBack` for a backward `Jmp` |
 
-The tests are `core/tests/host.rs` (the core's host functions and objects) and `tests/embedding_api.rs` (the API).
+The tests are `core/tests/host.rs` (the core's host functions and objects), `tests/embedding_api.rs` (the API) and `tests/host_exotic.rs` (host exotic objects).
 
 ## Host functions in the core
 
@@ -40,6 +42,41 @@ The body is an `Rc` because a host function is re-entrant: JavaScript calls it, 
 ## Host objects
 
 A host object is an `ObjectKind::Builtin` object with the embedder's prototype and an `InternalTag::HostData` record. It prints as `Object { … }`, is `[object Object]` to `Object.prototype.toString` unless its prototype defines `Symbol.toStringTag`, and is `typeof` `"object"`. `host_data` returns the datum as an `Rc`, so the API hands out a clone without borrowing the heap across the embedder's code. A `Drop` of a datum that releases an `ObjectRef` of the same runtime is deferred like any release made while the runtime is borrowed; a `Drop` that calls an API method gets `RuntimeError::Reentered`.
+
+## Host exotic objects
+
+A host exotic object's property operations are the embedder's Rust hooks, as QuickJS's `JSClassExoticMethods` are: `[[GetOwnProperty]]`, `[[DefineOwnProperty]]`, `[[HasProperty]]`, `[[Get]]` and `[[Set]]` with their receiver, `[[Delete]]` and `[[OwnPropertyKeys]]`. Its uses are a resolver of bare global names (the global object's prototype), records whose fields live in Rust, and maps converted on first read.
+
+**The class.** The embedder implements `ExoticClass` (its `Data` type and the hooks it needs) and registers it once with `register_exotic_class`, which returns a `HostClass<C>`; `new_host_exotic(value, &class, prototype)` makes an object of it, and `host_data::<C::Data>` reads its datum back as for a host object. In the core a class is an index into `Services::exotic_classes` (an `Rc<dyn ExoticHooks>` each, living as long as the runtime), and an object is an `ObjectKind::HostExotic` with an `InternalTag::HostData` record whose datum is `InternalData::HostExotic { class, data }`: the class costs the record no space beyond the host object's.
+
+**Declining.** Each hook returns `Hook::Handled(answer)` or `Hook::Ordinary`, which runs the ordinary internal method on the object, as QuickJS does for a method a class leaves `NULL`. `get`, `set` and `has` answer for the whole chain; when they decline, the ordinary method asks `get_own_property` (whose own decline reads the object's ordinary properties) and continues to the prototype. A `set` that declines is `OrdinarySet`, which ends in the receiver's `[[GetOwnProperty]]` and `[[DefineOwnProperty]]`; a class that answers only `get_own_property` and `define_own_property` is complete. `own_keys`' list is followed by the ordinary own keys it does not name. The engine checks none of a proxy's invariants against the answers.
+
+```rust
+struct Names;
+impl ExoticClass for Names {
+    type Data = RefCell<HashMap<JsString, Value>>;
+    fn has(&self, _: &mut ExoticScope<'_>, map: &Self::Data, key: &PropertyKey) -> JsResult<Hook<bool>> {
+        let found = key.to_js_string().is_some_and(|name| map.borrow().contains_key(&name));
+        // Not ours: `Object.prototype` behind the object answers.
+        Ok(if found { Hook::Handled(true) } else { Hook::Ordinary })
+    }
+    fn get(&self, _: &mut ExoticScope<'_>, map: &Self::Data, key: &PropertyKey) -> JsResult<Hook<Value>> {
+        let found = key.to_js_string().and_then(|name| map.borrow().get(&name).cloned());
+        Ok(found.map_or(Hook::Ordinary, Hook::Handled))
+    }
+}
+let class = context.register_exotic_class(Names)?;
+let names = context.new_host_exotic(RefCell::default(), &class, Some(&context.object_prototype()?))?;
+context.set_prototype_of(&context.global_object()?, Some(&names))?;
+```
+
+`examples/exotic_globals.rs` runs this with a `set` and times it.
+
+**`ExoticScope`.** A hook runs with an `ExoticScope`, a third handle beside `Context` and `Scope` that `js_ops!` gives every operation of `Js`, so a hook makes values, calls functions, evaluates and throws as a host function does. It reads the exotic object (`this`) and the `[[Get]]` or `[[Set]]` receiver (`receiver`, `receiver_is_this`) on demand, so a hook that does not ask makes no handle; the key arrives as a `PropertyKey`, copied once from the atom's flat text.
+
+**In the engine.** `vm::object`'s internal methods take the hook path for the kind beside the `Proxy` arms. The kind is in `ObjectKind::is_exotic`, so `vm::property`'s heap-only walks, the named and global inline caches and the element fast paths leave for those methods when they meet it on an object or a prototype, and no cache entry is filled for it or through it: a hook's answer is read on every access. It is not in `has_elements`, so an index the ordinary fallback stores is a named property, which the element fast paths do not read. A bare name the global object does not hold goes, as through a `Proxy`, to `has` and then `get` (`typeof` of a name `has` denies is `"undefined"`); a strict assignment asks `has` before `set` and throws `ReferenceError` on `false`; a sloppy one calls `set` with the global object as receiver; `delete name` deletes from the global object and does not reach the prototype.
+
+**The call.** `vm::exotic::invoke` clones the class's `Rc` out of the services (the heap is free while it runs), enters through `enter_native` (so a hook that recurses through itself throws `InternalError: stack overflow`), roots the object, the key and the values passed, and cuts the root stack back when the hook returns. The API's wrapper is the host function wrapper's: it holds the runtime weakly, its guard poisons the runtime when a hook panics, it translates an error into a throw by the same table, and it releases the handles the hook dropped.
 
 ## The API layer
 
@@ -116,12 +153,16 @@ A host function call costs about 560 instructions with no arguments. With a 1 Ki
 | `JsString` | ~430 | ~630 |
 | `String` | ~1,300 | ~56,000 |
 
+A read of a bare name through an exotic global prototype is two hooks (`has`, `get`), an add (`counter += 1`) three. In `examples/exotic_globals.rs` (release build, x86-64 desktop), 1,000 adds of a name a `HashMap<JsString, Value>` holds take about 220 µs, 1,000 reads 145 µs and 1,000 writes 85 µs, against 12 µs for 1,000 adds of an ordinary global; most of the difference is the hooks' conversions and the embedder's hash lookups.
+
 ## Known issues
 
 - **Recursion depth.** Rust → JavaScript → Rust recursion through a host function fits about 725 levels in the default 1 MiB native-stack budget in a release build and about 46 in a debug build; a builtin's re-entry reaches more (`Array.prototype.map`: 1,063 in release). The 1,000-level test runs on a thread with a 256 MiB stack.
 - **UTF-16 text to `String`.** Converting wide text to a Rust `String` costs about 55 instructions per code unit, in std's `String::from_utf16_lossy`. A host function that only reads or forwards text takes `JsString` instead.
 - **Interrupt latency.** The poll runs at back-edges and calls only. One long native operation (a regular expression over a large input, a large `join`) is not interrupted until it returns to the loop.
 - **The interrupt flag stays set.** `InterruptHandle::interrupt` stops every later evaluation until `clear()`.
+- **Host exotic objects print their ordinary properties.** The printer reads the heap and calls no hook; `console.log` of one lists only what the ordinary fallback stored.
+- **An exotic prototype disables the hole fast path.** As for a `Proxy` or a prototype with index properties, a host exotic object used as a prototype clears `holes_writable`, so a write into an array hole walks the chain heap-wide from then on.
 - **Host objects print as `Object`.** The printer does not use the prototype's `constructor`; `Symbol.toStringTag` changes only `Object.prototype.toString`.
 - **`SharedArrayBuffer` bytes are copied.** `with_array_buffer_bytes` copies a shared buffer before calling the closure, since its bytes can change under the borrow.
 - **Modules inside a host function.** `compile_module` and `execute_module` return `Unsupported` there; `eval` and `compile` there make transient code.
