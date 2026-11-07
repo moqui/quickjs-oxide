@@ -502,36 +502,28 @@ impl Heap {
         if let Some(dictionary) = &record.dictionary {
             return dictionary.find(key);
         }
+        // Above the threshold the walk stops at the nearest shape with a
+        // table, and builds one only after walking `TABLE_THRESHOLD`
+        // shapes: a chain grown one property at a time (a builtin's
+        // prototype as it is installed) builds a table every
+        // `TABLE_THRESHOLD` shapes, not one per shape.
+        let tabled = record.count > TABLE_THRESHOLD;
         let mut current = record;
-        if record.count > TABLE_THRESHOLD {
-            // Walk up to the nearest shape with a table: a chain grown one
-            // property at a time (a builtin's prototype as it is installed)
-            // builds a table every `TABLE_THRESHOLD` shapes, not one per
-            // shape.
-            let mut steps = 0;
-            while current.count > TABLE_THRESHOLD {
-                if let Some(table) = current.table.get() {
-                    return table.get(&key).copied();
-                }
-                if current.key == key {
-                    return Some((current.slot, current.flags));
-                }
-                steps += 1;
-                if steps >= TABLE_THRESHOLD {
-                    return record
-                        .table
-                        .get_or_init(|| Box::new(self.build_table(shape)))
-                        .get(&key)
-                        .copied();
-                }
-                current = self
-                    .shapes
-                    .get(current.parent.expect("non-root shape has a parent").0);
-            }
-        }
+        let mut steps = 0;
         while current.count > 0 {
+            if tabled && let Some(table) = current.table.get() {
+                return table.get(&key).copied();
+            }
             if current.key == key {
                 return Some((current.slot, current.flags));
+            }
+            steps += 1;
+            if tabled && steps >= TABLE_THRESHOLD {
+                return record
+                    .table
+                    .get_or_init(|| Box::new(self.build_table(shape)))
+                    .get(&key)
+                    .copied();
             }
             current = self
                 .shapes
