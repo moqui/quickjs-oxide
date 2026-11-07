@@ -295,3 +295,75 @@ fn a_panic_while_lent_poisons_the_runtime() {
     assert_eq!(context.eval("1"), Err(RuntimeError::Poisoned));
     assert!(!runtime.is_lent());
 }
+
+#[test]
+fn an_execution_turn_runs_while_lent() {
+    let (runtime, context) = runtime();
+    let global = context.global_object().unwrap();
+    let nested = context.clone();
+    context
+        .define_function(&global, "turn", 0, move |scope: &mut Scope<'_>| {
+            let runtime = nested.runtime();
+            scope.lend(|| runtime.with_execution_turn(|| nested.eval("40 + 2")))
+        })
+        .unwrap();
+    assert_eq!(context.eval("turn()").unwrap(), Value::Int(42));
+    // The outermost turn still clears its kept objects.
+    assert_eq!(
+        runtime
+            .with_execution_turn(|| context.eval("turn() + 1"))
+            .unwrap(),
+        Value::Int(43)
+    );
+}
+
+#[test]
+fn a_panic_in_a_host_function_a_lent_script_calls_poisons_the_runtime() {
+    let (runtime, context) = runtime();
+    define_lending(&context, "nested");
+    let global = context.global_object().unwrap();
+    context
+        .define_function(&global, "boom", 0, |_: &mut Scope<'_>| -> JsResult<Value> {
+            panic!("inner host bug")
+        })
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context.eval("nested('boom()')")
+    }));
+    assert!(outcome.is_err());
+    assert!(!runtime.is_lent());
+    assert_eq!(context.eval("1"), Err(RuntimeError::Poisoned));
+    drop(context);
+    drop(runtime);
+}
+
+#[test]
+fn handles_dropped_while_lent_are_released() {
+    struct Tracked(Rc<Cell<u32>>);
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let (runtime, context) = runtime();
+    let drops = Rc::new(Cell::new(0));
+    let global = context.global_object().unwrap();
+    let nested = context.clone();
+    let counter = Rc::clone(&drops);
+    context
+        .define_function(&global, "churn", 0, move |scope: &mut Scope<'_>| {
+            scope.lend(|| {
+                for _ in 0..10 {
+                    let object = nested.new_host_object(Tracked(Rc::clone(&counter)), None)?;
+                    let made = nested.eval("({ big: new Array(100).fill(1) })")?;
+                    drop(made);
+                    drop(object);
+                }
+                Ok(Value::Undefined)
+            })
+        })
+        .unwrap();
+    context.eval("churn()").unwrap();
+    runtime.run_gc().unwrap();
+    assert_eq!(drops.get(), 10);
+}

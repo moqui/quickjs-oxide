@@ -509,7 +509,13 @@ impl Runtime {
         let turns = self.shared.turns.get() - 1;
         self.shared.turns.set(turns);
         if turns == 0 {
-            self.enter()?.core.clear_kept_objects();
+            match self.enter() {
+                Ok(mut entry) => entry.core.clear_kept_objects(),
+                // Inside a host function (lent or not) the outermost
+                // script's or job's end clears them.
+                Err(RuntimeError::Reentered) => {}
+                Err(error) => return result.and(Err(error)),
+            }
         }
         result
     }
