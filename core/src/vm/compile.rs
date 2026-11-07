@@ -22,11 +22,16 @@ use crate::heap::{AtomMode, BytecodeTemplate, Heap, HeapError};
 use crate::runtime::{Intrinsic, Realm};
 use crate::value::{ObjectId, Value};
 
-/// The code store a compilation publishes into: owned before the program
-/// runs (units go in the static store), shared while it runs (units go in
-/// the heap).
+/// Where a compilation publishes: the code store, whose units live as long
+/// as the runtime, or the heap, which frees them once unreachable (`eval`'s
+/// and the embedder's transient code). Either works while the program runs.
 enum Store<'a> {
-    Owned(&'a mut CodeStore),
+    /// The code store, this runtime's alone (between entries): units go
+    /// straight to its settled units, with no bound.
+    Unique(&'a mut CodeStore),
+    /// The code store while the running loop borrows it: units go to its
+    /// bounded overflow, then to the heap.
+    Owned(&'a CodeStore),
     Shared(&'a CodeStore),
 }
 
@@ -77,13 +82,23 @@ impl<'a> Compiler<'a> {
         Compiler::with(heap, Store::Shared(code), realm, AtomMode::Hold)
     }
 
-    pub(crate) fn owned(heap: &'a mut Heap, code: &'a mut CodeStore, realm: &'a Realm) -> Self {
+    pub(crate) fn owned(heap: &'a mut Heap, code: &'a CodeStore, realm: &'a Realm) -> Self {
+        // A full overflow makes the compilation transient from the start.
+        if !code.has_room() {
+            return Compiler::new(heap, code, realm);
+        }
         Compiler::with(heap, Store::Owned(code), realm, AtomMode::Pin)
+    }
+
+    /// [`Compiler::owned`] into a store no one else holds.
+    pub(crate) fn unique(heap: &'a mut Heap, code: &'a mut CodeStore, realm: &'a Realm) -> Self {
+        Compiler::with(heap, Store::Unique(code), realm, AtomMode::Pin)
     }
 
     /// The same parts for a shorter borrow (a host callback's view).
     pub fn reborrow(&mut self) -> Compiler<'_> {
         let code = match &mut self.code {
+            Store::Unique(code) => Store::Unique(code),
             Store::Owned(code) => Store::Owned(code),
             Store::Shared(code) => Store::Shared(code),
         };
@@ -223,8 +238,9 @@ impl<'a> Compiler<'a> {
     /// Every published unit, static and dynamic.
     pub fn units(&self) -> Units<'_> {
         let code = match &self.code {
-            Store::Owned(code) => &**code,
-            Store::Shared(code) => *code,
+            Store::Unique(code) => &**code,
+            Store::Owned(code) => code,
+            Store::Shared(code) => code,
         };
         Units {
             code,
@@ -236,28 +252,52 @@ impl<'a> Compiler<'a> {
         self.realm.intrinsic(intrinsic)
     }
 
-    /// Validates `unit`, reserves its cache entries and publishes it: into
+    /// Validates `unit` and publishes it (its cache entries are reserved
+    /// when it is first entered): into
     /// the code store before the program runs (its key atoms pinned), into
     /// the heap (pinned until the compilation ends, its bytes charged to the
     /// collection trigger) while it runs. Its children must be published
     /// first.
-    pub fn publish(&mut self, mut unit: CodeUnit) -> Result<CodeUnitId, ValidateError> {
+    pub fn publish(&mut self, unit: CodeUnit) -> Result<CodeUnitId, ValidateError> {
         validate::validate(&unit, &|id| self.units().lookup(id))?;
-        self.heap.ics.reserve(&mut unit);
+        Ok(self.publish_validated(unit))
+    }
+
+    /// [`Compiler::publish`] of a unit the validator already passed (an
+    /// image's, checked against the image's own units).
+    fn publish_validated(&mut self, unit: CodeUnit) -> CodeUnitId {
+        // While shared, the store's overflow takes a bounded number of
+        // units; past it the rest of the compilation is transient, its atoms
+        // held for the heap's units rather than pinned.
+        if let Store::Owned(code) = self.code
+            && !code.has_room()
+        {
+            self.heap.set_atom_mode(AtomMode::Hold);
+            self.code = Store::Shared(code);
+        }
         match &mut self.code {
             // A static unit lives as long as the runtime, and so do its keys,
-            // wherever they were interned.
-            Store::Owned(code) => {
-                // Pinning is idempotent, so a key used twice needs no dedup.
+            // wherever they were interned. Pinning is idempotent, so a key
+            // used twice needs no dedup.
+            Store::Unique(code) => {
                 for atom in unit.key_atom_uses() {
                     self.heap.pin_atom(atom);
                 }
-                Ok(code.push(unit))
+                code.push_settled(unit)
+            }
+            Store::Owned(code) => {
+                for atom in unit.key_atom_uses() {
+                    self.heap.pin_atom(atom);
+                }
+                match code.push(unit) {
+                    Ok(id) => id,
+                    Err(_) => unreachable!("room in the code store"),
+                }
             }
             Store::Shared(_) => {
                 let (id, bytes) = self.heap.code.publish(unit);
                 self.heap.gc.allocated += bytes;
-                Ok(id)
+                id
             }
         }
     }
@@ -271,8 +311,9 @@ impl<'a> Compiler<'a> {
         constants: &[&[Value]],
     ) -> Result<ObjectId, HeapError> {
         let code = match &self.code {
-            Store::Owned(code) => &**code,
-            Store::Shared(code) => *code,
+            Store::Unique(code) => &**code,
+            Store::Owned(code) => code,
+            Store::Shared(code) => code,
         };
         let code = Units {
             code,
@@ -309,6 +350,13 @@ impl<'a> Compiler<'a> {
                 }
             })
             .collect();
+        // The root's function is made here; its children's when their
+        // closures are.
+        let root_unit = code.get(root);
+        if root_unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+            self.heap.ics.reserve(&root_unit);
+        }
+        drop(root_unit);
         let prototype = self.realm.intrinsic(Intrinsic::FunctionPrototype);
         self.heap
             .alloc_bytecode_function(Some(prototype), None, &tree)
@@ -322,49 +370,105 @@ impl Compiler<'_> {
         cooked: &[Value],
         raw: &[Value],
     ) -> Result<ObjectId, HeapError> {
-        use crate::heap::object::flags;
-        let prototype = self.intrinsic(Intrinsic::ArrayPrototype);
-        let names = self.realm.names;
-        let heap = &mut *self.heap;
-        let mark = heap.roots().mark();
-        // An atom interned outside a compilation is weak.
-        for &value in cooked.iter().chain(raw) {
-            heap.roots().push(value);
+        template_object(self.heap, self.realm, cooked, raw)
+    }
+
+    /// Loads a code image: interns its atoms, publishes its units children
+    /// first through the validator (into the code store before the program
+    /// runs, into the heap while it runs, as [`Compiler::publish`] does),
+    /// and instantiates its root. The script's function object, unrooted.
+    pub fn load_image(
+        &mut self,
+        image: &crate::image::CodeImage,
+    ) -> Result<ObjectId, crate::image::LoadError> {
+        use crate::image::LoadError;
+        let mut loader = crate::image::Loader::new(image);
+        // Everything is checked before anything is published, interned or
+        // reserved, so a malformed image changes nothing.
+        crate::image::check(loader.image)?;
+        let count = loader.image.units.len();
+        let mut provisional: Vec<CodeUnit> =
+            (0..count).map(|index| loader.provisional(index)).collect();
+        for unit in &provisional {
+            validate::validate(unit, &|id| provisional.get(id.0 as usize))
+                .map_err(LoadError::Invalid)?;
         }
+        let mark = self.heap.roots().mark();
         let result = (|| {
-            let raw_array = heap.alloc_array(Some(prototype), raw.len() as u32)?;
-            heap.roots().push(Value::object(raw_array));
-            let array = heap.alloc_array(Some(prototype), cooked.len() as u32)?;
-            heap.roots().push(Value::object(array));
-            for (target, values) in [(raw_array, raw), (array, cooked)] {
-                for (index, &value) in values.iter().enumerate() {
-                    let key =
-                        crate::PropertyKey::index(index as u32).ok_or(HeapError::OutOfMemory)?;
-                    heap.add_property(
-                        target,
-                        key,
-                        crate::PropertyFlags::data(false, true, false),
-                        value,
-                    )?;
-                }
-                heap.set_array_length(target, values.len() as u32);
+            let mut ids: Vec<CodeUnitId> = Vec::with_capacity(count);
+            // Children follow their parent in pre-order and have higher
+            // indices, so publishing from the last unit back publishes every
+            // child before its parent.
+            for index in (0..count).rev() {
+                let mut unit = provisional.pop().expect("a unit per index");
+                let children = loader.image.units[index]
+                    .children
+                    .iter()
+                    .map(|&child| ids[count - 1 - child as usize])
+                    .collect();
+                loader.patch(self.heap, index, &mut unit, children)?;
+                ids.push(self.publish_validated(unit));
             }
-            let raw_key = crate::runtime::Names::key(names.raw);
-            heap.add_property(
-                array,
-                raw_key,
-                crate::PropertyFlags::data(false, false, false),
-                Value::object(raw_array),
-            )?;
-            for target in [raw_array, array] {
-                heap.set_object_flag(target, flags::SPARSE | flags::LENGTH_READONLY);
-                heap.clear_object_flag(target, flags::EXTENSIBLE);
+            let root = ids[count - 1];
+            let mut tables = Vec::with_capacity(count);
+            for index in 0..count {
+                tables.push(loader.constants(self.heap, self.realm, index, template_object)?);
             }
-            Ok(array)
+            let tables: Vec<&[Value]> = tables.iter().map(Vec::as_slice).collect();
+            Ok(self.instantiate(root, &tables)?)
         })();
-        heap.roots().truncate(mark);
+        self.heap.roots().truncate(mark);
         result
     }
+}
+
+/// A tagged template's frozen site object.
+pub(crate) fn template_object(
+    heap: &mut Heap,
+    realm: &Realm,
+    cooked: &[Value],
+    raw: &[Value],
+) -> Result<ObjectId, HeapError> {
+    use crate::heap::object::flags;
+    let prototype = realm.intrinsic(Intrinsic::ArrayPrototype);
+    let names = realm.names;
+    let mark = heap.roots().mark();
+    // An atom interned outside a compilation is weak.
+    for &value in cooked.iter().chain(raw) {
+        heap.roots().push(value);
+    }
+    let result = (|| {
+        let raw_array = heap.alloc_array(Some(prototype), raw.len() as u32)?;
+        heap.roots().push(Value::object(raw_array));
+        let array = heap.alloc_array(Some(prototype), cooked.len() as u32)?;
+        heap.roots().push(Value::object(array));
+        for (target, values) in [(raw_array, raw), (array, cooked)] {
+            for (index, &value) in values.iter().enumerate() {
+                let key = crate::PropertyKey::index(index as u32).ok_or(HeapError::OutOfMemory)?;
+                heap.add_property(
+                    target,
+                    key,
+                    crate::PropertyFlags::data(false, true, false),
+                    value,
+                )?;
+            }
+            heap.set_array_length(target, values.len() as u32);
+        }
+        let raw_key = crate::runtime::Names::key(names.raw);
+        heap.add_property(
+            array,
+            raw_key,
+            crate::PropertyFlags::data(false, false, false),
+            Value::object(raw_array),
+        )?;
+        for target in [raw_array, array] {
+            heap.set_object_flag(target, flags::SPARSE | flags::LENGTH_READONLY);
+            heap.clear_object_flag(target, flags::EXTENSIBLE);
+        }
+        Ok(array)
+    })();
+    heap.roots().truncate(mark);
+    result
 }
 
 /// What to compile.

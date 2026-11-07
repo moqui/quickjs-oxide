@@ -147,7 +147,7 @@ fn every_opcode_round_trips_through_the_disassembler() {
         ..UnitLayout::default()
     });
     // `MakeClosure fn0` needs one child: publish a leaf first.
-    let mut store = CodeStore::default();
+    let store = CodeStore::default();
     let leaf = store.publish(unit_returning()).unwrap();
     let mut unit = unit;
     unit.children = vec![leaf].into();
@@ -203,7 +203,7 @@ fn builder_patches_forward_jumps_and_decodes_operands() {
     assert_eq!(code[1].int(), i32::MIN);
     assert_eq!(code[2].imm, 0);
     let mut unit = builder.finish(layout(6));
-    unit.captures = vec![Capture::None].into();
+    unit.body_mut().captures = vec![Capture::None].into();
     assert_eq!(validate(&unit), Ok(()));
     assert_eq!(unit.temp_base(), 5);
     assert!(unit.debug.positions.is_empty());
@@ -370,7 +370,7 @@ fn validator_rejects_each_malformation() {
         Ok(())
     );
     let mut capturing = unit_returning();
-    capturing.captures = vec![Capture::Register(1)].into();
+    capturing.body_mut().captures = vec![Capture::Register(1)].into();
     assert_eq!(
         {
             let published = [capturing.clone()];
@@ -382,7 +382,7 @@ fn validator_rejects_each_malformation() {
         Err(E::ChildCapture(1)),
         "the parent has one register"
     );
-    capturing.captures = vec![Capture::Outer(0)].into();
+    capturing.body_mut().captures = vec![Capture::Outer(0)].into();
     assert_eq!(
         {
             let published = [capturing];
@@ -401,11 +401,11 @@ fn validator_rejects_each_malformation() {
         column: 1,
     };
     let mut lines = unit_returning();
-    lines.debug.positions = vec![position(0), position(9)].into();
+    lines.body_mut().debug.positions = vec![position(0), position(9)].into();
     assert_eq!(validate(&lines), Err(E::LineTable));
-    lines.debug.positions = vec![position(0), position(0)].into();
+    lines.body_mut().debug.positions = vec![position(0), position(0)].into();
     assert_eq!(validate(&lines), Err(E::LineTable));
-    lines.debug.positions = vec![position(0)].into();
+    lines.body_mut().debug.positions = vec![position(0)].into();
     assert_eq!(validate(&lines), Ok(()));
 
     let mut arrow = unit_returning();
@@ -423,7 +423,7 @@ fn validator_checks_handler_ranges_and_nesting() {
             }
             b.op(Opcode::ReturnUndefined);
         });
-        unit.handlers = handlers.into();
+        unit.body_mut().handlers = handlers.into();
         validate(&unit)
     };
     let h = |start, end, target, register| Handler {
@@ -453,7 +453,7 @@ fn validator_checks_handler_ranges_and_nesting() {
 
 #[test]
 fn publication_validates_and_the_store_walks_trees_in_pre_order() {
-    let mut store = CodeStore::default();
+    let store = CodeStore::default();
     let a = store.publish(unit_returning()).unwrap();
     let b = store.publish(unit_returning()).unwrap();
     let mut middle = unit_returning();
@@ -572,10 +572,14 @@ fn cache_sites_are_numbered_per_unit() {
     assert_eq!(validate(&unit), Ok(()));
 
     let mut bad = unit.clone();
-    bad.code[2].c = 5;
+    let mut code = bad.code.to_vec();
+    code[2].c = 5;
+    bad.code = code.into();
     assert_eq!(validate(&bad), Err(ValidateErrorKind::Site(5)));
     let mut bad = unit;
-    bad.code[0].imm = 9;
+    let mut code = bad.code.to_vec();
+    code[0].imm = 9;
+    bad.code = code.into();
     assert_eq!(validate(&bad), Err(ValidateErrorKind::Site(9)));
 }
 
@@ -598,9 +602,10 @@ fn field_sites_past_255_share_the_reserved_site() {
     assert_eq!(validate(&unit), Ok(()));
 }
 
-/// Publication gives each unit its own range of the cache store.
+/// Publication reserves no cache entries: a unit takes its range when it
+/// is first entered.
 #[test]
-fn publication_reserves_cache_entries() {
+fn publication_defers_cache_entries() {
     let key = PropertyKey::index(7).unwrap();
     let mut runtime = Runtime::new(HeapLimits::default()).unwrap();
     let before = runtime.heap().ics().len();
@@ -611,9 +616,13 @@ fn publication_reserves_cache_entries() {
     };
     let first = runtime.publish(unit(8, two)).unwrap();
     let second = runtime.publish(unit(8, two)).unwrap();
-    assert_eq!(runtime.code().get(first).ic_base as usize, before);
-    assert_eq!(runtime.code().get(second).ic_base as usize, before + 2);
-    assert_eq!(runtime.heap().ics().len(), before + 4);
+    for unit in [first, second] {
+        assert_eq!(
+            runtime.code().get(unit).ic_base.get(),
+            oxide_core::bytecode::IC_UNRESERVED
+        );
+    }
+    assert_eq!(runtime.heap().ics().len(), before);
     assert_eq!(runtime.heap().ics().filled(), 0);
 }
 
@@ -658,5 +667,41 @@ fn spill_scope_accesses_validate() {
         }),
     ] {
         assert_eq!(validate(&bad), Err(ValidateErrorKind::Spill));
+    }
+}
+
+/// A shared store's overflow is bounded: `CodeStore::publish` past it
+/// panics (the compiler sends such units to the heap instead).
+#[test]
+#[should_panic(expected = "code store overflow")]
+fn publishing_past_the_overflow_panics() {
+    let store = CodeStore::default();
+    for _ in 0..=128 * 256 {
+        store
+            .publish(unit(8, |b| {
+                b.op(Opcode::ReturnUndefined);
+            }))
+            .unwrap();
+    }
+}
+
+/// A settled store has no bound: `settle` moves the overflow into it.
+#[test]
+fn settling_moves_the_overflow_and_keeps_ids() {
+    let mut store = CodeStore::default();
+    let ids: Vec<_> = (0..300)
+        .map(|_| {
+            store
+                .publish(unit(8, |b| {
+                    b.op(Opcode::ReturnUndefined);
+                }))
+                .unwrap()
+        })
+        .collect();
+    store.settle();
+    assert_eq!(store.len(), 300);
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(id.index() as usize, index);
+        assert!(store.lookup(*id).is_some());
     }
 }

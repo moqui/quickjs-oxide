@@ -22,6 +22,8 @@ pub enum ValidateErrorKind {
     RegisterRange,
     Target(u32),
     Constant(u32),
+    /// A key operand past the unit's key table.
+    Key(u32),
     Child(u32),
     /// A child id that is not yet published.
     UnpublishedChild(u32),
@@ -130,6 +132,11 @@ pub fn validate<'a>(
                 fail(at, E::Target(t))
             }
         };
+        if matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey)
+            && insn.imm as usize >= unit.keys.len()
+        {
+            return fail(at, E::Key(insn.imm));
+        }
         match insn.op.format() {
             Format::None | Format::Key => {}
             Format::A | Format::AInt | Format::AKey | Format::ACount => {

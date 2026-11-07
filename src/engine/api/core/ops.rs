@@ -14,6 +14,7 @@ use super::compile::{ScriptCompileError, compile_script, syntax_location};
 use super::context::{Context, EvalOptions, FunctionBytecodeRef, ModuleBytecodeRef, QjsHelpers};
 use super::exotic::{ExoticClass, ExoticScope, HostClass};
 use super::function::{FunctionOptions, HostFunction, Raw, Scope, host_body};
+use super::image::CodeImage;
 use super::promise::PromiseCapability;
 use super::property::{
     AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, Key,
@@ -309,16 +310,6 @@ impl View<'_> {
         }
     }
 
-    /// The error for an operation a host function cannot run, because the
-    /// running loop borrows what it needs.
-    fn modules_supported(&mut self) -> JsResult<()> {
-        if self.core.owns_code() {
-            Ok(())
-        } else {
-            Err(RuntimeError::Unsupported("modules inside a host function"))
-        }
-    }
-
     // ---- scripts ----
 
     pub(crate) fn eval(&mut self, source: &str) -> JsResult<Value> {
@@ -518,7 +509,6 @@ impl View<'_> {
         filename: &str,
         import_meta: Vec<(String, Value)>,
     ) -> JsResult<ModuleBytecodeRef> {
-        self.modules_supported()?;
         let debug_info = self.shared.debug_info.get();
         let compiled = {
             let mut compiler = self.core.compiler(false);
@@ -557,7 +547,6 @@ impl View<'_> {
     }
 
     pub(crate) fn execute_module(&mut self, module: &ModuleBytecodeRef) -> JsResult<Value> {
-        self.modules_supported()?;
         let result = self.core.run_module(module.name());
         self.complete(result)
     }
@@ -1322,7 +1311,21 @@ js_ops! {
     /// Runs a compiled script with the global object as `this`.
     fn execute(&mut self, script: &FunctionBytecodeRef) -> JsResult<Value>;
 
-    // ---- modules (`Unsupported` inside a host function) ----
+    // ---- code images ----
+
+    /// The code image of a compiled script: its units with their atoms by
+    /// text and constants by value, for any runtime of this build to load.
+    fn encode_image(&mut self, script: &FunctionBytecodeRef) -> JsResult<CodeImage>;
+    /// Compiles `source` as the script `filename` (transient here) and
+    /// returns its image. A syntax error is thrown as by `compile`.
+    fn compile_image(&mut self, source: &str, filename: &str) -> JsResult<CodeImage>;
+    /// Loads a code image without parsing: its atoms interned, its units
+    /// published through the validator with fresh inline caches (static
+    /// code, inside a host function too), its root
+    /// instantiated. Run it with `execute`.
+    fn load_image(&mut self, image: &CodeImage) -> JsResult<FunctionBytecodeRef>;
+
+    // ---- modules ----
 
     fn compile_module(&mut self, source: &str) -> JsResult<ModuleBytecodeRef>;
     fn compile_module_bytes(&mut self, source: &[u8]) -> JsResult<ModuleBytecodeRef>;

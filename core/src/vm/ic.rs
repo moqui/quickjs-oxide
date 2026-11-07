@@ -262,9 +262,9 @@ pub struct IcStore {
 }
 
 impl IcStore {
-    /// Reserves the entries of a unit about to be published and sets its
+    /// Reserves the entries of a unit entered for the first time and sets its
     /// `ic_base`: the first free range that fits, else the end of the store.
-    pub(crate) fn reserve(&mut self, unit: &mut CodeUnit) {
+    pub(crate) fn reserve(&mut self, unit: &CodeUnit) {
         let count = unit.ic_count;
         let end = self.entries.len() as u32;
         let first = match self.free.iter().position(|&(_, len)| len >= count) {
@@ -305,14 +305,14 @@ impl IcStore {
                 self.kinds[first + site as usize] = kind;
             }
         }
-        unit.ic_base = first as u32;
+        unit.ic_base.set(first as u32);
     }
 
     /// Empties the entries of a freed unit and returns its range (and the
     /// polymorphic rows its sites own) to the free lists.
     pub(crate) fn release(&mut self, unit: &CodeUnit) {
-        let (start, count) = (unit.ic_base, unit.ic_count);
-        if count == 0 {
+        let (start, count) = (unit.ic_base.get(), unit.ic_count);
+        if count == 0 || start == crate::bytecode::IC_UNRESERVED {
             return;
         }
         let range = start as usize..(start + count) as usize;
@@ -700,8 +700,8 @@ mod tests {
     }
 
     fn reserve(store: &mut IcStore, sites: u32) -> CodeUnit {
-        let mut unit = unit(sites);
-        store.reserve(&mut unit);
+        let unit = unit(sites);
+        store.reserve(&unit);
         unit
     }
 
@@ -709,7 +709,15 @@ mod tests {
     fn freed_ranges_merge_and_split() {
         let mut store = IcStore::default();
         let [a, b, c, d] = [4, 6, 3, 5].map(|sites| reserve(&mut store, sites));
-        assert_eq!([a.ic_base, b.ic_base, c.ic_base, d.ic_base], [0, 4, 10, 13]);
+        assert_eq!(
+            [
+                a.ic_base.get(),
+                b.ic_base.get(),
+                c.ic_base.get(),
+                d.ic_base.get()
+            ],
+            [0, 4, 10, 13]
+        );
         store.release(&b);
         store.release(&a);
         assert_eq!(store.free, [(0, 10)], "adjacent ranges merge");
@@ -718,15 +726,15 @@ mod tests {
         assert_eq!(store.free_len(), 13);
         // First fit, and the rest stays free.
         let e = reserve(&mut store, 8);
-        assert_eq!(e.ic_base, 0);
+        assert_eq!(e.ic_base.get(), 0);
         assert_eq!(store.free, [(8, 5)]);
         // Too large for the hole: appended.
         let f = reserve(&mut store, 9);
-        assert_eq!(f.ic_base, 18);
+        assert_eq!(f.ic_base.get(), 18);
         // A free range at the end grows into the new entries.
         store.release(&f);
         let g = reserve(&mut store, 12);
-        assert_eq!(g.ic_base, 18);
+        assert_eq!(g.ic_base.get(), 18);
         assert_eq!(store.len(), 30);
         store.verify_free();
     }
@@ -751,7 +759,7 @@ mod tests {
         store.verify_free();
         // The next polymorphic site takes the freed row.
         let b = reserve(&mut store, 1);
-        assert_eq!(b.ic_base, 0);
+        assert_eq!(b.ic_base.get(), 0);
         assert!(store.record(0, fill(4)));
         assert!(store.record(0, fill(5)));
         assert_eq!(store.entries[0].w1, 0, "the row is reused");

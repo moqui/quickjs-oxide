@@ -482,6 +482,11 @@ impl Runtime {
     /// The loop's view of the runtime.
     #[inline]
     pub(crate) fn cx(&mut self) -> Cx<'_> {
+        // Between entries the store is this runtime's alone: what a host
+        // function published joins the units the loop reads directly.
+        if let Some(code) = std::rc::Rc::get_mut(&mut self.code) {
+            code.settle();
+        }
         Cx {
             heap: &mut self.heap,
             static_code: &self.code,
@@ -691,14 +696,11 @@ impl Runtime {
     /// live as long as the runtime (in the code store, where the loop runs
     /// them as a plain borrow): the program and its modules.
     pub fn compiler(&mut self) -> crate::vm::compile::Compiler<'_> {
-        // The store is shared only while a host function lends the engine,
-        // when no compilation here runs; were it shared, the code would be
-        // transient.
         if std::rc::Rc::get_mut(&mut self.code).is_none() {
-            return crate::vm::compile::Compiler::new(&mut self.heap, &self.code, &self.realm);
+            return crate::vm::compile::Compiler::owned(&mut self.heap, &self.code, &self.realm);
         }
         let code = std::rc::Rc::get_mut(&mut self.code).expect("an unshared code store");
-        crate::vm::compile::Compiler::owned(&mut self.heap, code, &self.realm)
+        crate::vm::compile::Compiler::unique(&mut self.heap, code, &self.realm)
     }
 
     /// [`Runtime::compiler`] for code the embedder compiles and lets go of (a
@@ -764,9 +766,12 @@ impl Runtime {
         );
         let mut sites = Vec::new();
         for (id, unit) in self.units().all() {
+            if unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+                continue;
+            }
             for (pc, insn) in unit.code.iter().enumerate() {
                 if let Some(site) = insn.site() {
-                    let entry = (unit.ic_base + site) as usize;
+                    let entry = (unit.ic_base.get() + site) as usize;
                     let misses = stats.site_misses[entry];
                     if misses > 0 {
                         sites.push((misses, id, pc, *insn));
@@ -784,7 +789,7 @@ impl Runtime {
             };
             let key = match insn.op {
                 crate::bytecode::Opcode::New => String::new(),
-                _ => crate::vm::property::key_text(&self.heap, insn.key()),
+                _ => crate::vm::property::key_text(&self.heap, unit.key(insn)),
             };
             let _ = writeln!(
                 out,
@@ -914,6 +919,15 @@ impl Runtime {
         let mut report = self.heap.report();
         let code = &mut report.code;
         code.static_units = self.code.len();
+        let mut bodies = crate::heap::hash::FxHashSet::default();
+        for (_, unit) in self.code.units() {
+            code.static_bytes += unit.own_bytes();
+            if unit.owns_shared() {
+                code.static_bytes += unit.shared_bytes();
+            } else if bodies.insert(std::sync::Arc::as_ptr(&unit.body)) {
+                code.shared_body_bytes += unit.shared_bytes();
+            }
+        }
         for (_, unit) in self.units().all() {
             code.units += 1;
             code.instructions += unit.code.len();

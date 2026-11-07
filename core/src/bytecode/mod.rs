@@ -59,12 +59,6 @@ impl Insn {
         (self.b as u16 | (self.c as u16) << 8) as i16
     }
 
-    /// The `imm` field read as a property key.
-    #[inline]
-    pub const fn key(self) -> PropertyKey {
-        PropertyKey::from_raw(self.imm)
-    }
-
     /// The cache site of an instruction that has one: `c` for `GetField` and
     /// `SetField`, `b | c << 8` for the global forms, `imm` for `New`. An index
     /// into the unit's entries of the [`IcStore`](crate::vm::ic::IcStore).
@@ -194,7 +188,7 @@ pub const NO_SPILL: u16 = u16::MAX;
 pub struct DebugInfo {
     pub name: Box<str>,
     /// The script or module the function belongs to, for `import()`.
-    pub filename: Option<std::rc::Rc<str>>,
+    pub filename: Option<std::sync::Arc<str>>,
     /// Where the instructions came from, sorted by `pc`: each entry holds
     /// for its instruction and the ones after it up to the next. Empty when
     /// the producer recorded none.
@@ -229,8 +223,11 @@ impl DebugInfo {
 /// temporaries up to `register_count`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeUnit {
-    pub code: Box<[Insn]>,
-    pub handlers: Box<[Handler]>,
+    /// The instructions; a key operand is an index into [`CodeUnit::keys`].
+    /// They name nothing of the runtime, so every runtime that loaded the
+    /// unit from one code image shares them (one hop from the unit, as the
+    /// loop reads them at every frame entry).
+    pub code: std::sync::Arc<[Insn]>,
     pub register_count: u16,
     pub parameter_count: u16,
     pub local_count: u16,
@@ -246,20 +243,42 @@ pub struct CodeUnit {
     pub spill_register: u16,
     /// The slots of the spill scope.
     pub spill_slots: u16,
-    /// The unit's first entry in the cache store, set when it is published.
-    pub ic_base: u32,
+    /// The unit's first entry in the cache store, reserved when the unit is
+    /// first entered ([`IC_UNRESERVED`] until then): a function that never
+    /// runs holds no cache entries.
+    pub ic_base: std::cell::Cell<u32>,
     /// Cache sites, numbered by [`CodeBuilder::finish`](builder::CodeBuilder::finish).
     pub ic_count: u32,
     /// Inner functions, by `MakeClosure` index. Published before the unit.
     pub children: Box<[CodeUnitId]>,
-    /// The cells a closure over this unit captures, from the frame that
-    /// creates it; `LoadCaptured` indexes them.
-    pub captures: Box<[Capture]>,
-    pub debug: DebugInfo,
     /// The function's `name` (an atom), or `None` for `""`.
     pub name_atom: Option<crate::value::StringId>,
     /// The function's `length`.
     pub length: u16,
+    /// The atoms a dynamic unit keeps alive ([`CodeUnit::key_atoms`]), set
+    /// when it is published; empty for a static unit, whose atoms are
+    /// pinned.
+    pub atoms: Box<[crate::value::StringId]>,
+    /// The property keys the instructions name: an instruction of a key
+    /// format holds an index into this table in `imm` ([`CodeUnit::key`]),
+    /// so the instructions name nothing of the runtime and are shared in
+    /// the body.
+    pub keys: Box<[PropertyKey]>,
+    /// The tables that name nothing of a runtime, shared by every runtime
+    /// that loaded the unit from one code image ([`crate::image`]); the
+    /// unit reads them as its own fields ([`CodeUnit`] derefs to them).
+    pub body: std::sync::Arc<UnitBody>,
+}
+
+/// The parts of a unit that name nothing of a runtime: held once for every
+/// runtime that runs the unit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnitBody {
+    pub handlers: Box<[Handler]>,
+    /// The cells a closure over this unit captures, from the frame that
+    /// creates it; `LoadCaptured` indexes them.
+    pub captures: Box<[Capture]>,
+    pub debug: DebugInfo,
     /// The function's source text, for `Function.prototype.toString`, in
     /// WTF-8 (a lone surrogate of `Function` constructor source is kept as
     /// its three-byte form, as QuickJS's `JS_ToCStringLen2` keeps it).
@@ -268,10 +287,43 @@ pub struct CodeUnit {
     /// indirect eval: a backtrace lists no native frame for them, as QuickJS's
     /// direct eval has none.
     pub direct_eval_sites: Box<[u32]>,
-    /// The atoms a dynamic unit keeps alive ([`CodeUnit::key_atoms`]), set
-    /// when it is published; empty for a static unit, whose atoms are
-    /// pinned.
-    pub atoms: Box<[crate::value::StringId]>,
+}
+
+impl UnitBody {
+    /// Bytes the tables hold.
+    pub fn bytes(&self) -> usize {
+        size_of::<UnitBody>()
+            + std::mem::size_of_val(&*self.handlers)
+            + std::mem::size_of_val(&*self.captures)
+            + std::mem::size_of_val(&*self.debug.positions)
+            + self.debug.name.len()
+            + self.source.as_ref().map_or(0, |source| source.len())
+            + std::mem::size_of_val(&*self.direct_eval_sites)
+    }
+}
+
+impl std::ops::Deref for CodeUnit {
+    type Target = UnitBody;
+
+    #[inline(always)]
+    fn deref(&self) -> &UnitBody {
+        &self.body
+    }
+}
+
+impl CodeUnit {
+    /// The body to fill in while the unit is built (unshared then).
+    pub fn body_mut(&mut self) -> &mut UnitBody {
+        std::sync::Arc::make_mut(&mut self.body)
+    }
+
+    /// Bytes the unit holds itself, without its body or its cache entries.
+    pub fn own_bytes(&self) -> usize {
+        size_of::<CodeUnit>()
+            + std::mem::size_of_val(&*self.keys)
+            + std::mem::size_of_val(&*self.children)
+            + std::mem::size_of_val(&*self.atoms)
+    }
 }
 
 impl CodeUnit {
@@ -291,6 +343,9 @@ impl CodeUnit {
         self.flags & flag != 0
     }
 }
+
+/// [`CodeUnit::ic_base`] of a unit not yet entered.
+pub const IC_UNRESERVED: u32 = u32::MAX;
 
 /// Marks a [`CodeUnitId`] of a unit compiled at run time, which the heap
 /// owns.
@@ -325,25 +380,98 @@ impl std::ops::Deref for UnitRef<'_> {
     }
 }
 
-/// The units published before the program runs. It lives in the runtime
-/// beside the heap, not in it, so the main loop can hold `&[Insn]` across
-/// heap calls; units compiled at run time live in the heap
+/// The units that live as long as the runtime: the program's, its modules',
+/// and what the embedder compiles without the `transient` option, before
+/// the program runs or inside a host function. It lives beside the heap, not
+/// in it, so the main loop can hold `&[Insn]` across heap calls; units
+/// compiled at run time by `eval` live in the heap
 /// ([`DynamicUnits`](crate::heap::code::DynamicUnits)).
+///
+/// The store only grows, and a unit never moves while anything can borrow
+/// it. Publishing takes `&self`, so it is safe while the running loop
+/// borrows a unit: a new unit goes in the overflow, chunks of cells that are
+/// filled once (chunk `k` holds `FIRST_CHUNK << k`). The loop reads the
+/// settled units, a plain vector; [`CodeStore::settle`] moves the overflow
+/// into it whenever the store is not shared (between entries), keeping
+/// every id.
 #[derive(Default)]
 pub struct CodeStore {
     units: Vec<CodeUnit>,
+    overflow: Overflow,
+}
+
+/// Units published while the store was shared, in id order after the
+/// settled ones: `CHUNKS` chunks of `CHUNK` cells, each filled once.
+struct Overflow {
+    chunks: [std::cell::OnceCell<Box<[std::cell::OnceCell<CodeUnit>]>>; CHUNKS],
+    len: std::cell::Cell<u32>,
+}
+
+/// Units per overflow chunk.
+const CHUNK: usize = 128;
+/// Overflow chunks: the units a runtime can publish while its store is
+/// shared before it returns to the top level; past them a host function's
+/// code is transient.
+const CHUNKS: usize = 256;
+
+impl Default for Overflow {
+    fn default() -> Self {
+        Overflow {
+            chunks: std::array::from_fn(|_| std::cell::OnceCell::new()),
+            len: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl Overflow {
+    #[inline]
+    fn get(&self, index: usize) -> Option<&CodeUnit> {
+        self.chunks
+            .get(index / CHUNK)?
+            .get()?
+            .get(index % CHUNK)?
+            .get()
+    }
 }
 
 impl CodeStore {
     /// Validates `unit` and appends it. Its cache entries are the caller's:
     /// [`Runtime::publish`](crate::Runtime::publish) reserves them.
-    pub fn publish(&mut self, unit: CodeUnit) -> Result<CodeUnitId, ValidateError> {
+    pub fn publish(&self, unit: CodeUnit) -> Result<CodeUnitId, ValidateError> {
         validate::validate(&unit, &|id| self.lookup(id))?;
-        Ok(self.push(unit))
+        match self.push(unit) {
+            Ok(id) => Ok(id),
+            Err(_) => panic!("code store overflow"),
+        }
     }
 
-    /// Appends a validated unit.
-    pub(crate) fn push(&mut self, unit: CodeUnit) -> CodeUnitId {
+    /// Appends a validated unit, to the overflow; gives it back when the
+    /// overflow is full.
+    pub(crate) fn push(&self, unit: CodeUnit) -> Result<CodeUnitId, CodeUnit> {
+        if !self.has_room() {
+            return Err(unit);
+        }
+        let index = self.overflow.len.get() as usize;
+        let id = (self.units.len() + index) as u32;
+        let cells = self.overflow.chunks[index / CHUNK]
+            .get_or_init(|| (0..CHUNK).map(|_| std::cell::OnceCell::new()).collect());
+        if cells[index % CHUNK].set(unit).is_err() {
+            unreachable!("an overflow cell is filled once");
+        }
+        self.overflow.len.set(index as u32 + 1);
+        Ok(CodeUnitId(id))
+    }
+
+    /// Whether [`CodeStore::push`] has room.
+    pub(crate) fn has_room(&self) -> bool {
+        let overflow = self.overflow.len.get() as usize;
+        overflow < CHUNK * CHUNKS && self.units.len() + overflow < DYNAMIC as usize
+    }
+
+    /// Appends a validated unit to the settled units, after the overflow
+    /// (settled first): a store no one else holds has no bound.
+    pub(crate) fn push_settled(&mut self, unit: CodeUnit) -> CodeUnitId {
+        self.settle();
         let id = u32::try_from(self.units.len())
             .ok()
             .filter(|&id| id < DYNAMIC)
@@ -352,35 +480,74 @@ impl CodeStore {
         CodeUnitId(id)
     }
 
+    /// Moves the overflow into the settled units, where the loop reads them
+    /// directly. Ids do not change.
+    #[inline]
+    pub fn settle(&mut self) {
+        if self.overflow.len.get() != 0 {
+            self.settle_overflow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn settle_overflow(&mut self) {
+        let overflow = std::mem::take(&mut self.overflow);
+        let count = overflow.len.get() as usize;
+        self.units.reserve(count);
+        for chunk in overflow.chunks {
+            let Some(cells) = chunk.into_inner() else {
+                break;
+            };
+            for cell in cells.into_vec() {
+                match cell.into_inner() {
+                    Some(unit) => self.units.push(unit),
+                    None => return,
+                }
+            }
+        }
+    }
+
     /// The unit `id`, if it is a unit of this store.
+    #[inline]
     pub fn lookup(&self, id: CodeUnitId) -> Option<&CodeUnit> {
         if id.is_dynamic() {
             return None;
         }
-        self.units.get(id.0 as usize)
+        match self.units.get(id.0 as usize) {
+            Some(unit) => Some(unit),
+            None => self.overflow.get(id.0 as usize - self.units.len()),
+        }
     }
 
     /// The static unit `id`.
     #[inline]
     pub fn get(&self, id: CodeUnitId) -> &CodeUnit {
         debug_assert!(!id.is_dynamic(), "a unit of the code store");
-        &self.units[id.0 as usize]
+        let index = id.0 as usize;
+        if index >= self.units.len() {
+            return self.get_overflow(id);
+        }
+        &self.units[index]
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_overflow(&self, id: CodeUnitId) -> &CodeUnit {
+        self.lookup(id).expect("a published unit")
     }
 
     pub fn len(&self) -> usize {
-        self.units.len()
+        self.units.len() + self.overflow.len.get() as usize
     }
 
     /// Every unit with its id, in publication order.
     pub fn units(&self) -> impl Iterator<Item = (CodeUnitId, &CodeUnit)> {
-        self.units
-            .iter()
-            .enumerate()
-            .map(|(index, unit)| (CodeUnitId(index as u32), unit))
+        (0..self.len() as u32).map(|index| (CodeUnitId(index), self.get(CodeUnitId(index))))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.units.is_empty()
+        self.len() == 0
     }
 
     /// `id` and its descendants in pre-order ([`Units::tree`]).
@@ -442,6 +609,12 @@ impl<'a> Units<'a> {
 }
 
 impl CodeUnit {
+    /// The property key `insn` names (an instruction of a key format).
+    #[inline(always)]
+    pub fn key(&self, insn: Insn) -> PropertyKey {
+        self.keys[insn.imm as usize]
+    }
+
     /// The distinct atoms the instructions name as property keys, with the
     /// function's name: what a live dynamic unit keeps alive.
     pub(crate) fn key_atoms(&self) -> Box<[crate::value::StringId]> {
@@ -451,14 +624,12 @@ impl CodeUnit {
         atoms.into()
     }
 
-    /// Every atom the instructions name as a property key, and the
-    /// function's name, once per use.
+    /// Every atom the key table names, and the function's name.
     pub(crate) fn key_atom_uses(&self) -> impl Iterator<Item = crate::value::StringId> + '_ {
         use crate::heap::atom::KeyKind;
-        self.code
+        self.keys
             .iter()
-            .filter(|insn| matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey))
-            .filter_map(|insn| match insn.key().kind() {
+            .filter_map(|key| match key.kind() {
                 KeyKind::String(id) => Some(id),
                 _ => None,
             })
@@ -468,16 +639,17 @@ impl CodeUnit {
     /// Bytes the unit holds: its instructions, tables, positions, source
     /// text and cache entries. A dynamic unit charges them to the heap.
     pub fn bytes(&self) -> usize {
-        size_of::<CodeUnit>()
-            + std::mem::size_of_val(&*self.code)
-            + std::mem::size_of_val(&*self.handlers)
-            + std::mem::size_of_val(&*self.children)
-            + std::mem::size_of_val(&*self.captures)
-            + std::mem::size_of_val(&*self.debug.positions)
-            + self.debug.name.len()
-            + self.source.as_ref().map_or(0, |source| source.len())
-            + std::mem::size_of_val(&*self.direct_eval_sites)
-            + std::mem::size_of_val(&*self.atoms)
-            + self.ic_count as usize * crate::vm::ic::ENTRY_BYTES
+        self.own_bytes() + self.shared_bytes() + self.ic_count as usize * crate::vm::ic::ENTRY_BYTES
+    }
+
+    /// Bytes of what a code image shares: the instructions and the body.
+    pub fn shared_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.code) + self.body.bytes()
+    }
+
+    /// Whether the instructions and the body are this unit's alone.
+    pub fn owns_shared(&self) -> bool {
+        std::sync::Arc::strong_count(&self.body) == 1
+            && std::sync::Arc::strong_count(&self.code) == 1
     }
 }

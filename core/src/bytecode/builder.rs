@@ -194,9 +194,10 @@ impl CodeBuilder {
     /// then the global and `new` sites.
     pub fn finish(mut self, layout: UnitLayout) -> CodeUnit {
         let ic_count = number_sites(&mut self.code);
+        let keys = key_table(&mut self.code);
         CodeUnit {
             code: self.code.into(),
-            handlers: self.handlers.into(),
+            keys,
             register_count: layout.register_count,
             parameter_count: layout.parameter_count,
             local_count: layout.local_count,
@@ -205,23 +206,44 @@ impl CodeBuilder {
             constant_count: layout.constant_count,
             spill_register: layout.spill_register.unwrap_or(super::NO_SPILL),
             spill_slots: layout.spill_slots,
-            ic_base: 0,
+            ic_base: std::cell::Cell::new(super::IC_UNRESERVED),
             ic_count,
             children: layout.children.into(),
-            captures: layout.captures.into(),
-            debug: DebugInfo {
-                name: layout.name.into(),
-                filename: layout.filename,
-                positions: Box::new([]),
-                definition: None,
-            },
             name_atom: layout.name_atom,
             length: layout.length,
-            source: layout.source,
-            direct_eval_sites: Box::new([]),
             atoms: Box::new([]),
+            body: std::sync::Arc::new(super::UnitBody {
+                handlers: self.handlers.into(),
+                captures: layout.captures.into(),
+                debug: DebugInfo {
+                    name: layout.name.into(),
+                    filename: layout.filename,
+                    positions: Box::new([]),
+                    definition: None,
+                },
+                source: layout.source,
+                direct_eval_sites: Box::new([]),
+            }),
         }
     }
+}
+
+/// Moves the property keys the instructions name into the unit's key table,
+/// each once in order of first use, and leaves each key operand its index.
+fn key_table(code: &mut [Insn]) -> Box<[crate::PropertyKey]> {
+    let mut keys: Vec<crate::PropertyKey> = Vec::new();
+    let mut index: crate::FxHashMap<u32, u32> = crate::FxHashMap::default();
+    for insn in code
+        .iter_mut()
+        .filter(|insn| matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey))
+    {
+        let raw = insn.imm;
+        insn.imm = *index.entry(raw).or_insert_with(|| {
+            keys.push(crate::PropertyKey::from_raw(raw));
+            keys.len() as u32 - 1
+        });
+    }
+    keys.into()
 }
 
 /// Writes each cache site's index into its instruction and returns the
@@ -285,5 +307,5 @@ pub struct UnitLayout {
     /// its three-byte form, as QuickJS's `JS_ToCStringLen2` keeps it).
     pub source: Option<Box<[u8]>>,
     /// The script or module the function belongs to.
-    pub filename: Option<std::rc::Rc<str>>,
+    pub filename: Option<std::sync::Arc<str>>,
 }

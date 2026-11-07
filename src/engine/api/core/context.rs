@@ -137,6 +137,26 @@ impl FunctionBytecodeRef {
     pub(crate) fn function(&self) -> &ObjectRef {
         &self.function
     }
+
+    /// A script loaded from a code image, which has no stack code: the front
+    /// end's tests see an empty script's.
+    pub(crate) fn loaded(function: ObjectRef) -> Self {
+        FunctionBytecodeRef {
+            function,
+            #[cfg(test)]
+            stack: StackCode {
+                root: std::rc::Rc::new(
+                    crate::engine::compiler::compile_unlinked_script_bytes_with_filename(
+                        b"",
+                        "<image>",
+                        crate::engine::code::debug::DebugInfoMode::Full,
+                    )
+                    .expect("an empty script compiles"),
+                ),
+                path: Vec::new(),
+            },
+        }
+    }
 }
 
 impl ModuleBytecodeRef {

@@ -119,10 +119,9 @@ fn every_context_and_runtime_operation_runs_while_lent() {
                 let key = PropertyKey::from_js_string(JsString::from_static("result"));
                 nested.set_property(&object, &key, result)?;
                 assert_eq!(runtime.type_of(&Value::Object(object.clone()))?, "object");
-                assert_eq!(
-                    nested.compile_module("export default 1").map(drop),
-                    Err(RuntimeError::Unsupported("modules inside a host function"))
-                );
+                let module =
+                    nested.compile_module_with_filename("export const m = 3", "lent.mjs")?;
+                nested.execute_module(&module)?;
                 // Collection stays at the top level.
                 assert_eq!(runtime.run_gc().map(drop), Err(RuntimeError::Reentered));
                 Ok(Value::Object(object))
