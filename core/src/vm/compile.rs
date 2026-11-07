@@ -350,6 +350,13 @@ impl<'a> Compiler<'a> {
                 }
             })
             .collect();
+        // The root's function is made here; its children's when their
+        // closures are.
+        let root_unit = code.get(root);
+        if root_unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+            self.heap.ics.reserve(&root_unit);
+        }
+        drop(root_unit);
         let prototype = self.realm.intrinsic(Intrinsic::FunctionPrototype);
         self.heap
             .alloc_bytecode_function(Some(prototype), None, &tree)

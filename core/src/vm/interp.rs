@@ -89,7 +89,7 @@ fn entry_failed(
     Ok(Value::object(promise))
 }
 
-/// Reserves the cache entries of a unit entered for the first time.
+/// Reserves the cache entries of a unit whose first function is made.
 #[cold]
 #[inline(never)]
 fn reserve_caches(cx: &mut Cx<'_>, unit: &CodeUnit) {
@@ -99,9 +99,11 @@ fn reserve_caches(cx: &mut Cx<'_>, unit: &CodeUnit) {
 /// [`enter`], inlined into the loop's call.
 #[inline(always)]
 fn enter_frame(cx: &mut Cx<'_>, unit: &CodeUnit, frame: Frame) -> Result<(), Throw> {
-    if unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
-        reserve_caches(cx, unit);
-    }
+    debug_assert_ne!(
+        unit.ic_base.get(),
+        crate::bytecode::IC_UNRESERVED,
+        "a unit's cache entries are reserved when its function is made"
+    );
     let poll = &mut cx.heap.vm.poll;
     *poll -= 1;
     if *poll == 0 {
@@ -1121,6 +1123,11 @@ fn closure_function(
     child_unit: &CodeUnit,
     scope: Option<ScopeId>,
 ) -> Result<ObjectId, Throw> {
+    // A unit takes its cache entries with its first function object, the
+    // only way to enter it, so a function never made holds none.
+    if child_unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+        reserve_caches(cx, child_unit);
+    }
     let (prototype, cache) = closure_kind(child_unit);
     let function_prototype = cx.realm.intrinsic(prototype);
     let function = cx

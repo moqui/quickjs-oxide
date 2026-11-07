@@ -56,6 +56,8 @@ pub(crate) struct ImageUnit {
     /// The unit's key table: what each key operand of its instructions
     /// (which are in the shared body) names.
     pub(crate) keys: Box<[ImageKey]>,
+    /// The instructions, shared with every runtime that loads the image.
+    pub(crate) code: Arc<[Insn]>,
     pub(crate) counts: Counts,
     pub(crate) body: Arc<UnitBody>,
     /// Indices into the image's units, in `MakeClosure` order.
@@ -176,10 +178,10 @@ impl CodeImage {
         match which {
             "key-operand" => {
                 let unit = &mut units[with_keys?];
-                let mut body = (*unit.body).clone();
-                let insn = body.code.iter_mut().find(|insn| names_key(insn))?;
+                let mut code = unit.code.to_vec();
+                let insn = code.iter_mut().find(|insn| names_key(insn))?;
                 insn.imm = unit.keys.len() as u32;
-                unit.body = Arc::new(body);
+                unit.code = code.into();
             }
             "key-kind" => {
                 let unit = &mut units[with_keys?];
@@ -227,18 +229,16 @@ impl CodeImage {
             }
             "register" => {
                 let unit = units.iter_mut().find(|unit| {
-                    unit.body
-                        .code
+                    unit.code
                         .iter()
                         .any(|insn| insn.op.format() == crate::bytecode::Format::AB)
                 })?;
-                let mut body = (*unit.body).clone();
-                let insn = body
-                    .code
+                let mut code = unit.code.to_vec();
+                let insn = code
                     .iter_mut()
                     .find(|insn| insn.op.format() == crate::bytecode::Format::AB)?;
                 insn.b = 255;
-                unit.body = Arc::new(body);
+                unit.code = code.into();
             }
             _ => return None,
         }
@@ -271,6 +271,7 @@ impl CodeImage {
                     + std::mem::size_of_val(&*unit.keys)
                     + std::mem::size_of_val(&*unit.children)
                     + std::mem::size_of_val(&*unit.constants)
+                    + std::mem::size_of_val(&*unit.code)
                     + unit.body.bytes()
             })
             .sum();
@@ -371,6 +372,7 @@ impl Encoder<'_> {
             .collect::<Result<Box<[_]>, _>>()?;
         let counts = counts_of(&unit);
         let body = Arc::clone(&unit.body);
+        let code = Arc::clone(&unit.code);
         let child_count = unit.children.len();
         drop(unit);
         let mut children = Vec::with_capacity(child_count);
@@ -380,6 +382,7 @@ impl Encoder<'_> {
         }
         self.out[index as usize] = Some(ImageUnit {
             keys: keys.into(),
+            code,
             counts,
             body,
             children: children.into(),
@@ -530,7 +533,7 @@ pub(crate) fn check(image: &ImageData) -> Result<(), LoadError> {
     }
     for unit in image.units.iter() {
         let counts = unit.counts;
-        if counts.ic_count as usize > unit.body.code.len() + 1
+        if counts.ic_count as usize > unit.code.len() + 1
             || unit.constants.len() != counts.constant_count as usize
         {
             return Err(malformed("a unit's counts"));
@@ -546,7 +549,7 @@ pub(crate) fn check(image: &ImageData) -> Result<(), LoadError> {
                 return Err(malformed("a key"));
             }
         }
-        for insn in unit.body.code.iter() {
+        for insn in unit.code.iter() {
             let generator = matches!(
                 insn.op,
                 Opcode::InitialYield | Opcode::Yield | Opcode::YieldStar
@@ -623,6 +626,7 @@ impl<'i> Loader<'i> {
         let unit = &self.image.units[index];
         let counts = unit.counts;
         CodeUnit {
+            code: Arc::clone(&unit.code),
             keys: vec![crate::PropertyKey::from_raw(0); unit.keys.len()].into(),
             register_count: counts.register_count,
             parameter_count: counts.parameter_count,

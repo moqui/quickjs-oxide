@@ -196,6 +196,7 @@ impl CodeBuilder {
         let ic_count = number_sites(&mut self.code);
         let keys = key_table(&mut self.code);
         CodeUnit {
+            code: self.code.into(),
             keys,
             register_count: layout.register_count,
             parameter_count: layout.parameter_count,
@@ -212,7 +213,6 @@ impl CodeBuilder {
             length: layout.length,
             atoms: Box::new([]),
             body: std::sync::Arc::new(super::UnitBody {
-                code: self.code.into(),
                 handlers: self.handlers.into(),
                 captures: layout.captures.into(),
                 debug: DebugInfo {

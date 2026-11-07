@@ -572,10 +572,14 @@ fn cache_sites_are_numbered_per_unit() {
     assert_eq!(validate(&unit), Ok(()));
 
     let mut bad = unit.clone();
-    bad.body_mut().code[2].c = 5;
+    let mut code = bad.code.to_vec();
+    code[2].c = 5;
+    bad.code = code.into();
     assert_eq!(validate(&bad), Err(ValidateErrorKind::Site(5)));
     let mut bad = unit;
-    bad.body_mut().code[0].imm = 9;
+    let mut code = bad.code.to_vec();
+    code[0].imm = 9;
+    bad.code = code.into();
     assert_eq!(validate(&bad), Err(ValidateErrorKind::Site(9)));
 }
 

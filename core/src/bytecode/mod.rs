@@ -223,6 +223,11 @@ impl DebugInfo {
 /// temporaries up to `register_count`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeUnit {
+    /// The instructions; a key operand is an index into [`CodeUnit::keys`].
+    /// They name nothing of the runtime, so every runtime that loaded the
+    /// unit from one code image shares them (one hop from the unit, as the
+    /// loop reads them at every frame entry).
+    pub code: std::sync::Arc<[Insn]>,
     pub register_count: u16,
     pub parameter_count: u16,
     pub local_count: u16,
@@ -269,9 +274,6 @@ pub struct CodeUnit {
 /// runtime that runs the unit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UnitBody {
-    /// The instructions; a key operand is an index into the unit's
-    /// [`CodeUnit::keys`].
-    pub code: Box<[Insn]>,
     pub handlers: Box<[Handler]>,
     /// The cells a closure over this unit captures, from the frame that
     /// creates it; `LoadCaptured` indexes them.
@@ -291,7 +293,6 @@ impl UnitBody {
     /// Bytes the tables hold.
     pub fn bytes(&self) -> usize {
         size_of::<UnitBody>()
-            + std::mem::size_of_val(&*self.code)
             + std::mem::size_of_val(&*self.handlers)
             + std::mem::size_of_val(&*self.captures)
             + std::mem::size_of_val(&*self.debug.positions)
@@ -638,6 +639,17 @@ impl CodeUnit {
     /// Bytes the unit holds: its instructions, tables, positions, source
     /// text and cache entries. A dynamic unit charges them to the heap.
     pub fn bytes(&self) -> usize {
-        self.own_bytes() + self.body.bytes() + self.ic_count as usize * crate::vm::ic::ENTRY_BYTES
+        self.own_bytes() + self.shared_bytes() + self.ic_count as usize * crate::vm::ic::ENTRY_BYTES
+    }
+
+    /// Bytes of what a code image shares: the instructions and the body.
+    pub fn shared_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.code) + self.body.bytes()
+    }
+
+    /// Whether the instructions and the body are this unit's alone.
+    pub fn owns_shared(&self) -> bool {
+        std::sync::Arc::strong_count(&self.body) == 1
+            && std::sync::Arc::strong_count(&self.code) == 1
     }
 }

@@ -922,10 +922,10 @@ impl Runtime {
         let mut bodies = crate::heap::hash::FxHashSet::default();
         for (_, unit) in self.code.units() {
             code.static_bytes += unit.own_bytes();
-            if std::sync::Arc::strong_count(&unit.body) == 1 {
-                code.static_bytes += unit.body.bytes();
+            if unit.owns_shared() {
+                code.static_bytes += unit.shared_bytes();
             } else if bodies.insert(std::sync::Arc::as_ptr(&unit.body)) {
-                code.shared_body_bytes += unit.body.bytes();
+                code.shared_body_bytes += unit.shared_bytes();
             }
         }
         for (_, unit) in self.units().all() {
