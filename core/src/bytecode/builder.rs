@@ -194,8 +194,9 @@ impl CodeBuilder {
     /// then the global and `new` sites.
     pub fn finish(mut self, layout: UnitLayout) -> CodeUnit {
         let ic_count = number_sites(&mut self.code);
+        let keys = key_table(&mut self.code);
         CodeUnit {
-            code: self.code.into(),
+            keys,
             register_count: layout.register_count,
             parameter_count: layout.parameter_count,
             local_count: layout.local_count,
@@ -211,6 +212,7 @@ impl CodeBuilder {
             length: layout.length,
             atoms: Box::new([]),
             body: std::sync::Arc::new(super::UnitBody {
+                code: self.code.into(),
                 handlers: self.handlers.into(),
                 captures: layout.captures.into(),
                 debug: DebugInfo {
@@ -224,6 +226,24 @@ impl CodeBuilder {
             }),
         }
     }
+}
+
+/// Moves the property keys the instructions name into the unit's key table,
+/// each once in order of first use, and leaves each key operand its index.
+fn key_table(code: &mut [Insn]) -> Box<[crate::PropertyKey]> {
+    let mut keys: Vec<crate::PropertyKey> = Vec::new();
+    let mut index: crate::FxHashMap<u32, u32> = crate::FxHashMap::default();
+    for insn in code
+        .iter_mut()
+        .filter(|insn| matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey))
+    {
+        let raw = insn.imm;
+        insn.imm = *index.entry(raw).or_insert_with(|| {
+            keys.push(crate::PropertyKey::from_raw(raw));
+            keys.len() as u32 - 1
+        });
+    }
+    keys.into()
 }
 
 /// Writes each cache site's index into its instruction and returns the

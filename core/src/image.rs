@@ -4,11 +4,11 @@
 //! An image names nothing of the runtime it came from. Atoms (the keys the
 //! instructions name, the functions' names, string constants) are held by
 //! text in one table; numbers by their bits; BigInts by sign and limbs;
-//! template objects by their strings. A unit's instructions keep their
-//! shape: each instruction whose `imm` is a string key holds the atom's
-//! index in the table instead, and the unit lists those instructions, so a
-//! load copies the instructions and patches the listed `imm`s with the
-//! loading runtime's atoms, without decoding anything.
+//! template objects by their strings. A unit's instructions name nothing of
+//! a runtime (a key operand indexes the unit's key table), so they are part
+//! of the unit's body, which the image and every runtime that loads it
+//! share: a load builds each unit's key table from the image's (interning
+//! the atoms) and copies no instruction.
 //!
 //! [`Compiler::load_image`](crate::vm::compile::Compiler::load_image)
 //! publishes every unit through the validator (a malformed image fails
@@ -53,10 +53,9 @@ pub(crate) struct ImageData {
 /// that loads the image shares.
 #[derive(Clone)]
 pub(crate) struct ImageUnit {
-    /// The instructions; the `imm` of each one `key_sites` lists is an
-    /// index into the atom table.
-    pub(crate) code: Box<[Insn]>,
-    pub(crate) key_sites: Box<[u32]>,
+    /// The unit's key table: what each key operand of its instructions
+    /// (which are in the shared body) names.
+    pub(crate) keys: Box<[ImageKey]>,
     pub(crate) counts: Counts,
     pub(crate) body: Arc<UnitBody>,
     /// Indices into the image's units, in `MakeClosure` order.
@@ -79,6 +78,15 @@ pub(crate) struct Counts {
     pub(crate) spill_slots: u16,
     pub(crate) ic_count: u32,
     pub(crate) length: u16,
+}
+
+/// A key of a unit's key table.
+#[derive(Clone, Copy)]
+pub(crate) enum ImageKey {
+    /// An atom of the table.
+    Atom(u32),
+    /// An array index, by its key's bits.
+    Index(u32),
 }
 
 /// A constant by value.
@@ -153,7 +161,7 @@ impl std::error::Error for EncodeError {}
 
 impl CodeImage {
     /// A copy of the image with one part broken, for the loader's tests:
-    /// `key-site-missing`, `key-site-extra`, `key-site-unsorted`,
+    /// `key-operand`, `key-kind`,
     /// `atom-index`, `child-index`, `child-twice`, `constant-count`,
     /// `constant-bits`, `ic-count`, `root-captures`, `root-flags`,
     /// `yield-flag` or `register`. `None` when the image has nothing of that
@@ -163,37 +171,27 @@ impl CodeImage {
         let mut data = (*self.0).clone();
         let atoms = data.atoms.len() as u32;
         let units = &mut data.units;
-        let with_sites = units.iter().position(|unit| unit.key_sites.len() >= 2);
+        let with_keys = units.iter().position(|unit| !unit.keys.is_empty());
         let with_children = units.iter().position(|unit| !unit.children.is_empty());
         match which {
-            "key-site-missing" => {
-                let unit = &mut units[with_sites?];
-                unit.key_sites = unit.key_sites[1..].into();
+            "key-operand" => {
+                let unit = &mut units[with_keys?];
+                let mut body = (*unit.body).clone();
+                let insn = body.code.iter_mut().find(|insn| names_key(insn))?;
+                insn.imm = unit.keys.len() as u32;
+                unit.body = Arc::new(body);
             }
-            "key-site-extra" => {
-                let unit = units.iter_mut().find(|unit| {
-                    unit.code.iter().enumerate().any(|(pc, insn)| {
-                        !names_key(insn) && !unit.key_sites.contains(&(pc as u32))
-                    })
-                })?;
-                let pc = unit.code.iter().position(|insn| !names_key(insn))? as u32;
-                let mut sites = unit.key_sites.to_vec();
-                sites.push(pc);
-                sites.sort_unstable();
-                unit.key_sites = sites.into();
-            }
-            "key-site-unsorted" => {
-                let unit = &mut units[with_sites?];
-                let mut sites = unit.key_sites.to_vec();
-                sites.swap(0, 1);
-                unit.key_sites = sites.into();
+            "key-kind" => {
+                let unit = &mut units[with_keys?];
+                let mut keys = unit.keys.to_vec();
+                keys[0] = ImageKey::Index(0);
+                unit.keys = keys.into();
             }
             "atom-index" => {
-                let unit = &mut units[with_sites?];
-                let pc = unit.key_sites[0] as usize;
-                let mut code = unit.code.to_vec();
-                code[pc].imm = atoms;
-                unit.code = code.into();
+                let unit = &mut units[with_keys?];
+                let mut keys = unit.keys.to_vec();
+                keys[0] = ImageKey::Atom(atoms);
+                unit.keys = keys.into();
             }
             "child-index" => {
                 let unit = &mut units[with_children?];
@@ -229,16 +227,18 @@ impl CodeImage {
             }
             "register" => {
                 let unit = units.iter_mut().find(|unit| {
-                    unit.code
+                    unit.body
+                        .code
                         .iter()
                         .any(|insn| insn.op.format() == crate::bytecode::Format::AB)
                 })?;
-                let mut code = unit.code.to_vec();
-                let insn = code
+                let mut body = (*unit.body).clone();
+                let insn = body
+                    .code
                     .iter_mut()
                     .find(|insn| insn.op.format() == crate::bytecode::Format::AB)?;
                 insn.b = 255;
-                unit.code = code.into();
+                unit.body = Arc::new(body);
             }
             _ => return None,
         }
@@ -268,8 +268,7 @@ impl CodeImage {
             .iter()
             .map(|unit| {
                 std::mem::size_of::<ImageUnit>()
-                    + std::mem::size_of_val(&*unit.code)
-                    + std::mem::size_of_val(&*unit.key_sites)
+                    + std::mem::size_of_val(&*unit.keys)
                     + std::mem::size_of_val(&*unit.children)
                     + std::mem::size_of_val(&*unit.constants)
                     + unit.body.bytes()
@@ -355,21 +354,14 @@ impl Encoder<'_> {
         self.out.push(None);
         let id = self.heap.bytecode_unit(bytecode);
         let unit = self.units.get(id);
-        let mut code = unit.code.to_vec();
-        let mut key_sites = Vec::new();
-        for (pc, insn) in code.iter_mut().enumerate() {
-            if !names_key(insn) {
-                continue;
-            }
-            match insn.key().kind() {
-                KeyKind::String(atom) => {
-                    insn.imm = self.atom(atom);
-                    key_sites.push(pc as u32);
-                }
-                KeyKind::Index(_) => {}
+        let mut keys = Vec::with_capacity(unit.keys.len());
+        for key in unit.keys.iter() {
+            keys.push(match key.kind() {
+                KeyKind::String(atom) => ImageKey::Atom(self.atom(atom)),
+                KeyKind::Index(_) => ImageKey::Index(key.raw()),
                 // A symbol is its runtime's.
                 KeyKind::Symbol(_) => return Err(EncodeError::Constant("symbol key")),
-            }
+            });
         }
         let name_atom = unit.name_atom.map(|atom| self.atom(atom));
         let constants = self.heap.bytecode_constants(bytecode).to_vec();
@@ -387,8 +379,7 @@ impl Encoder<'_> {
             children.push(self.unit(child)?);
         }
         self.out[index as usize] = Some(ImageUnit {
-            code: code.into(),
-            key_sites: key_sites.into(),
+            keys: keys.into(),
             counts,
             body,
             children: children.into(),
@@ -492,8 +483,8 @@ fn counts_of(unit: &CodeUnit) -> Counts {
 }
 
 /// Checks what the validator does not see before a load changes anything:
-/// the unit tree is the image's pre-order, every atom and constant index is
-/// in range, the key sites are exactly the instructions with string keys,
+/// the unit tree is the image's pre-order, every atom, key and constant
+/// index is in range,
 /// the counts fit the code, the root is a script that captures no cell, and
 /// only a generator yields and only an async function awaits.
 pub(crate) fn check(image: &ImageData) -> Result<(), LoadError> {
@@ -539,21 +530,23 @@ pub(crate) fn check(image: &ImageData) -> Result<(), LoadError> {
     }
     for unit in image.units.iter() {
         let counts = unit.counts;
-        if counts.ic_count as usize > unit.code.len() + 1
+        if counts.ic_count as usize > unit.body.code.len() + 1
             || unit.constants.len() != counts.constant_count as usize
         {
             return Err(malformed("a unit's counts"));
         }
-        let mut sites = unit.key_sites.iter().copied().peekable();
-        for (pc, insn) in unit.code.iter().enumerate() {
-            let site = sites.next_if_eq(&(pc as u32)).is_some();
-            if site {
-                if !names_key(insn) || insn.imm as usize >= atoms {
-                    return Err(malformed("a key site"));
+        for key in unit.keys.iter() {
+            let valid = match *key {
+                ImageKey::Atom(atom) => (atom as usize) < atoms,
+                ImageKey::Index(bits) => {
+                    matches!(crate::PropertyKey::from_raw(bits).kind(), KeyKind::Index(_))
                 }
-            } else if names_key(insn) && !matches!(insn.key().kind(), KeyKind::Index(_)) {
-                return Err(malformed("a key site"));
+            };
+            if !valid {
+                return Err(malformed("a key"));
             }
+        }
+        for insn in unit.body.code.iter() {
             let generator = matches!(
                 insn.op,
                 Opcode::InitialYield | Opcode::Yield | Opcode::YieldStar
@@ -564,9 +557,6 @@ pub(crate) fn check(image: &ImageData) -> Result<(), LoadError> {
             {
                 return Err(malformed("an instruction the unit's flags do not allow"));
             }
-        }
-        if sites.next().is_some() {
-            return Err(malformed("a key site"));
         }
         if unit.name_atom.is_some_and(|atom| atom as usize >= atoms) {
             return Err(malformed("an atom index"));
@@ -633,7 +623,7 @@ impl<'i> Loader<'i> {
         let unit = &self.image.units[index];
         let counts = unit.counts;
         CodeUnit {
-            code: unit.code.clone(),
+            keys: vec![crate::PropertyKey::from_raw(0); unit.keys.len()].into(),
             register_count: counts.register_count,
             parameter_count: counts.parameter_count,
             local_count: counts.local_count,
@@ -667,13 +657,14 @@ impl<'i> Loader<'i> {
     ) -> Result<(), LoadError> {
         let image = self.image;
         let source = &image.units[index];
-        let mut code = std::mem::take(&mut unit.code);
-        for &pc in source.key_sites.iter() {
-            let insn = &mut code[pc as usize];
-            let atom = self.atom(heap, insn.imm)?;
-            insn.imm = crate::PropertyKey::atom(atom).raw();
+        let mut keys = Vec::with_capacity(source.keys.len());
+        for key in source.keys.iter() {
+            keys.push(match *key {
+                ImageKey::Atom(atom) => crate::PropertyKey::atom(self.atom(heap, atom)?),
+                ImageKey::Index(bits) => crate::PropertyKey::from_raw(bits),
+            });
         }
-        unit.code = code;
+        unit.keys = keys.into();
         unit.name_atom = source
             .name_atom
             .map(|index| self.atom(heap, index))

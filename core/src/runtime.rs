@@ -786,7 +786,7 @@ impl Runtime {
             };
             let key = match insn.op {
                 crate::bytecode::Opcode::New => String::new(),
-                _ => crate::vm::property::key_text(&self.heap, insn.key()),
+                _ => crate::vm::property::key_text(&self.heap, unit.key(insn)),
             };
             let _ = writeln!(
                 out,

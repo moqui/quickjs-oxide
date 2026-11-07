@@ -222,9 +222,8 @@ fn a_malformed_image_fails_to_load_and_changes_nothing() {
     let (_, compiled) = runtime();
     let image = compiled.compile_image(RICH, "rich.js").unwrap();
     for which in [
-        "key-site-missing",
-        "key-site-extra",
-        "key-site-unsorted",
+        "key-operand",
+        "key-kind",
         "atom-index",
         "child-index",
         "child-twice",
