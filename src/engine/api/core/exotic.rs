@@ -43,7 +43,11 @@ pub enum Hook<T> {
 /// answers only `get_own_property` is therefore complete for reads; one
 /// that answers `get`, `set` and `has` is the usual shape of a name
 /// resolver. A `set` that declines ends in `OrdinarySet`, which defines the
-/// property on the receiver through its `[[DefineOwnProperty]]`.
+/// property on the receiver through its `[[DefineOwnProperty]]`. A
+/// `define_own_property` or `delete` that declines is the ordinary method
+/// over `get_own_property`'s answer: a property the class reports as
+/// non-configurable is neither deleted nor redefined incompatibly, and an
+/// accepted definition is stored as an ordinary own property.
 ///
 /// Hooks run inside the engine as host functions do: an error is thrown
 /// as a host function's is, a panic poisons the runtime, and the engine
@@ -124,7 +128,9 @@ pub trait ExoticClass: 'static {
     /// `[[OwnPropertyKeys]]`: `Object.keys`, `for-in`, `JSON.stringify`
     /// and the like, which then read each key's enumerability through
     /// [`ExoticClass::get_own_property`]. The object's ordinary own keys
-    /// that are not in the list follow it.
+    /// are added to the list, repeats are dropped, and the result is in an
+    /// ordinary object's order: integer indices ascending, then strings,
+    /// then symbols, each in list order.
     fn own_keys(
         &self,
         scope: &mut ExoticScope<'_>,
