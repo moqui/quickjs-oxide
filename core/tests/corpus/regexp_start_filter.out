@@ -10,3 +10,7 @@ true 2 true 3 false 0
 one_two 2 2 null
 2411  &lt;end&gt;
 105 50
+1:A@2 3:a@4 3:a@4 none
+1:abc@4 1:b@2 3:b@4 0:x@1 1:abc@4
+3 2
+1:\ude00@2 2:\ude00@3
