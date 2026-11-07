@@ -20,6 +20,7 @@ options and report types.
 | `PromiseCapability` | a promise and its resolving functions, settled from Rust |
 | `FromJs`, `IntoJs` | conversions between JavaScript values and Rust types, and the typed host functions over them |
 | `TypedArrayKind`, `TypedArrayView` | a typed array's element type and its window on its buffer |
+| `CodeImage`, `front_end_parses` | a compiled script by value, loaded into any runtime without parsing; the thread's parse count |
 | `Js`, `JsResult` | the operations `Context` and `Scope` share, as a sealed trait for code generic over either; both also have each as an inherent method |
 | `Scope`, `FunctionOptions`, `HostFunction`, `Raw` | host functions: the function's view of its call and of the engine, how it is made, what `new_function` takes |
 | `ExoticClass`, `Hook`, `HostClass`, `ExoticScope` | host exotic objects: a class's internal-method hooks, a hook's answer or decline, a registered class, a hook's view of the engine |
@@ -157,6 +158,14 @@ error throws and a panic poisons the runtime as in a host function. No
 inline cache holds an answer, and as the global object's prototype the
 object resolves bare names. [Embedding internals](../../../docs/embedding.md#host-exotic-objects)
 gives the fallback rules and the cost.
+
+## Code images
+
+`compile_image(source, filename)` or `encode_image(&script)` returns a
+`CodeImage`, a compiled script by value (`Send + Sync`, cheap to clone);
+`load_image(&image)` loads it into any runtime of the same build without
+parsing and returns a `FunctionBytecodeRef` to `execute`. See
+[Embedding internals](../../../docs/embedding.md#code-images).
 
 ## Promises and the event loop
 

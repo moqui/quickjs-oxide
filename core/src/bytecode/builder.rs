@@ -196,7 +196,6 @@ impl CodeBuilder {
         let ic_count = number_sites(&mut self.code);
         CodeUnit {
             code: self.code.into(),
-            handlers: self.handlers.into(),
             register_count: layout.register_count,
             parameter_count: layout.parameter_count,
             local_count: layout.local_count,
@@ -208,18 +207,21 @@ impl CodeBuilder {
             ic_base: 0,
             ic_count,
             children: layout.children.into(),
-            captures: layout.captures.into(),
-            debug: DebugInfo {
-                name: layout.name.into(),
-                filename: layout.filename,
-                positions: Box::new([]),
-                definition: None,
-            },
             name_atom: layout.name_atom,
             length: layout.length,
-            source: layout.source,
-            direct_eval_sites: Box::new([]),
             atoms: Box::new([]),
+            body: std::sync::Arc::new(super::UnitBody {
+                handlers: self.handlers.into(),
+                captures: layout.captures.into(),
+                debug: DebugInfo {
+                    name: layout.name.into(),
+                    filename: layout.filename,
+                    positions: Box::new([]),
+                    definition: None,
+                },
+                source: layout.source,
+                direct_eval_sites: Box::new([]),
+            }),
         }
     }
 }
@@ -285,5 +287,5 @@ pub struct UnitLayout {
     /// its three-byte form, as QuickJS's `JS_ToCStringLen2` keeps it).
     pub source: Option<Box<[u8]>>,
     /// The script or module the function belongs to.
-    pub filename: Option<std::rc::Rc<str>>,
+    pub filename: Option<std::sync::Arc<str>>,
 }

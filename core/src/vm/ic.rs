@@ -262,6 +262,13 @@ pub struct IcStore {
 }
 
 impl IcStore {
+    /// Makes room for `count` more entries at once, exactly: a load that
+    /// knows its units' sites grows the store once.
+    pub(crate) fn reserve_exact(&mut self, count: usize) {
+        self.entries.reserve_exact(count);
+        self.kinds.reserve_exact(count);
+    }
+
     /// Reserves the entries of a unit about to be published and sets its
     /// `ic_base`: the first free range that fits, else the end of the store.
     pub(crate) fn reserve(&mut self, unit: &mut CodeUnit) {

@@ -914,6 +914,15 @@ impl Runtime {
         let mut report = self.heap.report();
         let code = &mut report.code;
         code.static_units = self.code.len();
+        let mut bodies = crate::heap::hash::FxHashSet::default();
+        for (_, unit) in self.code.units() {
+            code.static_bytes += unit.own_bytes();
+            if std::sync::Arc::strong_count(&unit.body) == 1 {
+                code.static_bytes += unit.body.bytes();
+            } else if bodies.insert(std::sync::Arc::as_ptr(&unit.body)) {
+                code.shared_body_bytes += unit.body.bytes();
+            }
+        }
         for (_, unit) in self.units().all() {
             code.units += 1;
             code.instructions += unit.code.len();

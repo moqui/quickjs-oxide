@@ -96,6 +96,7 @@ impl<'source> Parser<'source> {
         filename: JsString,
         context: RootCompileContext,
     ) -> Result<FunctionTree<'source>, Error> {
+        crate::engine::compiler::count_parse();
         validate_source_length(source.len())?;
         let is_module = matches!(&context, RootCompileContext::Module);
         let (

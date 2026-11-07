@@ -194,7 +194,7 @@ pub const NO_SPILL: u16 = u16::MAX;
 pub struct DebugInfo {
     pub name: Box<str>,
     /// The script or module the function belongs to, for `import()`.
-    pub filename: Option<std::rc::Rc<str>>,
+    pub filename: Option<std::sync::Arc<str>>,
     /// Where the instructions came from, sorted by `pc`: each entry holds
     /// for its instruction and the ones after it up to the next. Empty when
     /// the producer recorded none.
@@ -230,7 +230,6 @@ impl DebugInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeUnit {
     pub code: Box<[Insn]>,
-    pub handlers: Box<[Handler]>,
     pub register_count: u16,
     pub parameter_count: u16,
     pub local_count: u16,
@@ -252,14 +251,29 @@ pub struct CodeUnit {
     pub ic_count: u32,
     /// Inner functions, by `MakeClosure` index. Published before the unit.
     pub children: Box<[CodeUnitId]>,
-    /// The cells a closure over this unit captures, from the frame that
-    /// creates it; `LoadCaptured` indexes them.
-    pub captures: Box<[Capture]>,
-    pub debug: DebugInfo,
     /// The function's `name` (an atom), or `None` for `""`.
     pub name_atom: Option<crate::value::StringId>,
     /// The function's `length`.
     pub length: u16,
+    /// The atoms a dynamic unit keeps alive ([`CodeUnit::key_atoms`]), set
+    /// when it is published; empty for a static unit, whose atoms are
+    /// pinned.
+    pub atoms: Box<[crate::value::StringId]>,
+    /// The tables that name nothing of a runtime, shared by every runtime
+    /// that loaded the unit from one code image ([`crate::image`]); the
+    /// unit reads them as its own fields ([`CodeUnit`] derefs to them).
+    pub body: std::sync::Arc<UnitBody>,
+}
+
+/// The parts of a unit that name nothing of a runtime: held once for every
+/// runtime that runs the unit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnitBody {
+    pub handlers: Box<[Handler]>,
+    /// The cells a closure over this unit captures, from the frame that
+    /// creates it; `LoadCaptured` indexes them.
+    pub captures: Box<[Capture]>,
+    pub debug: DebugInfo,
     /// The function's source text, for `Function.prototype.toString`, in
     /// WTF-8 (a lone surrogate of `Function` constructor source is kept as
     /// its three-byte form, as QuickJS's `JS_ToCStringLen2` keeps it).
@@ -268,10 +282,43 @@ pub struct CodeUnit {
     /// indirect eval: a backtrace lists no native frame for them, as QuickJS's
     /// direct eval has none.
     pub direct_eval_sites: Box<[u32]>,
-    /// The atoms a dynamic unit keeps alive ([`CodeUnit::key_atoms`]), set
-    /// when it is published; empty for a static unit, whose atoms are
-    /// pinned.
-    pub atoms: Box<[crate::value::StringId]>,
+}
+
+impl UnitBody {
+    /// Bytes the tables hold.
+    pub fn bytes(&self) -> usize {
+        size_of::<UnitBody>()
+            + std::mem::size_of_val(&*self.handlers)
+            + std::mem::size_of_val(&*self.captures)
+            + std::mem::size_of_val(&*self.debug.positions)
+            + self.debug.name.len()
+            + self.source.as_ref().map_or(0, |source| source.len())
+            + std::mem::size_of_val(&*self.direct_eval_sites)
+    }
+}
+
+impl std::ops::Deref for CodeUnit {
+    type Target = UnitBody;
+
+    #[inline(always)]
+    fn deref(&self) -> &UnitBody {
+        &self.body
+    }
+}
+
+impl CodeUnit {
+    /// The body to fill in while the unit is built (unshared then).
+    pub fn body_mut(&mut self) -> &mut UnitBody {
+        std::sync::Arc::make_mut(&mut self.body)
+    }
+
+    /// Bytes the unit holds itself, without its body or its cache entries.
+    pub fn own_bytes(&self) -> usize {
+        size_of::<CodeUnit>()
+            + std::mem::size_of_val(&*self.code)
+            + std::mem::size_of_val(&*self.children)
+            + std::mem::size_of_val(&*self.atoms)
+    }
 }
 
 impl CodeUnit {
@@ -468,16 +515,6 @@ impl CodeUnit {
     /// Bytes the unit holds: its instructions, tables, positions, source
     /// text and cache entries. A dynamic unit charges them to the heap.
     pub fn bytes(&self) -> usize {
-        size_of::<CodeUnit>()
-            + std::mem::size_of_val(&*self.code)
-            + std::mem::size_of_val(&*self.handlers)
-            + std::mem::size_of_val(&*self.children)
-            + std::mem::size_of_val(&*self.captures)
-            + std::mem::size_of_val(&*self.debug.positions)
-            + self.debug.name.len()
-            + self.source.as_ref().map_or(0, |source| source.len())
-            + std::mem::size_of_val(&*self.direct_eval_sites)
-            + std::mem::size_of_val(&*self.atoms)
-            + self.ic_count as usize * crate::vm::ic::ENTRY_BYTES
+        self.own_bytes() + self.body.bytes() + self.ic_count as usize * crate::vm::ic::ENTRY_BYTES
     }
 }

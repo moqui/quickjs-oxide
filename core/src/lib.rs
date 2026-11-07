@@ -11,6 +11,7 @@ mod clock;
 pub mod embed;
 pub mod heap;
 pub mod host;
+pub mod image;
 pub mod runtime;
 pub mod shape;
 pub mod value;
@@ -25,6 +26,7 @@ pub use heap::hash::{FxHashMap, FxHashSet, FxHasher};
 pub use heap::object::ObjectKind;
 pub use heap::report::MemoryReport;
 pub use heap::{AtomMode, BytecodeTemplate, Heap, HeapError};
+pub use image::{CodeImage, EncodeError, LoadError};
 pub use runtime::{Intrinsic, Realm, Runtime, RuntimeOptions, ThrownSummary};
 pub use shape::PropertyFlags;
 pub use value::{

@@ -14,6 +14,7 @@ use super::compile::{ScriptCompileError, compile_script, syntax_location};
 use super::context::{Context, EvalOptions, FunctionBytecodeRef, ModuleBytecodeRef, QjsHelpers};
 use super::exotic::{ExoticClass, ExoticScope, HostClass};
 use super::function::{FunctionOptions, HostFunction, Raw, Scope, host_body};
+use super::image::CodeImage;
 use super::promise::PromiseCapability;
 use super::property::{
     AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, Key,
@@ -1321,6 +1322,20 @@ js_ops! {
     fn compile_bytes_with_filename(&mut self, source: &[u8], filename: &str) -> JsResult<FunctionBytecodeRef>;
     /// Runs a compiled script with the global object as `this`.
     fn execute(&mut self, script: &FunctionBytecodeRef) -> JsResult<Value>;
+
+    // ---- code images ----
+
+    /// The code image of a compiled script: its units with their atoms by
+    /// text and constants by value, for any runtime of this build to load.
+    fn encode_image(&mut self, script: &FunctionBytecodeRef) -> JsResult<CodeImage>;
+    /// Compiles `source` as the script `filename` (transient here) and
+    /// returns its image. A syntax error is thrown as by `compile`.
+    fn compile_image(&mut self, source: &str, filename: &str) -> JsResult<CodeImage>;
+    /// Loads a code image without parsing: its atoms interned, its units
+    /// published through the validator with fresh inline caches (static
+    /// code between entries, transient inside a host function), its root
+    /// instantiated. Run it with `execute`.
+    fn load_image(&mut self, image: &CodeImage) -> JsResult<FunctionBytecodeRef>;
 
     // ---- modules (`Unsupported` inside a host function) ----
 
