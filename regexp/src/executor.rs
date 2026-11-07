@@ -734,9 +734,9 @@ where
 {
     let instructions = program.instructions();
 
-    // The interrupt is polled on backtracking and on a jump back, as
-    // QuickJS's `lre_poll_timeout` is on its backtracking: every
-    // exponential search backtracks, and a counted `Loop` ends.
+    // The interrupt is polled on backtracking, on a jump back and on a
+    // counted loop's repeat, as QuickJS's `lre_poll_timeout` is: an attempt
+    // that passes none of them is bounded by the program's length.
     macro_rules! fail_branch {
         () => {{
             if state.restore_backtrack() {
@@ -909,8 +909,7 @@ where
                 fail_branch!();
             }
             Instruction::Jump { target } => {
-                // A jump back closes a loop: polled too, so no program
-                // runs on without backtracking or reaching its bound.
+                // A jump back closes a loop: polled too.
                 if *target <= instruction_pc {
                     poller.step()?;
                 }
@@ -948,6 +947,8 @@ where
                 let value = value.wrapping_sub(1);
                 state.set_register(register_index, RegisterValue::Counter(value))?;
                 if value != 0 {
+                    // A counted loop may run 2^31 times, nested twice.
+                    poller.step()?;
                     state.pc = *target;
                 }
             }

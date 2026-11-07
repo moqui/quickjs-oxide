@@ -1258,6 +1258,37 @@ fn a_backtracking_regexp_stops_at_an_interrupt() {
 }
 
 #[test]
+fn a_counted_regexp_loop_stops_at_an_interrupt() {
+    // No backtracking: counted loops of empty bodies, alone and before a
+    // failing character at every start position.
+    struct Deadline(std::time::Instant);
+    impl Host for Deadline {
+        fn interrupt(&mut self) -> bool {
+            std::time::Instant::now() >= self.0
+        }
+    }
+    for source in [
+        "/(?:(?:){2147483646}){2147483646}/.test('')",
+        "/(?:){2147483646}x/.test('a'.repeat(1000))",
+        "/(?:\\b){2147483646}x/.test('a'.repeat(1000))",
+    ] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let runtime = Runtime::with_host(Deadline(deadline), RuntimeOptions::default());
+        let context = runtime.context();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            context.eval(source),
+            Err(RuntimeError::Interrupted),
+            "{source}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn an_interrupt_unwinds_through_a_host_function() {
     let (runtime, context) = runtime();
     let global = context.global_object().unwrap();
