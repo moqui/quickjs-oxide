@@ -790,3 +790,77 @@ fn proxies_are_unchanged() {
         "pundefinedhas viaProxy,has nothingHere"
     );
 }
+
+/// A class whose `set` hook counts and always declines.
+struct CountingSet;
+
+impl ExoticClass for CountingSet {
+    type Data = Cell<i32>;
+
+    fn set(
+        &self,
+        _: &mut ExoticScope<'_>,
+        count: &Cell<i32>,
+        _: &PropertyKey,
+        _: Value,
+    ) -> JsResult<Hook<bool>> {
+        count.set(count.get() + 1);
+        Ok(Hook::Ordinary)
+    }
+}
+
+#[test]
+fn a_set_site_never_caches_through_or_for_an_exotic_object() {
+    let (_, context) = runtime();
+    let class = context.register_exotic_class(CountingSet).unwrap();
+    let object_prototype = context.object_prototype().unwrap();
+    let exotic = context
+        .new_host_exotic(Cell::new(0), &class, Some(&object_prototype))
+        .unwrap();
+    context
+        .set_property(
+            &context.global_object().unwrap(),
+            &context.runtime().intern_property_key("exotic").unwrap(),
+            Value::Object(exotic.clone()),
+        )
+        .unwrap();
+    let count = context.host_data::<Cell<i32>>(&exotic).unwrap().unwrap();
+    // Adds to fresh objects whose prototype is exotic, at one site: the hook
+    // decides each one.
+    assert_eq!(
+        context
+            .eval(
+                "function write(o, v) { o.x = v; }
+                 var made = [];
+                 for (var i = 0; i < 8; i++) { var o = Object.create(exotic); write(o, i); made.push(o.x); }
+                 made.join()"
+            )
+            .unwrap(),
+        text("0,1,2,3,4,5,6,7")
+    );
+    assert_eq!(count.get(), 8);
+    // Writes to the exotic object itself once it has an ordinary own `x`.
+    count.set(0);
+    context
+        .eval("for (var i = 0; i < 8; i++) write(exotic, i);")
+        .unwrap();
+    assert_eq!(count.get(), 8);
+    assert_eq!(context.eval("exotic.x").unwrap(), Value::Int(7));
+}
+
+#[test]
+fn a_set_site_never_caches_an_add_through_a_proxy_prototype() {
+    let (_, context) = runtime();
+    assert_eq!(
+        context
+            .eval(
+                "var traps = 0;
+                 var proxy = new Proxy({}, { set(t, k, v, r) { traps++; return Reflect.set(t, k, v, r); } });
+                 function write(o, v) { o.x = v; }
+                 for (var i = 0; i < 8; i++) write(Object.create(proxy), i);
+                 traps"
+            )
+            .unwrap(),
+        Value::Int(8)
+    );
+}

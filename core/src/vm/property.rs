@@ -485,7 +485,11 @@ pub(crate) fn set_cached(
             KeyKind::Symbol(_) => true,
             KeyKind::Index(_) => false,
         };
-    let Some(object) = receiver.as_object().filter(|_| cacheable) else {
+    // An exotic receiver's write is its internal method's, every time.
+    let Some(object) = receiver
+        .as_object()
+        .filter(|&object| cacheable && !cx.heap.object_kind(object).is_exotic())
+    else {
         cx.heap.ics.count_miss(site, false);
         return set(cx, receiver, key, value, strict);
     };
@@ -543,10 +547,15 @@ pub(crate) fn set_cached(
 }
 
 /// Whether no prototype of `object` has `key` as an accessor or a read-only
-/// data property, so a write adds it to `object`.
+/// data property, so a write adds it to `object`. An exotic prototype (a
+/// proxy's `set` trap, a host exotic object's hook) decides every write
+/// itself, so its chain never allows a cached add.
 fn chain_allows_add(heap: &Heap, object: ObjectId, key: PropertyKey) -> bool {
     let mut current = heap.prototype_of(object);
     while let Some(prototype) = current {
+        if heap.object_kind(prototype).is_exotic() {
+            return false;
+        }
         if let Some((_, property)) = heap.lookup_own(prototype, key) {
             return is_plain_data(property);
         }
