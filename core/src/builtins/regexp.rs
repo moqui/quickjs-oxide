@@ -437,8 +437,7 @@ fn pristine_flags(cx: &Cx<'_>, object: ObjectId, cache: &RegExpFlagCache) -> Opt
     let heap = &*cx.heap;
     let prototype = cx.realm.intrinsic(Intrinsic::RegExpPrototype);
     if heap.object_kind(object) != ObjectKind::RegExp
-        || Some(heap.shape_of(object))
-            != cx.realm.regexp_instance_shape.get().map(|(shape, _)| shape)
+        || Some(heap.shape_of(object)) != cx.heap.regexp_instance_shape.map(|(shape, _)| shape)
         || heap.prototype_of(object) != Some(prototype)
         || heap.shape_of(prototype) != cache.shape
     {
@@ -546,7 +545,7 @@ pub(super) fn to_string(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
 /// (its only property, a writable data property).
 #[inline]
 fn last_index_slot(cx: &Cx<'_>, object: ObjectId) -> Option<u32> {
-    let (shape, slot) = cx.realm.regexp_instance_shape.get()?;
+    let (shape, slot) = cx.heap.regexp_instance_shape?;
     (cx.heap.shape_of(object) == shape).then_some(slot)
 }
 
@@ -789,8 +788,7 @@ fn intrinsic_exec(cx: &mut Cx<'_>, object: ObjectId) -> Result<bool, Throw> {
         let heap = &*cx.heap;
         let prototype = cx.realm.intrinsic(Intrinsic::RegExpPrototype);
         if heap.object_kind(object) == ObjectKind::RegExp
-            && Some(heap.shape_of(object))
-                == cx.realm.regexp_instance_shape.get().map(|(shape, _)| shape)
+            && Some(heap.shape_of(object)) == cx.heap.regexp_instance_shape.map(|(shape, _)| shape)
             && heap.prototype_of(object) == Some(prototype)
             && heap.shape_of(prototype) == cache.shape
         {

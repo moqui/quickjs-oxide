@@ -34,6 +34,9 @@ struct Program {
     /// absent. `None` for the whole field means the pattern has no named
     /// captures and matches QuickJS's absent group-name trailer.
     group_names: Option<Box<[Option<GroupName>]>>,
+    /// The units a match can start with, when the first instruction that
+    /// reads input fixes them.
+    first: Option<super::executor::FirstUnits>,
 }
 
 impl CompiledRegExp {
@@ -44,12 +47,14 @@ impl CompiledRegExp {
         register_count: u8,
         instructions: Vec<Instruction>,
     ) -> Self {
+        let first = super::executor::FirstUnits::of(flags, &instructions);
         Self(Program {
             flags,
             capture_count,
             register_count,
             instructions: instructions.into_boxed_slice(),
             group_names: None,
+            first,
         })
     }
 
@@ -64,12 +69,14 @@ impl CompiledRegExp {
             names.len() == usize::from(capture_count).saturating_sub(1)
                 && names.iter().any(Option::is_some)
         }));
+        let first = super::executor::FirstUnits::of(flags, &instructions);
         let program = Self(Program {
             flags,
             capture_count,
             register_count,
             instructions: instructions.into_boxed_slice(),
             group_names,
+            first,
         });
         super::executor::validate_program(&program).map_err(|error| CompileError {
             kind: CompileErrorKind::Internal,
@@ -99,6 +106,19 @@ impl CompiledRegExp {
     #[must_use]
     pub fn instructions(&self) -> &[Instruction] {
         &self.0.instructions
+    }
+
+    pub(super) fn first_units(&self) -> Option<&super::executor::FirstUnits> {
+        self.0.first.as_ref()
+    }
+
+    /// The bytes the search's start filter owns beyond the program's size.
+    #[must_use]
+    pub fn first_units_bytes(&self) -> usize {
+        self.0
+            .first
+            .as_ref()
+            .map_or(0, super::executor::FirstUnits::owned_bytes)
     }
 
     /// Names aligned to captures 1..N, or `None` when this program has no

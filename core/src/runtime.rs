@@ -285,9 +285,6 @@ pub struct Realm {
     /// `%RegExp.prototype%`'s flag accessors as installed, for the `flags`
     /// getter's fast path.
     pub(crate) regexp_flags: std::cell::Cell<Option<crate::builtins::RegExpFlagCache>>,
-    /// The shape of a fresh `%RegExp%` instance (only `lastIndex`) and the
-    /// slot of `lastIndex`.
-    pub(crate) regexp_instance_shape: std::cell::Cell<Option<(crate::value::ShapeId, u32)>>,
 }
 
 impl Realm {
@@ -457,7 +454,6 @@ impl Runtime {
             symbols,
             brand,
             regexp_flags: std::cell::Cell::new(None),
-            regexp_instance_shape: std::cell::Cell::new(None),
         };
         let mut runtime = Runtime {
             heap,

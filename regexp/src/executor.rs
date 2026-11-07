@@ -219,7 +219,18 @@ fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
 
     let mut state =
         AttemptState::new(program.capture_count(), program.register_count(), candidate)?;
+    let first = if sticky { None } else { program.first_units() };
     loop {
+        if let Some(first) = first {
+            // No attempt from a unit the first instruction rejects.
+            match input[candidate..]
+                .iter()
+                .position(|&unit| first.contains(unit.into()))
+            {
+                Some(skip) => candidate += skip,
+                None => return Ok(None),
+            }
+        }
         state.reset(candidate);
         if let Some(result) = run_attempt(program, input, unicode, &mut poller, &mut state)? {
             return Ok(Some(result));
@@ -1128,6 +1139,71 @@ fn is_word(character: u32, ignore_case: bool) -> bool {
         || character >= u32::from(b'A') && character <= u32::from(b'Z')
         || character >= u32::from(b'a') && character <= u32::from(b'z')
         || ignore_case && matches!(character, 0x017f | 0x212a)
+}
+
+/// The code units a match can start with: those of the first instruction
+/// that reads input, when it is a case-sensitive character or a positive
+/// class and only captures and registers come before it. In Unicode mode
+/// only a set below the surrogates qualifies, where a unit is its own
+/// character. A match can start only at such a unit, so the search skips
+/// the others without an attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FirstUnits {
+    latin1: [u64; 4],
+    wide: Box<[CharacterRange]>,
+}
+
+impl FirstUnits {
+    pub(super) fn of(flags: RegExpFlags, instructions: &[Instruction]) -> Option<Self> {
+        let limit = if flags.is_unicode() { 0xd7ff } else { 0xffff };
+        for instruction in instructions {
+            let ranges: &[CharacterRange] = match instruction {
+                Instruction::SaveStart { .. }
+                | Instruction::SaveEnd { .. }
+                | Instruction::ResetCaptures { .. }
+                | Instruction::SetRegister { .. } => continue,
+                Instruction::Char {
+                    value,
+                    ignore_case: false,
+                } => &[CharacterRange::new(*value, *value)],
+                Instruction::Range {
+                    ranges,
+                    inverted: false,
+                    ignore_case: false,
+                } => ranges,
+                _ => return None,
+            };
+            if ranges.iter().any(|range| range.end > limit) {
+                return None;
+            }
+            let mut latin1 = [0u64; 4];
+            for range in ranges {
+                for unit in range.start..=range.end.min(0xff) {
+                    latin1[(unit >> 6) as usize] |= 1 << (unit & 63);
+                }
+            }
+            let wide = ranges
+                .iter()
+                .filter(|range| range.end > 0xff)
+                .map(|range| CharacterRange::new(range.start.max(0x100), range.end))
+                .collect();
+            return Some(FirstUnits { latin1, wide });
+        }
+        None
+    }
+
+    pub(super) fn owned_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.wide)
+    }
+
+    #[inline]
+    pub(super) fn contains(&self, unit: u16) -> bool {
+        if unit < 0x100 {
+            self.latin1[usize::from(unit >> 6)] >> (unit & 63) & 1 != 0
+        } else {
+            range_contains(&self.wide, u32::from(unit))
+        }
+    }
 }
 
 fn range_contains(ranges: &[CharacterRange], character: u32) -> bool {

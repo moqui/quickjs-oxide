@@ -184,6 +184,11 @@ pub struct Heap {
     /// `callee`), sloppy then strict: learned from the first of each and
     /// marked as roots.
     pub(crate) arguments_shapes: [Option<ShapeId>; 2],
+    /// The shape of a fresh `%RegExp%` instance (only `lastIndex`) and the
+    /// slot of `lastIndex`: learned from the first and marked as a root, so
+    /// the fast paths that compare an instance's shape with it hold after
+    /// every instance has been collected.
+    pub(crate) regexp_instance_shape: Option<(ShapeId, u32)>,
     /// The job queue: roots until each runs.
     pub(crate) jobs: std::collections::VecDeque<crate::vm::jobs::Job>,
 }
@@ -251,6 +256,7 @@ impl Heap {
             closure_shapes: [None; CLOSURE_SHAPES],
             pending_closure_shapes: [None; CLOSURE_SHAPES],
             arguments_shapes: [None; 2],
+            regexp_instance_shape: None,
             jobs: std::collections::VecDeque::new(),
         };
         let cell = heap
