@@ -33,3 +33,11 @@ var long = 'lorem ipsum '.repeat(200) + '<end>';
 print($esc(long).length, $esc(long).slice(-12));
 var wide = 'ж'.repeat(50) + '&' + 'ж'.repeat(50);
 print($esc(wide).length, $esc(wide).indexOf('&amp;'));
+// Modifiers, an empty class, string alternatives in a v-mode class, and a
+// start inside a surrogate pair.
+print(all(/(?i:a)/g, 'xAya'), all(/(?-i:a)/gi, 'xAya'), all(/[]/g, 'abc'));
+print(all(/[\q{abc}]/gv, 'xabcab'), all(/[\q{}]b/gv, 'abab'), all(/[\q{abc}x]/gv, 'xabc'));
+var u = /a/gu; u.lastIndex = 1;
+print(u.exec('\u{1F600}a') && u.lastIndex, (u.lastIndex = 2, u.exec('\u{1F600}a').index));
+var p = /\uDE00/g; p.lastIndex = 0;
+print(all(/\uDE00/g, '\u{1F600}'), all(/\uDE00/gu, '\u{1F600}\uDE00'));
