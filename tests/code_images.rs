@@ -222,9 +222,8 @@ fn a_malformed_image_fails_to_load_and_changes_nothing() {
     let (_, compiled) = runtime();
     let image = compiled.compile_image(RICH, "rich.js").unwrap();
     for which in [
-        "key-site-missing",
-        "key-site-extra",
-        "key-site-unsorted",
+        "key-operand",
+        "key-kind",
         "atom-index",
         "child-index",
         "child-twice",
@@ -361,4 +360,44 @@ fn loads_share_the_units_bodies() {
     assert_eq!(third.memory_report().unwrap().code.shared_body_bytes, 0);
     let _image = three.encode_image(&script).unwrap();
     assert!(third.memory_report().unwrap().code.shared_body_bytes > 0);
+}
+
+/// Cache entries come with a unit's first function object: a loaded
+/// generator, async function or async generator first made and entered in
+/// a second runtime gets its own, and a unit without sites needs none.
+#[test]
+fn a_loaded_runtime_reserves_caches_as_functions_are_made() {
+    let source = "var o = { n: 1 };
+                  function* gen() { yield o.n; yield o.n + 1; }
+                  async function later() { await null; return o.n + 10; }
+                  async function* agen() { yield o.n + 20; }
+                  function empty() {}
+                  globalThis.make = () => [...gen()].join() + ':' + typeof later() + ':' + typeof agen().next() + ':' + empty();";
+    let (_, compiled) = runtime();
+    let image = compiled.compile_image(source, "lazy.js").unwrap();
+    let (first, one) = runtime();
+    let (second, two) = runtime();
+    for (runtime, context) in [(&first, &one), (&second, &two)] {
+        let before = runtime.memory_report().unwrap().ic_entries;
+        let script = context.load_image(&image).unwrap();
+        let loaded = runtime.memory_report().unwrap().ic_entries;
+        // Only the script's root is made by the load.
+        assert!(loaded >= before);
+        context.execute(&script).unwrap();
+        assert_eq!(
+            printed(context, context.eval("make()")),
+            "1,2:object:object:undefined"
+        );
+        assert!(runtime.memory_report().unwrap().ic_entries > loaded);
+        runtime.run_jobs().unwrap();
+        assert_eq!(
+            printed(
+                context,
+                context.eval("later().then(v => globalThis.got = v); 0")
+            ),
+            "0"
+        );
+        runtime.run_jobs().unwrap();
+        assert_eq!(printed(context, context.eval("got")), "11");
+    }
 }

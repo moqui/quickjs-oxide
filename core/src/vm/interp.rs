@@ -89,9 +89,21 @@ fn entry_failed(
     Ok(Value::object(promise))
 }
 
+/// Reserves the cache entries of a unit whose first function is made.
+#[cold]
+#[inline(never)]
+fn reserve_caches(cx: &mut Cx<'_>, unit: &CodeUnit) {
+    cx.heap.ics.reserve(unit);
+}
+
 /// [`enter`], inlined into the loop's call.
 #[inline(always)]
 fn enter_frame(cx: &mut Cx<'_>, unit: &CodeUnit, frame: Frame) -> Result<(), Throw> {
+    debug_assert_ne!(
+        unit.ic_base.get(),
+        crate::bytecode::IC_UNRESERVED,
+        "a unit's cache entries are reserved when its function is made"
+    );
     let poll = &mut cx.heap.vm.poll;
     *poll -= 1;
     if *poll == 0 {
@@ -192,7 +204,7 @@ fn rare_op(cx: &mut Cx<'_>, frame: &Frame, unit: &CodeUnit, insn: Insn) -> Resul
             let function = reg(cx, insn.b);
             let setter = insn.op == Opcode::DefineSetter;
             let flags = PropertyFlags::accessor(true, true);
-            return property::define_accessor(cx, object, insn.key(), function, setter, flags);
+            return property::define_accessor(cx, object, unit.key(insn), function, setter, flags);
         }
         Opcode::NewSpill => (insn.a, new_spill(cx, insn.imm)?),
         Opcode::ClearCell => {
@@ -232,7 +244,7 @@ fn rare_op(cx: &mut Cx<'_>, frame: &Frame, unit: &CodeUnit, insn: Insn) -> Resul
             (insn.b, arguments::append_spread(cx, array, index, source)?)
         }
         Opcode::ThrowInternal => {
-            let message = property::key_text(cx.heap, insn.key());
+            let message = property::key_text(cx.heap, unit.key(insn));
             return Err(error::throw(cx, ErrorKind::Internal, &message));
         }
         Opcode::CheckCtor => {
@@ -260,7 +272,7 @@ fn rare_op(cx: &mut Cx<'_>, frame: &Frame, unit: &CodeUnit, insn: Insn) -> Resul
         Opcode::DefineMethod => {
             let (object, function) = (reg(cx, insn.a), reg(cx, insn.b));
             let object = object.as_object().expect("an object");
-            return define_method(cx, object, insn.key(), function, u32::from(insn.c));
+            return define_method(cx, object, unit.key(insn), function, u32::from(insn.c));
         }
         Opcode::DefineMethodComputed => {
             let (object, key, function) = (reg(cx, insn.a), reg(cx, insn.b), reg(cx, insn.c));
@@ -277,11 +289,11 @@ fn rare_op(cx: &mut Cx<'_>, frame: &Frame, unit: &CodeUnit, insn: Insn) -> Resul
             return set_function_name(cx, function, key, "", false);
         }
         Opcode::ThrowType => {
-            let message = property::key_text(cx.heap, insn.key());
+            let message = property::key_text(cx.heap, unit.key(insn));
             return Err(error::type_error(cx, &message));
         }
         Opcode::ThrowReference => {
-            let message = property::key_text(cx.heap, insn.key());
+            let message = property::key_text(cx.heap, unit.key(insn));
             return Err(error::throw(cx, ErrorKind::Reference, &message));
         }
         Opcode::ImportCall => {
@@ -967,8 +979,14 @@ fn construct_exotic(
 /// A `kind` error whose message names the key in an instruction's `imm`.
 #[cold]
 #[inline(never)]
-fn key_error(cx: &mut Cx<'_>, kind: ErrorKind, insn: Insn, before: &str, after: &str) -> Throw {
-    let mut message = error::atom_message(cx.heap, before, insn.key(), after);
+fn key_error(
+    cx: &mut Cx<'_>,
+    kind: ErrorKind,
+    key: PropertyKey,
+    before: &str,
+    after: &str,
+) -> Throw {
+    let mut message = error::atom_message(cx.heap, before, key, after);
     // A binding whose name was stripped (`-s`, no direct eval) is QuickJS's
     // `JS_ATOM_NULL` in `JS_ThrowReferenceErrorUninitialized`.
     if message.len() == before.len() + after.len() && after == " is not initialized" {
@@ -986,11 +1004,11 @@ fn key_error(cx: &mut Cx<'_>, kind: ErrorKind, insn: Insn, before: &str, after: 
 fn prologue_error(
     cx: &mut Cx<'_>,
     kind: ErrorKind,
-    insn: Insn,
+    key: PropertyKey,
     before: &str,
     after: &str,
 ) -> Throw {
-    let message = error::atom_message(cx.heap, before, insn.key(), after);
+    let message = error::atom_message(cx.heap, before, key, after);
     error::throw_prologue(cx, kind, &String::from_utf16_lossy(&message))
 }
 
@@ -1105,6 +1123,11 @@ fn closure_function(
     child_unit: &CodeUnit,
     scope: Option<ScopeId>,
 ) -> Result<ObjectId, Throw> {
+    // A unit takes its cache entries with its first function object, the
+    // only way to enter it, so a function never made holds none.
+    if child_unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+        reserve_caches(cx, child_unit);
+    }
     let (prototype, cache) = closure_kind(child_unit);
     let function_prototype = cx.realm.intrinsic(prototype);
     let function = cx
@@ -1417,7 +1440,7 @@ fn learn_receiver_size(cx: &mut Cx<'_>, done: &Frame) {
     if insn.op != Opcode::New {
         return;
     }
-    let site = unit.ic_base as usize + insn.imm as usize;
+    let site = unit.ic_base.get() as usize + insn.imm as usize;
     let mut entry = cx.heap.ics.entries[site];
     if !entry.is_filled() || cx.heap.is_dictionary(receiver) {
         return;
@@ -1434,8 +1457,7 @@ fn learn_receiver_size(cx: &mut Cx<'_>, done: &Frame) {
 /// lexical binding in the TDZ throws and is not cached; anything else (an
 /// accessor, a global found on `%Object.prototype%`) is read uncached.
 #[inline(never)]
-fn get_global(cx: &mut Cx<'_>, insn: Insn, site: usize) -> Result<Value, Throw> {
-    let key = insn.key();
+fn get_global(cx: &mut Cx<'_>, insn: Insn, key: PropertyKey, site: usize) -> Result<Value, Throw> {
     let global = cx.realm.global();
     let lexical = cx.realm.intrinsic(Intrinsic::GlobalLexical);
     let heap = &*cx.heap;
@@ -1449,7 +1471,7 @@ fn get_global(cx: &mut Cx<'_>, insn: Insn, site: usize) -> Result<Value, Throw> 
                 return Err(key_error(
                     cx,
                     ErrorKind::Reference,
-                    insn,
+                    key,
                     "",
                     " is not initialized",
                 ));
@@ -1472,7 +1494,7 @@ fn get_global(cx: &mut Cx<'_>, insn: Insn, site: usize) -> Result<Value, Throw> 
                 Err(key_error(
                     cx,
                     ErrorKind::Reference,
-                    insn,
+                    key,
                     "'",
                     "' is not defined",
                 ))
@@ -1482,7 +1504,7 @@ fn get_global(cx: &mut Cx<'_>, insn: Insn, site: usize) -> Result<Value, Throw> 
         property::Lookup::Miss => Err(key_error(
             cx,
             ErrorKind::Reference,
-            insn,
+            key,
             "'",
             "' is not defined",
         )),
@@ -1496,11 +1518,11 @@ fn get_global(cx: &mut Cx<'_>, insn: Insn, site: usize) -> Result<Value, Throw> 
 fn set_global(
     cx: &mut Cx<'_>,
     insn: Insn,
+    key: PropertyKey,
     value: Value,
     strict: bool,
     site: usize,
 ) -> Result<(), Throw> {
-    let key = insn.key();
     let global = cx.realm.global();
     let lexical = cx.realm.intrinsic(Intrinsic::GlobalLexical);
     if let Some((slot, property)) = cx.heap.lookup_own(lexical, key) {
@@ -1509,14 +1531,14 @@ fn set_global(
             return Err(key_error(
                 cx,
                 ErrorKind::Reference,
-                insn,
+                key,
                 "",
                 " is not initialized",
             ));
         }
         if !property.has(PropertyFlags::WRITABLE) {
             cx.heap.ics.count_miss(site, false);
-            return Err(key_error(cx, ErrorKind::Type, insn, "'", "' is read-only"));
+            return Err(key_error(cx, ErrorKind::Type, key, "'", "' is read-only"));
         }
         cx.heap.set_slot(lexical, slot, value);
         let entry = global_entry(cx.heap, lexical, slot, property);
@@ -1528,7 +1550,7 @@ fn set_global(
         return Err(key_error(
             cx,
             ErrorKind::Reference,
-            insn,
+            key,
             "'",
             "' is not defined",
         ));
@@ -1625,8 +1647,7 @@ fn delete_global(cx: &mut Cx<'_>, key: PropertyKey) -> Result<Value, Throw> {
 
 /// The declaration forms and checks of a script's prologue.
 #[inline(never)]
-fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
-    let key = insn.key();
+fn declare_global(cx: &mut Cx<'_>, insn: Insn, key: PropertyKey) -> Result<(), Throw> {
     let lexical = cx.realm.intrinsic(Intrinsic::GlobalLexical);
     let global = cx.realm.global();
     match insn.op {
@@ -1655,7 +1676,7 @@ fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
                 return Err(prologue_error(
                     cx,
                     ErrorKind::Syntax,
-                    insn,
+                    key,
                     "redeclaration of '",
                     "'",
                 ));
@@ -1681,7 +1702,7 @@ fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
                 return Err(prologue_error(
                     cx,
                     ErrorKind::Type,
-                    insn,
+                    key,
                     "cannot define variable '",
                     "'",
                 ));
@@ -1698,7 +1719,7 @@ fn declare_global(cx: &mut Cx<'_>, insn: Insn) -> Result<(), Throw> {
                 return Err(prologue_error(
                     cx,
                     ErrorKind::Syntax,
-                    insn,
+                    key,
                     "redeclaration of '",
                     "'",
                 ));
@@ -1790,7 +1811,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
     set_unit!(frame.unit);
     let mut code: &[Insn] = &unit.code;
     let mut base = frame.base as usize;
-    let mut ic_base = unit.ic_base as usize;
+    let mut ic_base = unit.ic_base.get() as usize;
     let mut pc = start;
 
     macro_rules! window {
@@ -1811,7 +1832,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
             set_unit!(frame.unit);
             code = &unit.code;
             base = frame.base as usize;
-            ic_base = unit.ic_base as usize;
+            ic_base = unit.ic_base.get() as usize;
         }};
     }
     // Writes a value computed from the heap, then continues.
@@ -1897,14 +1918,18 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                     Err(key_error(
                         cx,
                         ErrorKind::Reference,
-                        insn,
+                        unit.key(insn),
                         "",
                         " is not initialized",
                     ))
                 }
-                Opcode::ThrowConstAssign => {
-                    Err(key_error(cx, ErrorKind::Type, insn, "'", "' is read-only"))
-                }
+                Opcode::ThrowConstAssign => Err(key_error(
+                    cx,
+                    ErrorKind::Type,
+                    unit.key(insn),
+                    "'",
+                    "' is read-only",
+                )),
 
                 // ---- unary operators ----
                 Opcode::Inc => {
@@ -2205,7 +2230,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                         continue 'dispatch;
                     }
                     let fill = insn.c != FIELD_NO_SITE;
-                    write!('dispatch, insn.a, property::get_cached(cx, object, insn.key(), site, fill))
+                    write!('dispatch, insn.a, property::get_cached(cx, object, unit.key(insn), site, fill))
                 }
                 Opcode::SetField => {
                     // The arenas are borrowed as in `GetField`.
@@ -2227,7 +2252,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                     property::set_cached(
                         cx,
                         object,
-                        insn.key(),
+                        unit.key(insn),
                         value,
                         unit.has(flags::STRICT),
                         site,
@@ -2237,12 +2262,12 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                 Opcode::DefineField => {
                     let (object, value) = (reg!(insn.a), reg!(insn.b));
                     let object = object.as_object().expect("an object");
-                    property::define(cx, object, insn.key(), value)
+                    property::define(cx, object, unit.key(insn), value)
                 }
                 Opcode::DeleteField => {
                     let object = reg!(insn.b);
                     write!('dispatch, insn.a,
-                        property::delete(cx, object, insn.key(), unit.has(flags::STRICT)).map(Value::bool)
+                        property::delete(cx, object, unit.key(insn), unit.has(flags::STRICT)).map(Value::bool)
                     )
                 }
                 Opcode::GetElem => {
@@ -2325,7 +2350,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                         cx.heap.ics.count_hit(IcKind::Global);
                         continue 'dispatch;
                     }
-                    write!('dispatch, insn.a, get_global(cx, insn, site))
+                    write!('dispatch, insn.a, get_global(cx, insn, unit.key(insn), site))
                 }
                 Opcode::SetGlobal => {
                     let value = reg!(insn.a);
@@ -2339,19 +2364,28 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                         cx.heap.ics.count_hit(IcKind::Global);
                         continue 'dispatch;
                     }
-                    set_global(cx, insn, value, unit.has(flags::STRICT), site)
+                    set_global(
+                        cx,
+                        insn,
+                        unit.key(insn),
+                        value,
+                        unit.has(flags::STRICT),
+                        site,
+                    )
                 }
                 Opcode::DefineGlobal => {
                     let value = reg!(insn.a);
                     let configurable = insn.b & global_flags::EVAL != 0;
-                    define_global(cx, insn.key(), value, true, configurable)
+                    define_global(cx, unit.key(insn), value, true, configurable)
                 }
                 Opcode::DeclareGlobal
                 | Opcode::DeclareGlobalLet
                 | Opcode::DeclareGlobalConst
                 | Opcode::CheckGlobalVar
-                | Opcode::CheckGlobalLexical => declare_global(cx, insn),
-                Opcode::DeleteGlobal => write!('dispatch, insn.a, delete_global(cx, insn.key())),
+                | Opcode::CheckGlobalLexical => declare_global(cx, insn, unit.key(insn)),
+                Opcode::DeleteGlobal => {
+                    write!('dispatch, insn.a, delete_global(cx, unit.key(insn)))
+                }
 
                 // ---- captured bindings ----
                 Opcode::NewCell => {
@@ -2383,7 +2417,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                     Err(key_error(
                         cx,
                         ErrorKind::Reference,
-                        insn,
+                        unit.key(insn),
                         "",
                         " is not initialized",
                     ))
@@ -2595,7 +2629,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                                     unit = callee_unit;
                                     code = &unit.code;
                                     base = frame.base as usize;
-                                    ic_base = unit.ic_base as usize;
+                                    ic_base = unit.ic_base.get() as usize;
                                 }
                                 None => load_frame!(),
                             }
@@ -2653,7 +2687,7 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                         frame = caller;
                         code = &unit.code;
                         base = frame.base as usize;
-                        ic_base = unit.ic_base as usize;
+                        ic_base = unit.ic_base.get() as usize;
                         regs = window!();
                         continue 'dispatch;
                     }

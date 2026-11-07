@@ -15,10 +15,15 @@ use oxide_core::{
 struct Reader {
     runtime: Runtime,
     function: Handle,
-    site: usize,
+    unit: oxide_core::CodeUnitId,
 }
 
 impl Reader {
+    /// The cache site, reserved when the function first runs.
+    fn site(&self) -> usize {
+        self.runtime.code().get(self.unit).ic_base.get() as usize
+    }
+
     fn new(name: &str) -> Reader {
         let mut runtime = Runtime::new(HeapLimits::default()).unwrap();
         let key = key(&mut runtime, name);
@@ -34,11 +39,10 @@ impl Reader {
         let unit = runtime.publish(unit).unwrap();
         let function = runtime.instantiate(unit, &[&[]]).unwrap();
         let function = runtime.hold(Value::object(function));
-        let site = runtime.code().get(unit).ic_base as usize;
         Reader {
             runtime,
             function,
-            site,
+            unit,
         }
     }
 
@@ -49,16 +53,20 @@ impl Reader {
             .unwrap()
     }
 
+    /// The site's entry; empty before the function first runs.
     fn entry(&self) -> IcEntry {
-        self.runtime.heap().ics().entry(self.site)
+        if self.runtime.code().get(self.unit).ic_base.get() == oxide_core::bytecode::IC_UNRESERVED {
+            return IcEntry::EMPTY;
+        }
+        self.runtime.heap().ics().entry(self.site())
     }
 
     /// The filled entries of the site, monomorphic or in its polymorphic row.
     fn entries(&self) -> Vec<IcEntry> {
         let ics = self.runtime.heap().ics();
-        match ics.poly_row(self.site) {
+        match ics.poly_row(self.site()) {
             Some(row) => row.iter().copied().filter(IcEntry::is_filled).collect(),
-            None => Some(ics.entry(self.site))
+            None => Some(ics.entry(self.site()))
                 .filter(IcEntry::is_filled)
                 .into_iter()
                 .collect(),

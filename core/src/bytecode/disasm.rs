@@ -43,6 +43,10 @@ pub fn operands(
 ) -> String {
     let r = |r: u8| register_name(unit, r as u32);
     let target = |t: u32| format!("@{t}");
+    let mut key = |insn: Insn| match unit.keys.get(insn.imm as usize) {
+        Some(&key) => key_name(key),
+        None => format!("key{}?", insn.imm),
+    };
     let text = match insn.op.format() {
         Format::None => String::new(),
         Format::A => r(insn.a),
@@ -51,9 +55,9 @@ pub fn operands(
         Format::AInt => format!("{}, {}", r(insn.a), insn.int()),
         Format::ABInt => format!("{}, {}, {}", r(insn.a), r(insn.b), insn.int()),
         Format::AConst => format!("{}, k{}", r(insn.a), insn.imm),
-        Format::Key => key_name(insn.key()),
-        Format::AKey => format!("{}, {}", r(insn.a), key_name(insn.key())),
-        Format::ABKey => format!("{}, {}, {}", r(insn.a), r(insn.b), key_name(insn.key())),
+        Format::Key => key(insn),
+        Format::AKey => format!("{}, {}", r(insn.a), key(insn)),
+        Format::ABKey => format!("{}, {}, {}", r(insn.a), r(insn.b), key(insn)),
         Format::ACapture => format!("{}, c{}", r(insn.a), insn.imm),
         Format::ACount => format!("{}, {}", r(insn.a), insn.imm),
         Format::ABRange => {

@@ -54,7 +54,7 @@ fn class_op_rooted(
             let (parent, closure) = (reg(cx, frame, insn.a), reg(cx, frame, insn.b));
             let prototype = make_class(cx, parent, closure, insn.c != 0)?;
             // An anonymous `export default class` is named `default`.
-            let key = insn.key();
+            let key = unit.key(insn);
             if let crate::KeyKind::String(name) = key.kind()
                 && cx.heap.string_len(name) != 0
             {
@@ -212,7 +212,7 @@ fn class_op_rooted(
             set_reg(cx, frame, insn.a, this);
         }
         Opcode::NewPrivateName => {
-            let description = match insn.key().kind() {
+            let description = match unit.key(insn).kind() {
                 crate::heap::atom::KeyKind::String(id) => Some(id),
                 _ => None,
             };
@@ -234,7 +234,7 @@ fn class_op_rooted(
                 2 => "set ",
                 _ => "",
             };
-            super::interp::set_function_name(cx, method, insn.key(), prefix, true)?;
+            super::interp::set_function_name(cx, method, unit.key(insn), prefix, true)?;
         }
         Opcode::GetPrivate => {
             let (target, name) = (reg(cx, frame, insn.b), reg(cx, frame, insn.c));
@@ -340,7 +340,7 @@ fn class_op_rooted(
             object::copy_data_properties(cx, target, source, &excluded)?;
         }
         Opcode::GlobalRef => {
-            let key = insn.key();
+            let key = unit.key(insn);
             let lexical = cx.realm.intrinsic(Intrinsic::GlobalLexical);
             let environment = if let Some((slot, flags)) = cx.heap.lookup_own(lexical, key) {
                 if cx.heap.get_slot(lexical, slot).is_empty() {
@@ -366,7 +366,7 @@ fn class_op_rooted(
             set_reg(cx, frame, insn.a, environment);
         }
         Opcode::GetRef => {
-            let key = insn.key();
+            let key = unit.key(insn);
             let environment = reg(cx, frame, insn.b);
             let value = match environment.as_object() {
                 Some(environment) if property::has(cx, environment, key)? => {
@@ -385,7 +385,7 @@ fn class_op_rooted(
             set_reg(cx, frame, insn.a, value);
         }
         Opcode::PutRef => {
-            let key = insn.key();
+            let key = unit.key(insn);
             let (environment, value) = (reg(cx, frame, insn.a), reg(cx, frame, insn.b));
             let strict = unit.has(flags::STRICT);
             match environment.as_object() {

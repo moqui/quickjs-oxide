@@ -572,10 +572,14 @@ fn cache_sites_are_numbered_per_unit() {
     assert_eq!(validate(&unit), Ok(()));
 
     let mut bad = unit.clone();
-    bad.code[2].c = 5;
+    let mut code = bad.code.to_vec();
+    code[2].c = 5;
+    bad.code = code.into();
     assert_eq!(validate(&bad), Err(ValidateErrorKind::Site(5)));
     let mut bad = unit;
-    bad.code[0].imm = 9;
+    let mut code = bad.code.to_vec();
+    code[0].imm = 9;
+    bad.code = code.into();
     assert_eq!(validate(&bad), Err(ValidateErrorKind::Site(9)));
 }
 
@@ -598,9 +602,10 @@ fn field_sites_past_255_share_the_reserved_site() {
     assert_eq!(validate(&unit), Ok(()));
 }
 
-/// Publication gives each unit its own range of the cache store.
+/// Publication reserves no cache entries: a unit takes its range when it
+/// is first entered.
 #[test]
-fn publication_reserves_cache_entries() {
+fn publication_defers_cache_entries() {
     let key = PropertyKey::index(7).unwrap();
     let mut runtime = Runtime::new(HeapLimits::default()).unwrap();
     let before = runtime.heap().ics().len();
@@ -611,9 +616,13 @@ fn publication_reserves_cache_entries() {
     };
     let first = runtime.publish(unit(8, two)).unwrap();
     let second = runtime.publish(unit(8, two)).unwrap();
-    assert_eq!(runtime.code().get(first).ic_base as usize, before);
-    assert_eq!(runtime.code().get(second).ic_base as usize, before + 2);
-    assert_eq!(runtime.heap().ics().len(), before + 4);
+    for unit in [first, second] {
+        assert_eq!(
+            runtime.code().get(unit).ic_base.get(),
+            oxide_core::bytecode::IC_UNRESERVED
+        );
+    }
+    assert_eq!(runtime.heap().ics().len(), before);
     assert_eq!(runtime.heap().ics().filled(), 0);
 }
 

@@ -252,7 +252,8 @@ impl<'a> Compiler<'a> {
         self.realm.intrinsic(intrinsic)
     }
 
-    /// Validates `unit`, reserves its cache entries and publishes it: into
+    /// Validates `unit` and publishes it (its cache entries are reserved
+    /// when it is first entered): into
     /// the code store before the program runs (its key atoms pinned), into
     /// the heap (pinned until the compilation ends, its bytes charged to the
     /// collection trigger) while it runs. Its children must be published
@@ -264,8 +265,7 @@ impl<'a> Compiler<'a> {
 
     /// [`Compiler::publish`] of a unit the validator already passed (an
     /// image's, checked against the image's own units).
-    fn publish_validated(&mut self, mut unit: CodeUnit) -> CodeUnitId {
-        self.heap.ics.reserve(&mut unit);
+    fn publish_validated(&mut self, unit: CodeUnit) -> CodeUnitId {
         // While shared, the store's overflow takes a bounded number of
         // units; past it the rest of the compilation is transient, its atoms
         // held for the heap's units rather than pinned.
@@ -350,6 +350,13 @@ impl<'a> Compiler<'a> {
                 }
             })
             .collect();
+        // The root's function is made here; its children's when their
+        // closures are.
+        let root_unit = code.get(root);
+        if root_unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+            self.heap.ics.reserve(&root_unit);
+        }
+        drop(root_unit);
         let prototype = self.realm.intrinsic(Intrinsic::FunctionPrototype);
         self.heap
             .alloc_bytecode_function(Some(prototype), None, &tree)
@@ -386,8 +393,6 @@ impl Compiler<'_> {
             validate::validate(unit, &|id| provisional.get(id.0 as usize))
                 .map_err(LoadError::Invalid)?;
         }
-        let sites: usize = provisional.iter().map(|unit| unit.ic_count as usize).sum();
-        self.heap.ics.reserve_exact(sites);
         let mark = self.heap.roots().mark();
         let result = (|| {
             let mut ids: Vec<CodeUnitId> = Vec::with_capacity(count);

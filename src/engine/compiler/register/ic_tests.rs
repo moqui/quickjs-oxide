@@ -63,7 +63,7 @@ impl Session {
             .filter(|insn| insn.op == op)
             .nth(nth)
             .unwrap_or_else(|| panic!("no {op:?} #{nth}"));
-        (unit.ic_base + insn.site().unwrap()) as usize
+        (unit.ic_base.get() + insn.site().unwrap()) as usize
     }
 
     fn entry(&self, site: usize) -> IcEntry {

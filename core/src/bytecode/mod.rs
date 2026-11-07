@@ -59,12 +59,6 @@ impl Insn {
         (self.b as u16 | (self.c as u16) << 8) as i16
     }
 
-    /// The `imm` field read as a property key.
-    #[inline]
-    pub const fn key(self) -> PropertyKey {
-        PropertyKey::from_raw(self.imm)
-    }
-
     /// The cache site of an instruction that has one: `c` for `GetField` and
     /// `SetField`, `b | c << 8` for the global forms, `imm` for `New`. An index
     /// into the unit's entries of the [`IcStore`](crate::vm::ic::IcStore).
@@ -229,7 +223,11 @@ impl DebugInfo {
 /// temporaries up to `register_count`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeUnit {
-    pub code: Box<[Insn]>,
+    /// The instructions; a key operand is an index into [`CodeUnit::keys`].
+    /// They name nothing of the runtime, so every runtime that loaded the
+    /// unit from one code image shares them (one hop from the unit, as the
+    /// loop reads them at every frame entry).
+    pub code: std::sync::Arc<[Insn]>,
     pub register_count: u16,
     pub parameter_count: u16,
     pub local_count: u16,
@@ -245,8 +243,10 @@ pub struct CodeUnit {
     pub spill_register: u16,
     /// The slots of the spill scope.
     pub spill_slots: u16,
-    /// The unit's first entry in the cache store, set when it is published.
-    pub ic_base: u32,
+    /// The unit's first entry in the cache store, reserved when the unit is
+    /// first entered ([`IC_UNRESERVED`] until then): a function that never
+    /// runs holds no cache entries.
+    pub ic_base: std::cell::Cell<u32>,
     /// Cache sites, numbered by [`CodeBuilder::finish`](builder::CodeBuilder::finish).
     pub ic_count: u32,
     /// Inner functions, by `MakeClosure` index. Published before the unit.
@@ -259,6 +259,11 @@ pub struct CodeUnit {
     /// when it is published; empty for a static unit, whose atoms are
     /// pinned.
     pub atoms: Box<[crate::value::StringId]>,
+    /// The property keys the instructions name: an instruction of a key
+    /// format holds an index into this table in `imm` ([`CodeUnit::key`]),
+    /// so the instructions name nothing of the runtime and are shared in
+    /// the body.
+    pub keys: Box<[PropertyKey]>,
     /// The tables that name nothing of a runtime, shared by every runtime
     /// that loaded the unit from one code image ([`crate::image`]); the
     /// unit reads them as its own fields ([`CodeUnit`] derefs to them).
@@ -315,7 +320,7 @@ impl CodeUnit {
     /// Bytes the unit holds itself, without its body or its cache entries.
     pub fn own_bytes(&self) -> usize {
         size_of::<CodeUnit>()
-            + std::mem::size_of_val(&*self.code)
+            + std::mem::size_of_val(&*self.keys)
             + std::mem::size_of_val(&*self.children)
             + std::mem::size_of_val(&*self.atoms)
     }
@@ -338,6 +343,9 @@ impl CodeUnit {
         self.flags & flag != 0
     }
 }
+
+/// [`CodeUnit::ic_base`] of a unit not yet entered.
+pub const IC_UNRESERVED: u32 = u32::MAX;
 
 /// Marks a [`CodeUnitId`] of a unit compiled at run time, which the heap
 /// owns.
@@ -601,6 +609,12 @@ impl<'a> Units<'a> {
 }
 
 impl CodeUnit {
+    /// The property key `insn` names (an instruction of a key format).
+    #[inline(always)]
+    pub fn key(&self, insn: Insn) -> PropertyKey {
+        self.keys[insn.imm as usize]
+    }
+
     /// The distinct atoms the instructions name as property keys, with the
     /// function's name: what a live dynamic unit keeps alive.
     pub(crate) fn key_atoms(&self) -> Box<[crate::value::StringId]> {
@@ -610,14 +624,12 @@ impl CodeUnit {
         atoms.into()
     }
 
-    /// Every atom the instructions name as a property key, and the
-    /// function's name, once per use.
+    /// Every atom the key table names, and the function's name.
     pub(crate) fn key_atom_uses(&self) -> impl Iterator<Item = crate::value::StringId> + '_ {
         use crate::heap::atom::KeyKind;
-        self.code
+        self.keys
             .iter()
-            .filter(|insn| matches!(insn.op.format(), Format::Key | Format::AKey | Format::ABKey))
-            .filter_map(|insn| match insn.key().kind() {
+            .filter_map(|key| match key.kind() {
                 KeyKind::String(id) => Some(id),
                 _ => None,
             })
@@ -627,6 +639,17 @@ impl CodeUnit {
     /// Bytes the unit holds: its instructions, tables, positions, source
     /// text and cache entries. A dynamic unit charges them to the heap.
     pub fn bytes(&self) -> usize {
-        self.own_bytes() + self.body.bytes() + self.ic_count as usize * crate::vm::ic::ENTRY_BYTES
+        self.own_bytes() + self.shared_bytes() + self.ic_count as usize * crate::vm::ic::ENTRY_BYTES
+    }
+
+    /// Bytes of what a code image shares: the instructions and the body.
+    pub fn shared_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.code) + self.body.bytes()
+    }
+
+    /// Whether the instructions and the body are this unit's alone.
+    pub fn owns_shared(&self) -> bool {
+        std::sync::Arc::strong_count(&self.body) == 1
+            && std::sync::Arc::strong_count(&self.code) == 1
     }
 }

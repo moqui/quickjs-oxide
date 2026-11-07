@@ -766,9 +766,12 @@ impl Runtime {
         );
         let mut sites = Vec::new();
         for (id, unit) in self.units().all() {
+            if unit.ic_base.get() == crate::bytecode::IC_UNRESERVED {
+                continue;
+            }
             for (pc, insn) in unit.code.iter().enumerate() {
                 if let Some(site) = insn.site() {
-                    let entry = (unit.ic_base + site) as usize;
+                    let entry = (unit.ic_base.get() + site) as usize;
                     let misses = stats.site_misses[entry];
                     if misses > 0 {
                         sites.push((misses, id, pc, *insn));
@@ -786,7 +789,7 @@ impl Runtime {
             };
             let key = match insn.op {
                 crate::bytecode::Opcode::New => String::new(),
-                _ => crate::vm::property::key_text(&self.heap, insn.key()),
+                _ => crate::vm::property::key_text(&self.heap, unit.key(insn)),
             };
             let _ = writeln!(
                 out,
@@ -919,10 +922,10 @@ impl Runtime {
         let mut bodies = crate::heap::hash::FxHashSet::default();
         for (_, unit) in self.code.units() {
             code.static_bytes += unit.own_bytes();
-            if std::sync::Arc::strong_count(&unit.body) == 1 {
-                code.static_bytes += unit.body.bytes();
+            if unit.owns_shared() {
+                code.static_bytes += unit.shared_bytes();
             } else if bodies.insert(std::sync::Arc::as_ptr(&unit.body)) {
-                code.shared_body_bytes += unit.body.bytes();
+                code.shared_body_bytes += unit.shared_bytes();
             }
         }
         for (_, unit) in self.units().all() {
