@@ -133,3 +133,114 @@ fn a_lent_engine_loads_images_and_modules_into_the_store() {
         ))
     );
 }
+
+/// A script of many functions, each its own unit.
+fn many_functions(count: usize) -> String {
+    let mut source = String::new();
+    for index in 0..count {
+        source.push_str(&format!("function f{index}() {{ return {index}; }}\n"));
+    }
+    source.push_str(&format!("f{}() + f0()", count - 1));
+    source
+}
+
+/// More units than a shared store's overflow holds: a top-level compile has
+/// no bound, and inside a host function the rest are transient.
+#[test]
+#[cfg_attr(
+    feature = "gc-stress",
+    ignore = "gc-stress collects at every allocation"
+)]
+fn compiles_past_the_overflow() {
+    let count = 33_000;
+    let source = many_functions(count);
+    let (top, context) = runtime();
+    let before = units(&top).0;
+    assert_eq!(context.eval(&source).unwrap(), Value::Int(count as i32 - 1));
+    assert!(units(&top).0 >= before + count, "every unit static");
+    assert_eq!(units(&top).1, 0);
+
+    let (runtime, context) = runtime();
+    let global = context.global_object().unwrap();
+    context
+        .define_function(&global, "compileHere", 0, move |scope: &mut Scope<'_>| {
+            let script = scope.compile(&source)?;
+            scope.execute(&script)
+        })
+        .unwrap();
+    let before = units(&runtime).0;
+    assert_eq!(
+        context.eval("compileHere()").unwrap(),
+        Value::Int(count as i32 - 1)
+    );
+    let (after, dynamic) = units(&runtime);
+    assert_eq!(after, before + 1 + 128 * 256, "the overflow filled");
+    assert!(dynamic > 0, "the rest went to the heap");
+    assert_eq!(context.eval("f0() + f32999()").unwrap(), Value::Int(32_999));
+    // A later top-level compile is unbounded again.
+    assert_eq!(context.eval("f1() + 1").unwrap(), Value::Int(2));
+}
+
+#[test]
+fn a_lend_that_throws_after_publishing_keeps_its_units() {
+    let (runtime, context) = runtime();
+    let global = context.global_object().unwrap();
+    let nested = context.clone();
+    context
+        .define_function(
+            &global,
+            "publishThenThrow",
+            0,
+            move |scope: &mut Scope<'_>| {
+                scope.lend(|| {
+                    nested.eval("function kept() { return 'kept'; } throw new Error('after')")
+                })
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        context
+            .eval("try { publishThenThrow() } catch (e) { e.message + ' ' + kept() }")
+            .unwrap(),
+        Value::String(quickjs_oxide::engine::api::core::JsString::from_static(
+            "after kept"
+        ))
+    );
+    runtime.run_gc().unwrap();
+    assert_eq!(
+        context.eval("kept()").unwrap(),
+        Value::String(quickjs_oxide::engine::api::core::JsString::from_static(
+            "kept"
+        ))
+    );
+}
+
+#[test]
+fn a_lend_that_panics_after_publishing_poisons_the_runtime() {
+    let (runtime, context) = runtime();
+    let global = context.global_object().unwrap();
+    let nested = context.clone();
+    context
+        .define_function(
+            &global,
+            "publishThenPanic",
+            0,
+            move |scope: &mut Scope<'_>| -> JsResult<Value> {
+                scope.lend(|| {
+                    nested.eval("function published() {}").unwrap();
+                    panic!("after publishing")
+                })
+            },
+        )
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context.eval("publishThenPanic()")
+    }));
+    assert!(outcome.is_err());
+    assert_eq!(
+        context.eval("1"),
+        Err(quickjs_oxide::engine::api::core::RuntimeError::Poisoned)
+    );
+    drop(context);
+    drop(runtime);
+}

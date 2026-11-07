@@ -277,14 +277,25 @@ impl<'a> NativeCx<'a> {
     /// host function too, since the store only grows and a published unit
     /// never moves while the running loop borrows one.
     pub fn compiler(&mut self, transient: bool) -> crate::vm::compile::Compiler<'_> {
+        use crate::vm::compile::Compiler;
+        let unique = !transient
+            && matches!(&self.code, CodeView::Owned(code)
+                if Rc::strong_count(code) == 1 && Rc::weak_count(code) == 0);
+        if unique {
+            let CodeView::Owned(code) = &mut self.code else {
+                unreachable!("an owned store");
+            };
+            let code = Rc::get_mut(code).expect("an unshared code store");
+            return Compiler::unique(self.heap, code, self.realm);
+        }
         let code: &CodeStore = match &self.code {
             CodeView::Owned(code) => code,
             CodeView::Shared(code) => code,
         };
         if transient {
-            crate::vm::compile::Compiler::new(self.heap, code, self.realm)
+            Compiler::new(self.heap, code, self.realm)
         } else {
-            crate::vm::compile::Compiler::owned(self.heap, code, self.realm)
+            Compiler::owned(self.heap, code, self.realm)
         }
     }
 

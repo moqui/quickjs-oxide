@@ -696,7 +696,11 @@ impl Runtime {
     /// live as long as the runtime (in the code store, where the loop runs
     /// them as a plain borrow): the program and its modules.
     pub fn compiler(&mut self) -> crate::vm::compile::Compiler<'_> {
-        crate::vm::compile::Compiler::owned(&mut self.heap, &self.code, &self.realm)
+        if std::rc::Rc::get_mut(&mut self.code).is_none() {
+            return crate::vm::compile::Compiler::owned(&mut self.heap, &self.code, &self.realm);
+        }
+        let code = std::rc::Rc::get_mut(&mut self.code).expect("an unshared code store");
+        crate::vm::compile::Compiler::unique(&mut self.heap, code, &self.realm)
     }
 
     /// [`Runtime::compiler`] for code the embedder compiles and lets go of (a

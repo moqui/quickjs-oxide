@@ -460,6 +460,18 @@ impl CodeStore {
         overflow < CHUNK * CHUNKS && self.units.len() + overflow < DYNAMIC as usize
     }
 
+    /// Appends a validated unit to the settled units, after the overflow
+    /// (settled first): a store no one else holds has no bound.
+    pub(crate) fn push_settled(&mut self, unit: CodeUnit) -> CodeUnitId {
+        self.settle();
+        let id = u32::try_from(self.units.len())
+            .ok()
+            .filter(|&id| id < DYNAMIC)
+            .expect("code store overflow");
+        self.units.push(unit);
+        CodeUnitId(id)
+    }
+
     /// Moves the overflow into the settled units, where the loop reads them
     /// directly. Ids do not change.
     #[inline]

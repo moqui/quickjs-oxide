@@ -660,3 +660,39 @@ fn spill_scope_accesses_validate() {
         assert_eq!(validate(&bad), Err(ValidateErrorKind::Spill));
     }
 }
+
+/// A shared store's overflow is bounded: `CodeStore::publish` past it
+/// panics (the compiler sends such units to the heap instead).
+#[test]
+#[should_panic(expected = "code store overflow")]
+fn publishing_past_the_overflow_panics() {
+    let store = CodeStore::default();
+    for _ in 0..=128 * 256 {
+        store
+            .publish(unit(8, |b| {
+                b.op(Opcode::ReturnUndefined);
+            }))
+            .unwrap();
+    }
+}
+
+/// A settled store has no bound: `settle` moves the overflow into it.
+#[test]
+fn settling_moves_the_overflow_and_keeps_ids() {
+    let mut store = CodeStore::default();
+    let ids: Vec<_> = (0..300)
+        .map(|_| {
+            store
+                .publish(unit(8, |b| {
+                    b.op(Opcode::ReturnUndefined);
+                }))
+                .unwrap()
+        })
+        .collect();
+    store.settle();
+    assert_eq!(store.len(), 300);
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(id.index() as usize, index);
+        assert!(store.lookup(*id).is_some());
+    }
+}
