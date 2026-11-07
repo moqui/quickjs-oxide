@@ -489,18 +489,80 @@ pub(super) fn substr(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     substring_value(cx, string, start as usize, end as usize)
 }
 
+/// One argument of [`concat`] after `ToString`: a string, or an int32
+/// whose digits need no string of their own.
+#[derive(Clone, Copy)]
+enum Part {
+    String(StringId),
+    Int(i32),
+}
+
+/// `String.prototype.concat`, which template literals call: the arguments
+/// are converted in order, then joined into one allocation of the result's
+/// length and width.
 pub(super) fn concat(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
+    const INLINE: usize = 16;
     let string = this_string(cx, &site)?;
-    let mut text = units(cx, string);
-    for index in 0..site.argc {
+    let mut inline = [Part::Int(0); INLINE];
+    let mut spill = Vec::new();
+    let parts: &mut [Part] = if site.argc <= INLINE {
+        &mut inline[..site.argc]
+    } else {
+        spill.resize(site.argc, Part::Int(0));
+        &mut spill
+    };
+    let first_len = cx.heap.string_len(string);
+    let (mut len, mut one_byte) = (first_len, cx.heap.string_is_one_byte(string));
+    for (index, slot) in parts.iter_mut().enumerate() {
         let part = site.arg(cx, index);
-        let part = to_string_id(cx, part)?;
-        text.extend(cx.heap.string(part).repr().units());
-        if text.len() > MAX_STRING {
+        *slot = match part.as_int32() {
+            Some(n) => {
+                len += ops::Digits::new(n).len();
+                Part::Int(n)
+            }
+            None => {
+                // Rooted by `to_string_id` when it made a string.
+                let id = to_string_id(cx, part)?;
+                len += cx.heap.string_len(id);
+                one_byte &= cx.heap.string_is_one_byte(id);
+                Part::String(id)
+            }
+        };
+        if len > MAX_STRING {
             return Err(error::string_too_long(cx));
         }
     }
-    string_units(cx, &text)
+    if len == first_len {
+        return Ok(Value::string(string));
+    }
+    let heap = &*cx.heap;
+    let first = std::iter::once(Part::String(string));
+    let repr = if one_byte {
+        let mut bytes = Vec::with_capacity(len);
+        for part in first.chain(parts.iter().copied()) {
+            match part {
+                Part::String(id) => match heap.string(id).repr() {
+                    StringRepr::OneByte(text) => bytes.extend_from_slice(text),
+                    StringRepr::TwoByte(_) => unreachable!("a one-byte string"),
+                },
+                Part::Int(n) => bytes.extend_from_slice(ops::Digits::new(n).as_bytes()),
+            }
+        }
+        StringRepr::OneByte(bytes.into())
+    } else {
+        let mut units = Vec::with_capacity(len);
+        for part in first.chain(parts.iter().copied()) {
+            match part {
+                Part::String(id) => units.extend(heap.string(id).repr().units()),
+                Part::Int(n) => {
+                    units.extend(ops::Digits::new(n).as_bytes().iter().map(|&b| u16::from(b)))
+                }
+            }
+        }
+        // A two-byte part has a unit above 0xFF, so the result is canonical.
+        StringRepr::TwoByte(units.into())
+    };
+    string_repr(cx, repr)
 }
 
 pub(super) fn repeat(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
