@@ -745,9 +745,13 @@ where
 {
     let instructions = program.instructions();
 
+    // The interrupt is polled on backtracking and on a jump back, as
+    // QuickJS's `lre_poll_timeout` is on its backtracking: every
+    // exponential search backtracks, and a counted `Loop` ends.
     macro_rules! fail_branch {
         () => {{
             if state.restore_backtrack() {
+                poller.step()?;
                 continue;
             }
             return Ok(None);
@@ -755,7 +759,6 @@ where
     }
 
     loop {
-        poller.step()?;
         let instruction_pc = state.pc;
         let instruction = instructions
             .get(instruction_pc)
@@ -916,7 +919,14 @@ where
                 state.reject_negative_lookahead(instruction_pc)?;
                 fail_branch!();
             }
-            Instruction::Jump { target } => state.pc = *target,
+            Instruction::Jump { target } => {
+                // A jump back closes a loop: polled too, so no program
+                // runs on without backtracking or reaching its bound.
+                if *target <= instruction_pc {
+                    poller.step()?;
+                }
+                state.pc = *target;
+            }
             Instruction::Split { first, second } => {
                 state.push_backtrack(*second)?;
                 state.pc = *first;

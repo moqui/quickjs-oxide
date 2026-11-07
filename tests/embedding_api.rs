@@ -1217,6 +1217,47 @@ fn a_host_hook_sets_a_deadline() {
 }
 
 #[test]
+fn a_backtracking_regexp_stops_at_an_interrupt() {
+    // (a+)+$ on a long run of a's that does not end the input backtracks
+    // exponentially: only the matcher's own polling stops it.
+    struct Deadline(std::time::Instant);
+    impl Host for Deadline {
+        fn interrupt(&mut self) -> bool {
+            std::time::Instant::now() >= self.0
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    let timed = Runtime::with_host(Deadline(deadline), RuntimeOptions::default());
+    let timed_context = timed.context();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        timed_context.eval(
+            "try { /(a+)+$/.test('a'.repeat(40) + '!') } catch (e) { globalThis.caught = 1 }"
+        ),
+        Err(RuntimeError::Interrupted)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // Uncatchable, as the loop's interrupt is.
+    assert_eq!(
+        timed_context.eval("typeof caught").unwrap(),
+        string("undefined")
+    );
+    // A two-byte subject, through replace, and from another thread.
+    let (runtime, context) = self::runtime();
+    let thread = interrupt_later(&runtime, std::time::Duration::from_millis(50));
+    assert_eq!(
+        context.eval("('ж' + 'a'.repeat(40) + '!').replace(/(a+)+$/, () => 'x')"),
+        Err(RuntimeError::Interrupted)
+    );
+    thread.join().unwrap();
+    runtime.interrupt_handle().clear();
+    assert_eq!(
+        context.eval("/(a+)+$/.test('aaa')").unwrap(),
+        Value::Bool(true)
+    );
+}
+
+#[test]
 fn an_interrupt_unwinds_through_a_host_function() {
     let (runtime, context) = runtime();
     let global = context.global_object().unwrap();
