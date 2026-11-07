@@ -17,7 +17,7 @@
 //! lists, every cell downstream. A shape caches its prototype's cell; the
 //! prototype IC records `(holder, slot, cell)` and tests one boolean.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::fmt;
 
 use crate::heap::arena::Record;
@@ -29,6 +29,10 @@ use crate::value::{ObjectId, ShapeId, ValidityCellId, Value};
 
 /// Past this many properties a transition shape builds a lookup table.
 pub const TABLE_THRESHOLD: u32 = 8;
+
+/// The lookups past [`TABLE_THRESHOLD`] after which a shape builds its own
+/// table even when each was answered within the walk.
+pub const TABLE_AFTER_LOOKUPS: u8 = 4;
 /// Adding a property beyond this count moves the object to dictionary mode.
 pub const DICTIONARY_THRESHOLD: u32 = 64;
 /// The always-valid cell of shapes without a prototype.
@@ -352,6 +356,9 @@ pub struct Shape {
     /// Key → (slot, flags), built on the first lookup past
     /// [`TABLE_THRESHOLD`] properties.
     pub table: OnceCell<Box<FxHashMap<PropertyKey, (u32, PropertyFlags)>>>,
+    /// Lookups past [`TABLE_THRESHOLD`] answered without this shape's own
+    /// table; the table is built at [`TABLE_AFTER_LOOKUPS`].
+    pub lookups: Cell<u8>,
     /// The prototype's validity cell as last seen, or [`NONE`].
     pub validity: ValidityCellId,
     pub dictionary: Option<Box<Dictionary>>,
@@ -370,6 +377,7 @@ impl Shape {
             kind,
             transitions: Transitions::None,
             table: OnceCell::new(),
+            lookups: Cell::new(0),
             validity: ValidityCellId(NONE),
             dictionary: None,
         }
@@ -508,6 +516,19 @@ impl Heap {
         // prototype as it is installed) builds a table every
         // `TABLE_THRESHOLD` shapes, not one per shape.
         let tabled = record.count > TABLE_THRESHOLD;
+        if tabled && record.table.get().is_none() {
+            // A shape read repeatedly (a prototype's last shape) gets its
+            // own table; one looked up while it was being extended does not.
+            let lookups = record.lookups.get() + 1;
+            if lookups >= TABLE_AFTER_LOOKUPS {
+                return record
+                    .table
+                    .get_or_init(|| Box::new(self.build_table(shape)))
+                    .get(&key)
+                    .copied();
+            }
+            record.lookups.set(lookups);
+        }
         let mut current = record;
         let mut steps = 0;
         while current.count > 0 {
