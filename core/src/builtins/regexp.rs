@@ -587,15 +587,31 @@ fn run(
     string: StringId,
     start: usize,
 ) -> Result<Option<RegExpMatch>, Throw> {
-    let compiled = cx.heap.regexps.program(program);
-    let result = match &cx.heap.string(string).repr() {
+    let heap = &*cx.heap;
+    let services = &mut *cx.host;
+    // The loop's interrupt sources, polled every 10,000 matcher steps as
+    // QuickJS's `lre_check_timeout` polls: a backtracking pattern stops at
+    // the embedder's deadline.
+    let already = heap.vm.interrupted;
+    let interrupted = || {
+        already
+            || services
+                .interrupt
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || services.hooks.interrupt()
+    };
+    let compiled = heap.regexps.program(program);
+    let result = match &heap.string(string).repr() {
         StringRepr::OneByte(bytes) => {
-            oxide_regexp::execute_latin1_with_interrupt(compiled, bytes, start, || false)
+            oxide_regexp::execute_latin1_with_interrupt(compiled, bytes, start, interrupted)
         }
-        StringRepr::TwoByte(units) => oxide_regexp::execute(compiled, units, start),
+        StringRepr::TwoByte(units) => {
+            oxide_regexp::execute_with_interrupt(compiled, units, start, interrupted)
+        }
     };
     result.map_err(|failure| match failure {
         ExecError::OutOfMemory => error::oom(cx.realm),
+        ExecError::Interrupted => error::interrupt(cx),
         other => error::throw(cx, ErrorKind::Internal, &other.to_string()),
     })
 }
