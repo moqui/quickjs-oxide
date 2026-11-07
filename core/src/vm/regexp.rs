@@ -44,6 +44,7 @@ pub struct RegExpStore {
 fn program_bytes(program: &CompiledRegExp) -> usize {
     size_of::<Option<(RegExpRecord, CompiledRegExp)>>()
         + std::mem::size_of_val(program.instructions())
+        + program.first_units_bytes()
         + program
             .instructions()
             .iter()
@@ -322,6 +323,13 @@ mod tests {
     #[test]
     fn program_bytes_includes_character_ranges() {
         assert_owned_payload_bytes("[aceg]", 4 * size_of::<oxide_regexp::CharacterRange>());
+    }
+
+    #[test]
+    fn program_bytes_includes_the_start_filter() {
+        // [a-c\u{100}-\u{200}] keeps its range above Latin-1 for the filter.
+        let range = size_of::<oxide_regexp::CharacterRange>();
+        assert_owned_payload_bytes("[a-c\u{100}-\u{200}]", 2 * range + range);
     }
 
     #[test]
