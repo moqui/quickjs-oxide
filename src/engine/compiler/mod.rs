@@ -114,6 +114,21 @@ pub fn compile_script(source: &str) -> Result<DetachedBytecode<Value>, Error> {
     lower_detached_script(tree)
 }
 
+thread_local! {
+    static PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one parse of a root (a script, a module or `eval` code) on this
+/// thread.
+pub(crate) fn count_parse() {
+    PARSES.with(|parses| parses.set(parses.get() + 1));
+}
+
+/// The roots parsed on this thread so far.
+pub(crate) fn parses() -> u64 {
+    PARSES.with(std::cell::Cell::get)
+}
+
 /// Compile a script into a runtime-independent draft ready for publication.
 ///
 /// Runtime publication uses this production boundary to keep primitive

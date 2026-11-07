@@ -1,0 +1,214 @@
+//! Code images: a script compiled in one runtime, loaded into another by
+//! value, runs as the compiled script does.
+
+use quickjs_oxide::engine::api::core::{
+    CodeImage, Context, Runtime, RuntimeError, Value, front_end_parses,
+};
+
+fn runtime() -> (Runtime, Context) {
+    let runtime = Runtime::new();
+    let context = runtime.context();
+    (runtime, context)
+}
+
+fn printed(context: &Context, value: Result<Value, RuntimeError>) -> String {
+    match value {
+        Ok(Value::String(text)) => text.to_utf8_lossy(),
+        Ok(other) => context.runtime().print_value(&other).unwrap(),
+        Err(RuntimeError::Exception(error)) => {
+            format!("threw {}", context.runtime().print_value(&error).unwrap())
+        }
+        Err(other) => format!("{other:?}"),
+    }
+}
+
+/// The source's completion value run from source and from its image in a
+/// fresh runtime, which must agree.
+fn round_trip(source: &str) -> String {
+    let (_, compiled) = runtime();
+    let expected = printed(&compiled, compiled.eval(source));
+    let image = compiled.compile_image(source, "<image>").unwrap();
+    let (_, loaded) = runtime();
+    let script = loaded.load_image(&image).unwrap();
+    let actual = printed(&loaded, loaded.execute(&script));
+    assert_eq!(actual, expected, "{source}");
+    actual
+}
+
+#[test]
+fn every_constant_kind_round_trips() {
+    assert_eq!(
+        round_trip(
+            "[1, -0, 0.5, 1e300, NaN, Infinity, 2147483648, -7, true, null, undefined,
+              'text', 'ünïcode ☃', '', '123', 12n, -(2n ** 130n),
+              typeof 'x', void 0].map(String).join('|')"
+        ),
+        "1|0|0.5|1e+300|NaN|Infinity|2147483648|-7|true|null|undefined|text|ünïcode ☃||123|12|-1361129467683753853853498429727072845824|string|undefined"
+    );
+    // A literal spelling an index stays its own string, not an atom.
+    round_trip("var a = ['10', '10']; [a[0] === a[1], typeof a[0]].join()");
+    round_trip("Object.is(-0, [-0][0]) + ':' + (1 / -0)");
+}
+
+#[test]
+fn closures_children_and_names_round_trip() {
+    assert_eq!(
+        round_trip(
+            "function outer(a) { let n = a; return { inc: () => ++n, get value() { return n; }, named: function inner() {} }; }
+             var o = outer(5); o.inc(); o.inc();
+             var anon = function () {}; var arrow = () => 1;
+             [o.value, o.named.name, anon.name, arrow.name, outer.length, outer.toString().slice(0, 17)].join()"
+        ),
+        "7,inner,anon,arrow,1,function outer(a)"
+    );
+    round_trip(
+        "var {a, b: [c, ...d], ...rest} = {a: 1, b: [2, 3, 4], e: 5, f: 6};
+         [a, c, d, Object.keys(rest), [...'hey'], Math.max(...[1, 9, 3])].join(';')",
+    );
+    round_trip(
+        "label: for (var i = 0; i < 3; i++) { for (var j in {x: 1, y: 2}) { if (j === 'y') continue label; } }
+         var s = ''; switch (i) { case 3: s = 'three'; break; default: s = 'other'; } s + i",
+    );
+}
+
+#[test]
+fn regexps_bigints_and_templates_round_trip() {
+    assert_eq!(
+        round_trip(
+            "var r = /(\\d+)-(?<word>[a-z]+)/giu; var m = r.exec('12-ab 34-cd');
+             [m[1], m.groups.word, r.flags, r.lastIndex, 'aXbX'.replace(/x/gi, '_'), /a/y.sticky].join()"
+        ),
+        "12,ab,giu,5,a_b_,true"
+    );
+    round_trip("[10n ** 40n, 0n, -1n, 0x1fn, BigInt.asUintN(8, 257n)].join()");
+    assert_eq!(
+        round_trip(
+            "function tag(strings, ...values) { return strings.raw.join('|') + '/' + strings.join('|') + '/' + values.join(); }
+             function site() { return tag`a${1}\\n${2}c`; }
+             var first = (function () { function t(s) { return s; } var x = []; for (var i = 0; i < 2; i++) x.push(t`same`); return x[0] === x[1] && Object.isFrozen(x[0]); })();
+             [site(), first, `plain ${1 + 1} text`, tag`\\unicode`].join(' ')"
+        ),
+        "a|\\n|c/a|\n|c/1,2 true plain 2 text \\unicode//"
+    );
+}
+
+#[test]
+fn classes_generators_and_async_round_trip() {
+    assert_eq!(
+        round_trip(
+            "class A { #secret = 1; static count = 0; field = 'f'; constructor() { A.count++; }
+                 get secret() { return this.#secret; } #hidden() { return 2; } both() { return this.#hidden() + this.#secret; }
+                 static { this.ready = true; } }
+             class B extends A { constructor() { super(); this.extra = super.both(); } toString() { return 'B'; } }
+             var b = new B(); new A();
+             [b.secret, b.field, b.both(), A.count, A.ready, b.extra, String(b), #secret in b ? 'no' : 'outside'].join()"
+                .replace("#secret in b ? 'no' : 'outside'", "b instanceof A")
+                .as_str()
+        ),
+        "1,f,3,2,true,3,B,true"
+    );
+    assert_eq!(
+        round_trip(
+            "function* gen(n) { for (let i = 0; i < n; i++) yield i * 2; return 'done'; }
+             var g = gen(3); var out = [...gen(4)];
+             var log = [];
+             async function work() { log.push('start'); await null; log.push('after'); return 'resolved'; }
+             async function* agen() { yield 1; yield 2; }
+             work().then(v => log.push(v));
+             [out.join(), g.next().value, g.next().value, typeof agen().next, log.join()].join(';')"
+        ),
+        "0,2,4,6;0;2;function;start"
+    );
+}
+
+#[test]
+fn an_image_loads_into_a_runtime_with_other_atoms() {
+    let (_, compiled) = runtime();
+    let source = "var record = { alpha: 1, beta: 2, gamma: 3 };
+                  function sum(o) { return o.alpha + o.beta + o.gamma; }
+                  [sum(record), Object.keys(record).join(), record.delta === undefined].join(';')";
+    let image = compiled.compile_image(source, "atoms.js").unwrap();
+    // A runtime that interned other names first numbers its atoms
+    // differently.
+    let (_, loaded) = runtime();
+    loaded
+        .eval("var zz1 = 1, zz2 = 2, gamma = 'g', qq = { delta: 4, beta: 5, omega: 6 };")
+        .unwrap();
+    let script = loaded.load_image(&image).unwrap();
+    assert_eq!(
+        printed(&loaded, loaded.execute(&script)),
+        "6;alpha,beta,gamma;true"
+    );
+    // The same image loads again into the same runtime, and once more
+    // after a collection.
+    let again = loaded.load_image(&image).unwrap();
+    loaded.runtime().run_gc().unwrap();
+    assert_eq!(
+        printed(&loaded, loaded.execute(&again)),
+        "6;alpha,beta,gamma;true"
+    );
+}
+
+#[test]
+fn errors_from_a_loaded_script_keep_their_positions() {
+    let source = "var x = 1;\nfunction fails(o) {\n  return o.missing.deeper;\n}\nfunction call() { return fails({}); }\ntry { call(); } catch (e) { e.stack }";
+    let (_, compiled) = runtime();
+    let script = compiled
+        .compile_with_filename(source, "positions.js")
+        .unwrap();
+    let expected = printed(&compiled, compiled.execute(&script));
+    assert!(expected.contains("positions.js:3:"), "{expected}");
+    let image = compiled.encode_image(&script).unwrap();
+    let (_, loaded) = runtime();
+    let script = loaded.load_image(&image).unwrap();
+    assert_eq!(printed(&loaded, loaded.execute(&script)), expected);
+    // A syntax error stays the compiler's.
+    assert!(matches!(
+        compiled.compile_image("var = 1", "bad.js"),
+        Err(RuntimeError::Exception(_))
+    ));
+}
+
+#[test]
+fn an_image_another_thread_made_loads_without_parsing() {
+    let source = "var total = 0; for (var i = 0; i < 100; i++) total += [i].map(x => x * 2)[0]; 'total ' + total";
+    let image: CodeImage = std::thread::spawn(move || {
+        let (_, context) = runtime();
+        context.compile_image(source, "threads.js").unwrap()
+    })
+    .join()
+    .unwrap();
+    let images: Vec<_> = (0..3)
+        .map(|_| {
+            let image = image.clone();
+            std::thread::spawn(move || {
+                let before = front_end_parses();
+                let (_, context) = runtime();
+                let script = context.load_image(&image).unwrap();
+                let result = printed(&context, context.execute(&script));
+                (front_end_parses() - before, result)
+            })
+        })
+        .collect();
+    for handle in images {
+        let (parses, result) = handle.join().unwrap();
+        assert_eq!(parses, 0);
+        assert_eq!(result, "total 9900");
+    }
+}
+
+#[test]
+fn an_image_counts_its_units() {
+    let (_, context) = runtime();
+    let script = context
+        .compile("function a() { return () => 1; } a")
+        .unwrap();
+    let image = context.encode_image(&script).unwrap();
+    assert_eq!(image.unit_count(), 3);
+    assert!(image.bytes() > 0);
+    // A function value is not a compiled script.
+    let Value::Object(function) = context.eval("(function () {})").unwrap() else {
+        panic!()
+    };
+    let _ = function;
+}

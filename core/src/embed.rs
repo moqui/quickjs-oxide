@@ -326,6 +326,26 @@ impl<'a> NativeCx<'a> {
         crate::vm::jobs::run_nested_job(&mut self.cx())
     }
 
+    /// The code image of the script whose function object is `function`
+    /// (a compiled script, run or not).
+    pub fn encode_image(
+        &mut self,
+        function: ObjectId,
+    ) -> Result<crate::image::CodeImage, crate::image::EncodeError> {
+        let cx = self.cx();
+        crate::image::encode(cx.heap, cx.units(), cx.realm, function)
+    }
+
+    /// Loads `image` as [`Compiler::load_image`](crate::vm::compile::Compiler::load_image)
+    /// does: into the code store between entries, transient inside a host
+    /// function. The script's function object, unrooted.
+    pub fn load_image(
+        &mut self,
+        image: &crate::image::CodeImage,
+    ) -> Result<ObjectId, crate::image::LoadError> {
+        self.compiler(false).load_image(image)
+    }
+
     /// Whether jobs are pending.
     pub fn has_pending_jobs(&self) -> bool {
         !self.heap.jobs.is_empty()

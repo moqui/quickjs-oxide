@@ -155,6 +155,11 @@ impl Value {
 
     /// The raw bit pattern.
     #[inline]
+    pub(crate) const fn from_bits(bits: u64) -> Value {
+        Value(bits)
+    }
+
+    #[inline]
     pub const fn bits(self) -> u64 {
         self.0
     }

@@ -322,49 +322,111 @@ impl Compiler<'_> {
         cooked: &[Value],
         raw: &[Value],
     ) -> Result<ObjectId, HeapError> {
-        use crate::heap::object::flags;
-        let prototype = self.intrinsic(Intrinsic::ArrayPrototype);
-        let names = self.realm.names;
-        let heap = &mut *self.heap;
-        let mark = heap.roots().mark();
-        // An atom interned outside a compilation is weak.
-        for &value in cooked.iter().chain(raw) {
-            heap.roots().push(value);
+        template_object(self.heap, self.realm, cooked, raw)
+    }
+
+    /// Loads a code image: interns its atoms, publishes its units children
+    /// first through the validator (into the code store before the program
+    /// runs, into the heap while it runs, as [`Compiler::publish`] does),
+    /// and instantiates its root. The script's function object, unrooted.
+    pub fn load_image(
+        &mut self,
+        image: &crate::image::CodeImage,
+    ) -> Result<ObjectId, crate::image::LoadError> {
+        use crate::image::LoadError;
+        let mut loader = crate::image::Loader::new(image);
+        let count = loader.image.units.len();
+        if count == 0 {
+            return Err(LoadError::Malformed("an image without units"));
         }
+        let mark = self.heap.roots().mark();
         let result = (|| {
-            let raw_array = heap.alloc_array(Some(prototype), raw.len() as u32)?;
-            heap.roots().push(Value::object(raw_array));
-            let array = heap.alloc_array(Some(prototype), cooked.len() as u32)?;
-            heap.roots().push(Value::object(array));
-            for (target, values) in [(raw_array, raw), (array, cooked)] {
-                for (index, &value) in values.iter().enumerate() {
-                    let key =
-                        crate::PropertyKey::index(index as u32).ok_or(HeapError::OutOfMemory)?;
-                    heap.add_property(
-                        target,
-                        key,
-                        crate::PropertyFlags::data(false, true, false),
-                        value,
-                    )?;
+            let mut ids: Vec<Option<CodeUnitId>> = vec![None; count];
+            // Children follow their parent in pre-order and have higher
+            // indices, so publishing from the last unit back publishes every
+            // child before its parent.
+            for index in (0..count).rev() {
+                let mut children = Vec::new();
+                for &child in loader.image.units[index].children.iter() {
+                    let child = child as usize;
+                    if child <= index {
+                        return Err(LoadError::Malformed("a child index"));
+                    }
+                    children.push(
+                        ids.get(child)
+                            .copied()
+                            .flatten()
+                            .ok_or(LoadError::Malformed("a child index"))?,
+                    );
                 }
-                heap.set_array_length(target, values.len() as u32);
+                let unit = loader.unit(self.heap, index, children.into())?;
+                ids[index] = Some(self.publish(unit).map_err(LoadError::Invalid)?);
             }
-            let raw_key = crate::runtime::Names::key(names.raw);
-            heap.add_property(
-                array,
-                raw_key,
-                crate::PropertyFlags::data(false, false, false),
-                Value::object(raw_array),
-            )?;
-            for target in [raw_array, array] {
-                heap.set_object_flag(target, flags::SPARSE | flags::LENGTH_READONLY);
-                heap.clear_object_flag(target, flags::EXTENSIBLE);
+            let root = ids[0].expect("the root published");
+            // The tree from the root must be the image's pre-order.
+            let order = self.units().tree(root);
+            if order.len() != count || order.iter().zip(&ids).any(|(a, b)| Some(*a) != *b) {
+                return Err(LoadError::Malformed("the unit tree"));
             }
-            Ok(array)
+            let mut tables = Vec::with_capacity(count);
+            for index in 0..count {
+                tables.push(loader.constants(self.heap, self.realm, index, template_object)?);
+            }
+            let tables: Vec<&[Value]> = tables.iter().map(Vec::as_slice).collect();
+            Ok(self.instantiate(root, &tables)?)
         })();
-        heap.roots().truncate(mark);
+        self.heap.roots().truncate(mark);
         result
     }
+}
+
+/// A tagged template's frozen site object.
+pub(crate) fn template_object(
+    heap: &mut Heap,
+    realm: &Realm,
+    cooked: &[Value],
+    raw: &[Value],
+) -> Result<ObjectId, HeapError> {
+    use crate::heap::object::flags;
+    let prototype = realm.intrinsic(Intrinsic::ArrayPrototype);
+    let names = realm.names;
+    let mark = heap.roots().mark();
+    // An atom interned outside a compilation is weak.
+    for &value in cooked.iter().chain(raw) {
+        heap.roots().push(value);
+    }
+    let result = (|| {
+        let raw_array = heap.alloc_array(Some(prototype), raw.len() as u32)?;
+        heap.roots().push(Value::object(raw_array));
+        let array = heap.alloc_array(Some(prototype), cooked.len() as u32)?;
+        heap.roots().push(Value::object(array));
+        for (target, values) in [(raw_array, raw), (array, cooked)] {
+            for (index, &value) in values.iter().enumerate() {
+                let key = crate::PropertyKey::index(index as u32).ok_or(HeapError::OutOfMemory)?;
+                heap.add_property(
+                    target,
+                    key,
+                    crate::PropertyFlags::data(false, true, false),
+                    value,
+                )?;
+            }
+            heap.set_array_length(target, values.len() as u32);
+        }
+        let raw_key = crate::runtime::Names::key(names.raw);
+        heap.add_property(
+            array,
+            raw_key,
+            crate::PropertyFlags::data(false, false, false),
+            Value::object(raw_array),
+        )?;
+        for target in [raw_array, array] {
+            heap.set_object_flag(target, flags::SPARSE | flags::LENGTH_READONLY);
+            heap.clear_object_flag(target, flags::EXTENSIBLE);
+        }
+        Ok(array)
+    })();
+    heap.roots().truncate(mark);
+    result
 }
 
 /// What to compile.

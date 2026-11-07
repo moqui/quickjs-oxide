@@ -64,6 +64,9 @@ pub struct CodeReport {
     pub dynamic_bytes: usize,
     pub instructions: usize,
     pub instruction_bytes: usize,
+    /// Bytes the static units hold, without their cache entries (in
+    /// `table_bytes`): what the code store costs this runtime.
+    pub static_bytes: usize,
     /// Bytes of the units' source-position tables.
     pub position_bytes: usize,
     /// Bytes of source text kept for `Function.prototype.toString`.

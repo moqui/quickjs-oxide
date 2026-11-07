@@ -914,6 +914,9 @@ impl Runtime {
         let mut report = self.heap.report();
         let code = &mut report.code;
         code.static_units = self.code.len();
+        for (_, unit) in self.code.units() {
+            code.static_bytes += unit.bytes() - unit.ic_count as usize * crate::vm::ic::ENTRY_BYTES;
+        }
         for (_, unit) in self.units().all() {
             code.units += 1;
             code.instructions += unit.code.len();
