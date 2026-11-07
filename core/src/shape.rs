@@ -516,9 +516,11 @@ impl Heap {
         // prototype as it is installed) builds a table every
         // `TABLE_THRESHOLD` shapes, not one per shape.
         let tabled = record.count > TABLE_THRESHOLD;
-        if tabled && record.table.get().is_none() {
-            // A shape read repeatedly (a prototype's last shape) gets its
-            // own table; one looked up while it was being extended does not.
+        if tabled && record.table.get().is_none() && record.transitions.len() == 0 {
+            // A leaf read repeatedly (a prototype's last shape) gets its own
+            // table. A shape with a child is on the way to another (a
+            // constructor's instances pass it on every add), so its lookups
+            // do not count.
             let lookups = record.lookups.get() + 1;
             if lookups >= TABLE_AFTER_LOOKUPS {
                 return record
