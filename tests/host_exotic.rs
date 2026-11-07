@@ -1040,3 +1040,53 @@ fn a_key_text_is_its_own_after_a_collection_reuses_the_atom() {
         context.runtime().run_gc().unwrap();
     }
 }
+
+#[test]
+fn key_texts_hold_across_a_lend_and_its_collections() {
+    // Hooks run at the top level and inside a nested script a host function
+    // lends its engine to; the nested script's allocations collect, which
+    // frees names and lets later names take their string ids.
+    struct Echo;
+    impl ExoticClass for Echo {
+        type Data = ();
+        fn get(&self, _: &mut ExoticScope<'_>, _: &(), key: &PropertyKey) -> JsResult<Hook<Value>> {
+            Ok(Hook::Handled(text(&name(key))))
+        }
+    }
+    let (runtime, context) = runtime();
+    let class = context.register_exotic_class(Echo).unwrap();
+    let echo = context.new_host_exotic((), &class, None).unwrap();
+    let global = context.global_object().unwrap();
+    let key = context.runtime().intern_property_key("echo").unwrap();
+    context
+        .set_property(&global, &key, Value::Object(echo))
+        .unwrap();
+    let nested = context.clone();
+    context
+        .define_function(&global, "nested", 1, move |scope: &mut Scope<'_>| {
+            let source = scope.arg(0);
+            let source = scope.to_js_string(&source)?.to_utf8_lossy();
+            scope.lend(|| nested.eval(&source))
+        })
+        .unwrap();
+    let before = runtime.gc_stats().unwrap().collections;
+    let source = "(function () { var out = []; \
+        for (var round = 0; round < 4; round++) { \
+          out.push(nested(\"var a = []; for (var i = 0; i < 100; i++) a.push(echo['n\" + round + \"_' + i]); \
+            for (var j = 0; j < 30000; j++) ({ j: j, s: 'v' + j }); a.join()\")); \
+          var b = []; for (var i = 0; i < 100; i++) b.push(echo['m' + round + '_' + i]); \
+          out.push(b.join()); \
+        } return out.join(';'); })()";
+    let mut expected = Vec::new();
+    for round in 0..4 {
+        for prefix in ["n", "m"] {
+            let names: Vec<String> = (0..100).map(|i| format!("{prefix}{round}_{i}")).collect();
+            expected.push(names.join(","));
+        }
+    }
+    assert_eq!(eval_string(&context, source), expected.join(";"));
+    assert!(
+        runtime.gc_stats().unwrap().collections > before,
+        "the nested scripts collected"
+    );
+}
