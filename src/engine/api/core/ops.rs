@@ -17,8 +17,8 @@ use super::function::{FunctionOptions, HostFunction, Raw, Scope, host_body};
 use super::image::CodeImage;
 use super::promise::PromiseCapability;
 use super::property::{
-    AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, InitValue, Key,
-    OrdinaryPropertyDescriptor, OwnData, PropertyKey, WellKnownSymbol,
+    AccessorValue, CompleteOrdinaryPropertyDescriptor, DataRef, DescriptorField, InitValue, Key,
+    OrdinaryPropertyDescriptor, OwnData, OwnDataRef, PropertyKey, TextRef, WellKnownSymbol,
 };
 use super::runtime::{Preloaded, PromiseSnapshot, PromiseState, Shared, slot};
 use super::value::{CallableRef, ObjectRef, Slot, SymbolRef, Value};
@@ -942,6 +942,72 @@ impl View<'_> {
         Ok(Some(entries))
     }
 
+    /// [`Self::plain_own_data`] shown to `visit` a property at a time, a
+    /// string borrowed from the heap and a callable marked, with no handle
+    /// or copy made for either. `Some(true)` when every property was shown,
+    /// `Some(false)` when `visit` stopped (it returned false), `None` when
+    /// the object is not one this reads (as `plain_own_data`); `visit` may
+    /// have seen some properties before an accessor said so. Runs no code.
+    pub(crate) fn visit_plain_own_data(
+        &mut self,
+        object: &ObjectRef,
+        prototype: Option<&ObjectRef>,
+        visit: &mut dyn FnMut(OwnDataRef<'_>) -> bool,
+    ) -> JsResult<Option<bool>> {
+        let id = self.object(object)?;
+        if self.core.object_kind(id) != oxide_core::ObjectKind::Ordinary {
+            return Ok(None);
+        }
+        let expected = prototype.map(|p| self.object(p)).transpose()?;
+        let result = self.core.get_prototype_of(id);
+        if self.complete_with(result)? != expected {
+            return Ok(None);
+        }
+        let result = self.core.own_property_keys(id);
+        let keys = self.complete_with(result)?;
+        for key in keys {
+            let result = self.core.get_own_property(id, key);
+            let Some(descriptor) = self.complete_with(result)? else {
+                continue;
+            };
+            if descriptor.is_accessor() {
+                return Ok(None);
+            }
+            let enumerable = descriptor.enumerable.unwrap_or(false);
+            let value = descriptor.value.unwrap_or(oxide_core::Value::UNDEFINED);
+            let key = self.lift_key(key)?;
+            let shown = if self.core.is_callable(value) {
+                visit(OwnDataRef {
+                    key: &key,
+                    enumerable,
+                    value: DataRef::Callable,
+                })
+            } else if value.as_string().is_some() {
+                let text = match self.core.string_repr(value) {
+                    Some(StringRepr::OneByte(bytes)) => TextRef::Latin1(bytes),
+                    Some(StringRepr::TwoByte(units)) => TextRef::Utf16(units),
+                    None => TextRef::Latin1(&[]),
+                };
+                visit(OwnDataRef {
+                    key: &key,
+                    enumerable,
+                    value: DataRef::Text(text),
+                })
+            } else {
+                let value = self.lift(value)?;
+                visit(OwnDataRef {
+                    key: &key,
+                    enumerable,
+                    value: DataRef::Value(value),
+                })
+            };
+            if !shown {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
     /// The elements of an Array, `0` to its `length`: `None` unless `object`
     /// is an Array whose every index below its length is an own data
     /// property (no hole, which would read through the prototype, and no
@@ -1620,6 +1686,11 @@ js_ops! {
     /// property; `None` otherwise (a hole, an accessor, not an Array). Runs
     /// no code.
     fn dense_array_values(&mut self, object: &ObjectRef) -> JsResult<Option<Vec<Value>>>;
+    /// A plain object's own data properties shown to `visit` one at a time,
+    /// strings borrowed and callables marked with no handle; `None` when it
+    /// is not a plain object, `Some(false)` when `visit` stopped. Runs no
+    /// code.
+    fn visit_plain_own_data(&mut self, object: &ObjectRef, prototype: Option<&ObjectRef>, visit: &mut dyn FnMut(OwnDataRef<'_>) -> bool) -> JsResult<Option<bool>>;
 
     // ---- conversions and printing ----
 
