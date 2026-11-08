@@ -305,12 +305,12 @@ impl Realm {
 }
 
 pub struct Runtime {
-    pub(crate) heap: Heap,
+    pub(crate) heap: Box<Heap>,
     /// The units published before the program runs. Beside the heap, not in
     /// it: the main loop borrows the running unit's code across heap calls.
     pub(crate) code: std::rc::Rc<CodeStore>,
     pub(crate) realm: std::rc::Rc<Realm>,
-    pub(crate) host: Services,
+    pub(crate) host: Box<Services>,
 }
 
 /// How a runtime is configured. `Default` is the behavior every runtime had
@@ -456,10 +456,10 @@ impl Runtime {
             regexp_flags: std::cell::Cell::new(None),
         };
         let mut runtime = Runtime {
-            heap,
+            heap: Box::new(heap),
             code: std::rc::Rc::new(CodeStore::default()),
             realm: std::rc::Rc::new(realm),
-            host: Services::default(),
+            host: Box::default(),
         };
         let out_of_memory = crate::builtins::install(&mut runtime.cx())?;
         runtime.set_intrinsic(Intrinsic::OutOfMemoryError, out_of_memory);

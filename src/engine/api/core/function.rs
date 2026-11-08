@@ -107,8 +107,8 @@ impl Scope<'_> {
     /// in the code store, an exception or an interrupt from a nested
     /// call returns as its `RuntimeError` (return it to keep unwinding), and
     /// collection, the reports, the options and the module loader stay at
-    /// the top level (`Reentered`). A lend costs two swaps of the heap's and
-    /// the services' headers (about 0.2 µs).
+    /// the top level (`Reentered`). A lend swaps the boxes of the heap and the
+    /// services with a spare's, four pointers there and back.
     pub fn lend<R>(&mut self, f: impl FnOnce() -> R) -> R {
         lend(&mut self.core, &self.shared, f)
     }

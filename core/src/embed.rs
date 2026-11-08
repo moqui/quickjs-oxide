@@ -78,11 +78,11 @@ pub enum KeyName {
 /// services and the code store, owned (`Runtime::native_cx`) or borrowed
 /// (inside a host function).
 pub struct NativeCx<'a> {
-    pub(crate) heap: &'a mut Heap,
+    pub(crate) heap: &'a mut Box<Heap>,
     code: CodeView<'a>,
     pub(crate) realm: &'a Realm,
     realm_owner: &'a Rc<Realm>,
-    pub(crate) host: &'a mut Services,
+    pub(crate) host: &'a mut Box<Services>,
 }
 
 /// The code store a [`NativeCx`] holds: the runtime's own between entries,
@@ -93,28 +93,29 @@ enum CodeView<'a> {
 }
 
 /// The engine a host function lends to the Rust code it calls
-/// ([`NativeCx::lend`]): the heap and the services moved out of the host
-/// function's view, with the code store and the realm shared. A
+/// ([`NativeCx::lend`]): the heap and the services taken out of the host
+/// function's view (their boxes, swapped with a spare's), with the code store and the realm shared. A
 /// [`NativeCx`] over it ([`Lent::native_cx`]) is the host function's view
 /// for code that has no way to reach it: its loop frames, register file and
 /// root stack are the lent heap's.
 pub struct Lent {
-    parts: Box<Parts>,
+    parts: Parts,
     code: Rc<CodeStore>,
     realm: Rc<Realm>,
 }
 
-/// A heap and services, boxed so a lend moves them in place.
+/// A heap and services, each boxed so a lend swaps two pointers, not the
+/// 4.2 KB heap and the services by value.
 struct Parts {
-    heap: Heap,
-    host: Services,
+    heap: Box<Heap>,
+    host: Box<Services>,
 }
 
 impl Lent {
     /// The view of the lent engine; inside it, as inside a host function,
     /// compiled code is transient.
     pub fn native_cx(&mut self) -> NativeCx<'_> {
-        let parts = &mut *self.parts;
+        let parts = &mut self.parts;
         NativeCx {
             heap: &mut parts.heap,
             code: CodeView::Shared(&self.code),
@@ -127,15 +128,15 @@ impl Lent {
 
 /// What a lending view holds while its engine is lent: an empty heap and
 /// default services, never used. Kept between lends, it makes a lend two
-/// swaps.
-pub struct Spare(Box<Parts>);
+/// pointer swaps.
+pub struct Spare(Parts);
 
 impl Spare {
     pub fn new() -> Self {
-        Spare(Box::new(Parts {
-            heap: Heap::new(crate::HeapLimits::default()),
-            host: Services::default(),
-        }))
+        Spare(Parts {
+            heap: Box::new(Heap::new(crate::HeapLimits::default())),
+            host: Box::default(),
+        })
     }
 }
 
