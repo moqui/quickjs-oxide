@@ -115,4 +115,17 @@ pub enum Instruction {
     CheckAdvance {
         register: u8,
     },
+    /// A greedy loop over the one-character instruction after it (`Char`,
+    /// `Dot`, `Any`, `Space` or `Range`, at `pc + 1`): matches it as often
+    /// as it can, at least `min` and at most `max` times (`u32::MAX` for no
+    /// bound), and goes on at `pc + 2`. One backtrack record gives the
+    /// characters past `min` back one at a time, where QuickJS keeps a
+    /// `split` frame for each; a `possessive` loop keeps none, the compiler
+    /// having shown that no continuation can match once one is given back.
+    /// Not in QuickJS's set.
+    CharLoop {
+        min: u32,
+        max: u32,
+        possessive: bool,
+    },
 }

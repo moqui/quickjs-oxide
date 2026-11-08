@@ -54,6 +54,7 @@ pub enum ProgramError {
     InvalidCharacterRange { pc: usize, start: u32, end: u32 },
     AssertionStructure { pc: usize },
     IncompleteCapture { capture: u8 },
+    CharLoopStructure { pc: usize },
 }
 
 impl fmt::Display for ProgramError {
@@ -126,6 +127,12 @@ impl fmt::Display for ProgramError {
             }
             Self::IncompleteCapture { capture } => {
                 write!(formatter, "RegExp capture {capture} has only one boundary")
+            }
+            Self::CharLoopStructure { pc } => {
+                write!(
+                    formatter,
+                    "RegExp instruction {pc} is a character loop without a one-character body"
+                )
             }
         }
     }
@@ -260,10 +267,7 @@ fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
         loop {
             if let Some(filter) = filter {
                 // No attempt from a unit the first instruction rejects.
-                match input[candidate..]
-                    .iter()
-                    .position(|&unit| filter.contains(unit.into()))
-                {
+                match filter.find(&input[candidate..]) {
                     Some(skip) => candidate += skip,
                     None => return Ok(None),
                 }
@@ -406,6 +410,24 @@ pub(super) fn validate_program(program: &CompiledRegExp) -> Result<(), ExecError
                     return Err(ProgramError::AssertionStructure { pc }.into());
                 }
             }
+            Instruction::CharLoop { min, max, .. } => {
+                let matcher = instructions.get(pc + 1);
+                if min > max
+                    || pc + 2 >= instructions.len()
+                    || !matches!(
+                        matcher,
+                        Some(
+                            Instruction::Char { .. }
+                                | Instruction::Dot
+                                | Instruction::Any
+                                | Instruction::Space { .. }
+                                | Instruction::Range { .. }
+                        )
+                    )
+                {
+                    return Err(ProgramError::CharLoopStructure { pc }.into());
+                }
+            }
             Instruction::SetRegister { register, .. }
             | Instruction::Loop { register, .. }
             | Instruction::SavePosition { register }
@@ -525,8 +547,20 @@ impl Undo {
 
 #[derive(Clone, Copy, Debug)]
 enum ControlKind {
-    Split { pc: usize },
-    LookAhead { negative: bool, target: usize },
+    Split {
+        pc: usize,
+    },
+    LookAhead {
+        negative: bool,
+        target: usize,
+    },
+    /// A [`Instruction::CharLoop`] that can give characters back: the
+    /// frame's position is where the loop now ends, `floor` where it ended
+    /// after its `min` characters, and `pc` its continuation.
+    Loop {
+        pc: usize,
+        floor: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -651,6 +685,18 @@ impl AttemptState {
         Ok(())
     }
 
+    fn push_loop(&mut self, pc: usize, floor: usize) -> Result<(), ExecError> {
+        self.controls
+            .try_reserve(1)
+            .map_err(|_| ExecError::OutOfMemory)?;
+        self.controls.push(ControlFrame {
+            kind: ControlKind::Loop { pc, floor },
+            position: self.position,
+            undo_len: self.undo.len(),
+        });
+        Ok(())
+    }
+
     fn push_lookahead(&mut self, negative: bool, target: usize) -> Result<(), ExecError> {
         self.controls
             .try_reserve(1)
@@ -676,8 +722,9 @@ impl AttemptState {
     ///
     /// A failed positive lookahead propagates through its boundary. A failed
     /// negative lookahead succeeds at its continuation. Split frames resume
-    /// their retained branch.
-    fn restore_backtrack(&mut self) -> bool {
+    /// their retained branch. A loop frame gives back one character and
+    /// stays while it has more to give.
+    fn restore_backtrack<T: Copy + Into<u16>>(&mut self, input: &[T], unicode: bool) -> bool {
         loop {
             let Some(frame) = self.controls.pop() else {
                 return false;
@@ -686,6 +733,18 @@ impl AttemptState {
             self.position = frame.position;
             match frame.kind {
                 ControlKind::Split { pc } => {
+                    self.pc = pc;
+                    return true;
+                }
+                ControlKind::Loop { pc, floor } => {
+                    let position =
+                        read_previous_character_bounded(input, frame.position, floor, unicode)
+                            .map_or(floor, |(_, previous)| previous);
+                    if position > floor {
+                        // The slot just popped: no allocation.
+                        self.controls.push(ControlFrame { position, ..frame });
+                    }
+                    self.position = position;
                     self.pc = pc;
                     return true;
                 }
@@ -872,7 +931,7 @@ where
     // that passes none of them is bounded by the program's length.
     macro_rules! fail_branch {
         () => {{
-            if state.restore_backtrack() {
+            if state.restore_backtrack(input, unicode) {
                 poller.step()?;
                 continue;
             }
@@ -1052,6 +1111,42 @@ where
                 state.push_backtrack(*second)?;
                 state.pc = *first;
             }
+            Instruction::CharLoop {
+                min,
+                max,
+                possessive,
+            } => {
+                let matcher =
+                    instructions
+                        .get(instruction_pc + 1)
+                        .ok_or(ProgramError::ProgramCounter {
+                            pc: instruction_pc + 1,
+                        })?;
+                let start = state.position;
+                let mut position = start;
+                let mut floor = start;
+                let mut count = 0u32;
+                while count < *max {
+                    let Some(next) = match_one(matcher, input, position, unicode) else {
+                        break;
+                    };
+                    position = next;
+                    count += 1;
+                    if count == *min {
+                        floor = position;
+                    }
+                }
+                if count < *min {
+                    fail_branch!();
+                }
+                // A long run is work the attempt's bound does not count.
+                poller.step_by(count)?;
+                state.position = position;
+                state.pc = instruction_pc + 2;
+                if !*possessive && position > floor {
+                    state.push_loop(instruction_pc + 2, floor)?;
+                }
+            }
             Instruction::Match => return state.finish_match().map(Some),
             Instruction::SaveStart { capture } => {
                 state.set_capture(usize::from(*capture) * 2, Some(state.position))?;
@@ -1123,6 +1218,45 @@ fn normalize_start<T: Copy + Into<u16>>(input: &[T], start: usize, unicode: bool
 
 fn advance_string_index<T: Copy + Into<u16>>(input: &[T], position: usize, unicode: bool) -> usize {
     read_character(input, position, unicode).map_or(input.len(), |(_, next)| next)
+}
+
+/// Where the one-character instruction `matcher` ends when it matches at
+/// `position`: the loop body of an [`Instruction::CharLoop`].
+#[inline(always)]
+fn match_one<T: Copy + Into<u16>>(
+    matcher: &Instruction,
+    input: &[T],
+    position: usize,
+    unicode: bool,
+) -> Option<usize> {
+    let (character, next) = read_character(input, position, unicode)?;
+    let matched = match matcher {
+        Instruction::Char { value, ignore_case } => {
+            let character = if *ignore_case {
+                canonicalize(character, unicode)
+            } else {
+                character
+            };
+            character == *value
+        }
+        Instruction::Dot => !is_line_terminator(character),
+        Instruction::Any => true,
+        Instruction::Space { inverted } => is_space(character) != *inverted,
+        Instruction::Range {
+            ranges,
+            inverted,
+            ignore_case,
+        } => {
+            let character = if *ignore_case {
+                canonicalize(character, unicode)
+            } else {
+                character
+            };
+            range_contains(ranges, character) != *inverted
+        }
+        _ => false,
+    };
+    matched.then_some(next)
 }
 
 fn read_character<T: Copy + Into<u16>>(
@@ -1276,53 +1410,65 @@ fn is_word(character: u32, ignore_case: bool) -> bool {
 
 /// The code units a match can start with: those of the first instruction
 /// that reads input, when it is a case-sensitive character or a positive
-/// class and only captures and registers come before it. In Unicode mode
-/// only a set below the surrogates qualifies, where a unit is its own
-/// character. A match can start only at such a unit, so the search skips
-/// the others without an attempt.
+/// class (or `\s`) and only captures and registers come before it; for a
+/// character loop, its body's, and with no minimum, those of what follows it
+/// too. In Unicode mode only a set below the surrogates qualifies, where a
+/// unit is its own character. A match can start only at such a unit, so the
+/// search skips the others without an attempt; a set of one unit is found
+/// by a scan the compiler vectorizes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FirstUnits {
     latin1: [u64; 4],
     wide: Box<[CharacterRange]>,
+    single: Option<u16>,
 }
 
 impl FirstUnits {
     pub(super) fn of(flags: RegExpFlags, instructions: &[Instruction]) -> Option<Self> {
         let limit = if flags.is_unicode() { 0xd7ff } else { 0xffff };
-        for instruction in instructions {
-            let ranges: &[CharacterRange] = match instruction {
-                Instruction::SaveStart { .. }
-                | Instruction::SaveEnd { .. }
-                | Instruction::ResetCaptures { .. }
-                | Instruction::SetRegister { .. } => continue,
-                Instruction::Char {
-                    value,
-                    ignore_case: false,
-                } => &[CharacterRange::new(*value, *value)],
-                Instruction::Range {
-                    ranges,
-                    inverted: false,
-                    ignore_case: false,
-                } => ranges,
-                _ => return None,
-            };
-            if ranges.iter().any(|range| range.end > limit) {
-                return None;
+        let mut ranges = Vec::new();
+        first_ranges(instructions, 0, &mut ranges)?;
+        // A loop's set and its follower's may overlap: sorted and merged.
+        ranges.sort_unstable_by_key(|range| range.start);
+        ranges.dedup_by(|next, kept| {
+            let touches = next.start <= kept.end.saturating_add(1);
+            if touches {
+                kept.end = kept.end.max(next.end);
             }
-            let mut latin1 = [0u64; 4];
-            for range in ranges {
-                for unit in range.start..=range.end.min(0xff) {
-                    latin1[(unit >> 6) as usize] |= 1 << (unit & 63);
-                }
-            }
-            let wide = ranges
-                .iter()
-                .filter(|range| range.end > 0xff)
-                .map(|range| CharacterRange::new(range.start.max(0x100), range.end))
-                .collect();
-            return Some(FirstUnits { latin1, wide });
+            touches
+        });
+        if ranges.iter().any(|range| range.end > limit) {
+            return None;
         }
-        None
+        let mut latin1 = [0u64; 4];
+        for range in &ranges {
+            for unit in range.start..=range.end.min(0xff) {
+                latin1[(unit >> 6) as usize] |= 1 << (unit & 63);
+            }
+        }
+        let wide = ranges
+            .iter()
+            .filter(|range| range.end > 0xff)
+            .map(|range| CharacterRange::new(range.start.max(0x100), range.end))
+            .collect::<Box<[_]>>();
+        let single = match ranges.as_slice() {
+            [range] if range.start == range.end => u16::try_from(range.start).ok(),
+            _ => None,
+        };
+        Some(FirstUnits {
+            latin1,
+            wide,
+            single,
+        })
+    }
+
+    /// The offset of the first unit of `units` a match can start with.
+    #[inline]
+    pub(super) fn find<T: Copy + Into<u16>>(&self, units: &[T]) -> Option<usize> {
+        match self.single {
+            Some(unit) => find_unit(units, unit),
+            None => units.iter().position(|&unit| self.contains(unit.into())),
+        }
     }
 
     pub(super) fn owned_bytes(&self) -> usize {
@@ -1337,6 +1483,100 @@ impl FirstUnits {
             range_contains(&self.wide, u32::from(unit))
         }
     }
+}
+
+/// Adds to `out` the characters the program from `pc` can start a match
+/// with ([`FirstUnits`]); `None` when it cannot tell or a match can start
+/// with any (or no) character.
+fn first_ranges(
+    instructions: &[Instruction],
+    mut pc: usize,
+    out: &mut Vec<CharacterRange>,
+) -> Option<()> {
+    // A loop with no minimum adds its body and goes on: a few at most.
+    for _ in 0..8 {
+        let instruction = instructions.get(pc)?;
+        let body = match instruction {
+            Instruction::SaveStart { .. }
+            | Instruction::SaveEnd { .. }
+            | Instruction::ResetCaptures { .. }
+            | Instruction::SetRegister { .. } => {
+                pc += 1;
+                continue;
+            }
+            Instruction::CharLoop { min, .. } => {
+                let body = instructions.get(pc + 1)?;
+                if *min > 0 {
+                    return push_positive_set(body, out);
+                }
+                push_positive_set(body, out)?;
+                pc += 2;
+                continue;
+            }
+            body => body,
+        };
+        return push_positive_set(body, out);
+    }
+    None
+}
+
+/// Adds the set of a case-sensitive character, positive class or `\s` to
+/// `out`; `None` for any other instruction.
+fn push_positive_set(instruction: &Instruction, out: &mut Vec<CharacterRange>) -> Option<()> {
+    match instruction {
+        Instruction::Char {
+            value,
+            ignore_case: false,
+        } => out.push(CharacterRange::new(*value, *value)),
+        Instruction::Range {
+            ranges,
+            inverted: false,
+            ignore_case: false,
+        } => out.extend_from_slice(ranges),
+        Instruction::Space { inverted: false } => {
+            for (start, end) in [
+                (0x09, 0x0d),
+                (0x20, 0x20),
+                (0xa0, 0xa0),
+                (0x1680, 0x1680),
+                (0x2000, 0x200a),
+                (0x2028, 0x2029),
+                (0x202f, 0x202f),
+                (0x205f, 0x205f),
+                (0x3000, 0x3000),
+                (0xfeff, 0xfeff),
+            ] {
+                out.push(CharacterRange::new(start, end));
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// The offset of the first `unit` in `units`, sixteen at a time: each
+/// block's compare is one branch-free reduction.
+#[inline]
+fn find_unit<T: Copy + Into<u16>>(units: &[T], unit: u16) -> Option<usize> {
+    const LANES: usize = 16;
+    let mut chunks = units.chunks_exact(LANES);
+    let mut base = 0;
+    for chunk in &mut chunks {
+        if chunk.iter().fold(false, |found, &candidate| {
+            found | (candidate.into() == unit)
+        }) {
+            return chunk
+                .iter()
+                .position(|&candidate| candidate.into() == unit)
+                .map(|offset| base + offset);
+        }
+        base += LANES;
+    }
+    chunks
+        .remainder()
+        .iter()
+        .position(|&candidate| candidate.into() == unit)
+        .map(|offset| base + offset)
 }
 
 fn range_contains(ranges: &[CharacterRange], character: u32) -> bool {
@@ -1757,6 +1997,171 @@ mod tests {
             complete_range(execute(&advances, &units("x"), 0).unwrap()),
             Some(0..1)
         );
+    }
+
+    /// Compiled with character loops and without (QuickJS's split loops),
+    /// a pattern finds the same match and captures.
+    fn with_and_without_loops(
+        pattern: &str,
+        flags: &str,
+    ) -> Option<(CompiledRegExp, CompiledRegExp)> {
+        let compile = |on: bool| {
+            super::super::compiler::CHAR_LOOPS.with(|loops| loops.set(on));
+            let compiled = super::super::compiler::compile_units(&units(pattern), &units(flags));
+            super::super::compiler::CHAR_LOOPS.with(|loops| loops.set(true));
+            compiled.ok()
+        };
+        Some((compile(true)?, compile(false)?))
+    }
+
+    fn assert_same_matches(pattern: &str, flags: &str, inputs: &[Vec<u16>]) {
+        let Some((loops, splits)) = with_and_without_loops(pattern, flags) else {
+            return;
+        };
+        for input in inputs {
+            for start in 0..=input.len() {
+                let expected = execute(&splits, input, start);
+                assert_eq!(
+                    execute(&loops, input, start),
+                    expected,
+                    "/{pattern}/{flags} on {:?} from {start}",
+                    String::from_utf16_lossy(input)
+                );
+                if let Some(bytes) = input
+                    .iter()
+                    .map(|&unit| u8::try_from(unit).ok())
+                    .collect::<Option<Vec<u8>>>()
+                {
+                    assert_eq!(
+                        execute_latin1_with_interrupt(&loops, &bytes, start, || false),
+                        expected,
+                        "/{pattern}/{flags} on Latin-1 {:?} from {start}",
+                        String::from_utf16_lossy(input)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn character_loops_match_as_split_loops_do() {
+        let mut inputs = [
+            "",
+            "12345.6",
+            "a1b2::c",
+            "aaab",
+            "ab ab\nab",
+            "2026-11-08 10:00:01 ERROR Find: 404\n",
+            "x\u{1F600}\u{1F600}y",
+            "AaBb",
+            "::1:",
+        ]
+        .map(units)
+        .to_vec();
+        // Lone and paired surrogates.
+        inputs.push(vec![
+            0xd83d,
+            u16::from(b'a'),
+            0xde00,
+            0xd83d,
+            0xde00,
+            0xde00,
+        ]);
+        for (pattern, flags) in [
+            // zipp's counterexample to skipping a failed loop's run.
+            (r"(\d{1,3})\.", ""),
+            (r"\d*:", ""),
+            (r"ERROR (\w+): (\d+)", ""),
+            (r"\d*1", ""),
+            (r"(a*)ab", ""),
+            (r"a{2,3}a", ""),
+            (r"a{2,3}?a", ""),
+            (r".*x", ""),
+            (r".+y", "u"),
+            (r".+\u{DE00}", "u"),
+            (r"[^a]*a", "u"),
+            (r"\S+\s", ""),
+            (r"(?=(\d+))\d", ""),
+            (r"(?!\d+:)\d", ""),
+            (r"(?<=a+)b", ""),
+            (r"(\w+)\s\1", ""),
+            (r"a+$", "m"),
+            (r"b+$", ""),
+            (r"^\w*", "m"),
+            (r"a*B", "i"),
+            (r"[a-c]+B", "i"),
+            (r"(?:x\d+|y):", ""),
+            (r"\d{3,}", ""),
+            (r"\d{0}a", ""),
+            (r"(?:a|\d+)+:", ""),
+        ] {
+            assert_same_matches(pattern, flags, &inputs);
+        }
+    }
+
+    #[test]
+    fn random_patterns_match_as_split_loops_do() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        const ATOMS: [&str; 14] = [
+            "a", "b", "1", ":", ".", r"\d", r"\w", r"\s", r"\S", "[ab]", "[^a]", r"\b", "$", "^",
+        ];
+        const QUANTIFIERS: [&str; 10] = ["", "", "*", "+", "?", "{2}", "{1,2}", "{2,}", "*?", "+?"];
+        const FLAGS: [&str; 5] = ["", "i", "m", "u", "s"];
+        const ALPHABET: [&str; 7] = ["a", "b", "1", ":", " ", "\n", "A"];
+        let mut inputs = Vec::new();
+        for _ in 0..12 {
+            let length = next(9);
+            inputs.push(units(
+                &(0..length)
+                    .map(|_| ALPHABET[next(ALPHABET.len())])
+                    .collect::<String>(),
+            ));
+        }
+        for _ in 0..2000 {
+            let mut pattern = String::new();
+            for term in 0..1 + next(4) {
+                if term > 0 && next(6) == 0 {
+                    pattern.push('|');
+                }
+                let atom = match next(8) {
+                    0 => format!("({}{})", ATOMS[next(ATOMS.len())], QUANTIFIERS[next(4)]),
+                    1 => format!(
+                        "(?:{}|{})",
+                        ATOMS[next(ATOMS.len())],
+                        ATOMS[next(ATOMS.len())]
+                    ),
+                    2 => format!("(?={})", ATOMS[next(ATOMS.len())]),
+                    _ => ATOMS[next(ATOMS.len())].to_owned(),
+                };
+                pattern.push_str(&atom);
+                pattern.push_str(QUANTIFIERS[next(QUANTIFIERS.len())]);
+            }
+            assert_same_matches(&pattern, FLAGS[next(FLAGS.len())], &inputs);
+        }
+    }
+
+    #[test]
+    fn first_units_take_a_loop_and_its_follower() {
+        let first = |pattern: &str| compile(pattern, "").first_units().cloned();
+        let digits_or_colon = first(r"\d*:").unwrap();
+        for unit in "0123456789:".encode_utf16() {
+            assert!(digits_or_colon.contains(unit));
+        }
+        assert!(!digits_or_colon.contains(u16::from(b'a')));
+        assert_eq!(first(r"\d+x").unwrap().find(&units("ab7x")), Some(2));
+        assert_eq!(first("E+RROR").unwrap().single, Some(u16::from(b'E')));
+        assert_eq!(first("ERROR").unwrap().find(&units(&"x".repeat(40))), None);
+        let long = format!("{}E", "x".repeat(37));
+        assert_eq!(first("ERROR").unwrap().find(long.as_bytes()), Some(37));
+        // A loop with no minimum before the end can match anywhere.
+        assert_eq!(first(r"\d*"), None);
+        assert_eq!(first(r"a*b*"), None);
     }
 
     #[test]
