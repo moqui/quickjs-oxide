@@ -25,8 +25,16 @@ impl PropertyKey {
     /// The key of the string `text` (an index when `text` is one's
     /// canonical form, as `ToPropertyKey` reads it).
     pub fn from_js_string(text: JsString) -> Self {
-        let units: Vec<u16> = text.utf16_units().collect();
-        match canonical_index(&units) {
+        // an index has at most 10 digits: a longer string is no index, and a
+        // shorter one is checked without a copy
+        if text.len() > 10 {
+            return PropertyKey(Key::String(text));
+        }
+        let mut units = [0u16; 10];
+        for (slot, unit) in units.iter_mut().zip(text.utf16_units()) {
+            *slot = unit;
+        }
+        match canonical_index(&units[..text.len()]) {
             Some(index) => PropertyKey(Key::Index(index)),
             None => PropertyKey(Key::String(text)),
         }

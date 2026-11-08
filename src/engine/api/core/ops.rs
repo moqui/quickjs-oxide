@@ -207,10 +207,16 @@ impl View<'_> {
                 },
                 Ok,
             )?,
-            Key::String(text) => {
-                let units: Vec<u16> = text.utf16_units().collect();
-                self.core.key_from_units(&units)?
-            }
+            // A flat string is read in place: a key whose atom exists costs
+            // a lookup and no allocation.
+            Key::String(text) => match (text.flat_latin1(), text.flat_utf16()) {
+                (Some(bytes), _) => self.core.key_from_latin1(bytes)?,
+                (_, Some(units)) => self.core.key_from_units(units)?,
+                _ => {
+                    let units: Vec<u16> = text.utf16_units().collect();
+                    self.core.key_from_units(&units)?
+                }
+            },
             // The symbol's handle roots it.
             Key::Symbol(symbol) => {
                 let value = self.own(&symbol.slot)?;

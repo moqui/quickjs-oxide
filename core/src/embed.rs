@@ -553,6 +553,12 @@ impl NativeCx<'_> {
         self.heap.property_key_units(units)
     }
 
+    /// The key of the Latin-1 string `bytes`: no allocation when its atom
+    /// exists.
+    pub fn key_from_latin1(&mut self, bytes: &[u8]) -> Result<PropertyKey, HeapError> {
+        self.heap.property_key_latin1(bytes)
+    }
+
     /// The key of a symbol value; `None` for any other value.
     pub fn key_from_symbol(&self, symbol: Value) -> Option<PropertyKey> {
         symbol.as_symbol().map(PropertyKey::symbol)
