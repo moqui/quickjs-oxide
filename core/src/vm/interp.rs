@@ -388,8 +388,11 @@ pub(crate) fn set_function_name(
         // A unit named where its closure is created already holds the name:
         // a named function keeps it unless `always`, and a method's is its
         // key.
-        let bytecode = cx.heap.function_bytecode(function).expect("a closure");
-        let pending = cx.unit(cx.heap.bytecode_unit(bytecode)).name_atom;
+        // A pending builtin native is materialized first.
+        let pending = match cx.heap.function_bytecode(function) {
+            Some(bytecode) => cx.unit(cx.heap.bytecode_unit(bytecode)).name_atom,
+            None => None,
+        };
         match pending {
             Some(name) if !always && cx.heap.string_len(name) > 0 => return Ok(()),
             Some(name) if prefix.is_empty() && key == PropertyKey::atom(name) => return Ok(()),
@@ -1177,10 +1180,9 @@ pub(crate) fn materialize_closure(
     function: ObjectId,
     prototype: Option<Value>,
 ) -> Result<(), Throw> {
-    let bytecode = cx
-        .heap
-        .function_bytecode(function)
-        .expect("a bytecode closure");
+    let Some(bytecode) = cx.heap.function_bytecode(function) else {
+        return materialize_native(cx, function);
+    };
     let unit = cx.unit(cx.heap.bytecode_unit(bytecode));
     let mark = cx.heap.roots().mark();
     cx.heap.roots().push(Value::object(function));
@@ -1190,6 +1192,48 @@ pub(crate) fn materialize_closure(
     let result = closure_properties(cx, function, &unit, prototype);
     cx.heap.roots().truncate(mark);
     result
+}
+
+/// [`materialize_closure`] for a builtin native made pending
+/// ([`crate::builtins`]' `native_pending`): its `length` and `name` from the
+/// native table, in the plain closure's shape.
+fn materialize_native(cx: &mut Cx<'_>, function: ObjectId) -> Result<(), Throw> {
+    let index = cx.heap.function_record(function).native;
+    let native = Native::from_index(index).expect("a builtin native");
+    let names = cx.realm.names;
+    let name = Value::string(cx.heap.native_name(index).unwrap_or(names.empty));
+    let length = native.length();
+    let mark = cx.heap.roots().mark();
+    cx.heap.roots().push(Value::object(function));
+    let result = native_properties(cx, function, name, length);
+    cx.heap.roots().truncate(mark);
+    result.map_err(|error| error::heap_error(cx, error))
+}
+
+fn native_properties(
+    cx: &mut Cx<'_>,
+    function: ObjectId,
+    name: Value,
+    length: u32,
+) -> Result<(), crate::HeapError> {
+    // The plain closure's shape index (`closure_kind`).
+    const PLAIN: usize = 0;
+    cx.heap.unpend_closure(function, 2)?;
+    let function_prototype = cx.heap.prototype_of(function);
+    let values = [Value::int32(length as i32), name];
+    match cx.heap.closure_shapes[PLAIN] {
+        Some(shape) if cx.heap.prototype_of_shape(shape) == function_prototype => {
+            cx.heap.apply_closure_shape(function, shape, &values);
+        }
+        _ => {
+            let names = cx.realm.names;
+            crate::builtins::define_name_length(cx.heap, &names, function, name, length)?;
+            if !cx.heap.is_dictionary(function) {
+                cx.heap.closure_shapes[PLAIN] = Some(cx.heap.shape_of(function));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn closure_properties(

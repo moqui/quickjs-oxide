@@ -548,8 +548,12 @@ fn a_compile_past_the_heap_cap_is_out_of_memory() {
         context.eval("var keep = []; for (;;) keep.push({ a: keep.length });"),
         Err(RuntimeError::OutOfMemory)
     );
+    // The fill stops at the first arena growth past the cap, which can leave
+    // a few MiB of the 8 free (2.4 MiB once the builtin natives' `length`
+    // and `name` were made pending): a compile of this size needs about
+    // 4.8 MiB, more than such a remainder.
     let mut source = String::from("(function () { var out = 0;\n");
-    for line in 0..4000 {
+    for line in 0..16000 {
         source.push_str(&format!("out += {line} * 2 + (out > {line} ? 1 : 0);\n"));
     }
     source.push_str("return out; })");

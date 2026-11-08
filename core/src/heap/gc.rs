@@ -563,7 +563,12 @@ impl Heap {
                 .iter()
                 .map(|frame| Value::object(frame.function)),
         );
-        for &id in self.pinned_atoms.iter().chain(&self.held_atoms) {
+        for &id in self
+            .pinned_atoms
+            .iter()
+            .chain(&self.held_atoms)
+            .chain(self.native_names.iter().flatten())
+        {
             self.strings.mark(id.0);
         }
         for &id in self

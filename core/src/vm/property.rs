@@ -80,7 +80,21 @@ pub(crate) fn pending_value(
     function: ObjectId,
     key: PropertyKey,
 ) -> Option<Value> {
-    let unit = units.get(heap.bytecode_unit(heap.function_bytecode(function)?));
+    let Some(bytecode) = heap.function_bytecode(function) else {
+        // A pending builtin native: its table's.
+        let index = heap.function_record(function).native;
+        let native = crate::builtins::Native::from_index(index)?;
+        return if key == Names::key(names.length) {
+            Some(Value::int32(native.length() as i32))
+        } else if key == Names::key(names.name) {
+            Some(Value::string(
+                heap.native_name(index).unwrap_or(names.empty),
+            ))
+        } else {
+            None
+        };
+    };
+    let unit = units.get(heap.bytecode_unit(bytecode));
     if key == Names::key(names.length) {
         Some(Value::int32(i32::from(unit.length)))
     } else if key == Names::key(names.name) {

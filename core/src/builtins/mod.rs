@@ -947,6 +947,57 @@ fn native_named(
     Ok(function)
 }
 
+/// A native function object named by the table, left on the root stack,
+/// with its `length` and `name` pending: the plain closures' pending shape,
+/// over no slots, the values read from the table (the name's atom kept in
+/// [`crate::Heap::native_name`]) until an own-property operation first
+/// needs them ([`crate::vm::interp::materialize_closure`]). Only for a
+/// native whose properties nothing else adds or reconfigures through the
+/// heap directly: a method, not a constructor installed with its members.
+fn native_pending(
+    cx: &mut Cx<'_>,
+    native: Native,
+    data: Option<ObjectId>,
+) -> Result<ObjectId, HeapError> {
+    let name = native.js_name();
+    let index = native.index() as usize;
+    if !name.is_empty() && cx.heap.native_name(native.index()).is_none() {
+        let atom = cx.heap.intern(name)?;
+        let table = &mut cx.heap.native_names;
+        if table.len() <= index {
+            table.resize(Native::ALL.len().max(index + 1), None);
+        }
+        table[index] = Some(atom);
+    }
+    let prototype = cx.realm.intrinsic(Intrinsic::FunctionPrototype);
+    let function = cx
+        .heap
+        .alloc_native_closure_with(Some(prototype), native.index(), data, 0)?;
+    cx.heap.roots().push(Value::object(function));
+    if native.is_constructor() {
+        cx.heap
+            .set_object_flag(function, crate::heap::object::flags::CONSTRUCTOR);
+    }
+    // The plain closure's: `length` then `name`, over `%Function.prototype%`.
+    const PLAIN: usize = 0;
+    match cx.heap.pending_closure_shapes[PLAIN] {
+        Some(shape) if cx.heap.prototype_of_shape(shape) == Some(prototype) => {
+            cx.heap.apply_pending_shape(function, shape);
+        }
+        _ => {
+            let names = cx.realm.names;
+            let flags = PropertyFlags::data(false, false, true);
+            let entries = [
+                (Names::key(names.length), flags),
+                (Names::key(names.name), flags),
+            ];
+            let shape = cx.heap.pending_closure_shape(function, &entries)?;
+            cx.heap.pending_closure_shapes[PLAIN] = Some(shape);
+        }
+    }
+    Ok(function)
+}
+
 /// A native function object with its table name and length, left on the
 /// root stack.
 fn native_function(cx: &mut Cx<'_>, native: Native) -> Result<ObjectId, HeapError> {
@@ -963,7 +1014,7 @@ pub(crate) fn native_closure(
 ) -> Result<ObjectId, Throw> {
     let mark = cx.heap.roots().mark();
     cx.heap.roots().push(Value::object(data));
-    let result = native_named(cx, native, native.js_name(), Some(data));
+    let result = native_pending(cx, native, Some(data));
     cx.heap.roots().truncate(mark);
     result.map_err(|error| vm_error::heap_error(cx, error))
 }
@@ -987,7 +1038,7 @@ pub(crate) fn native_data(cx: &mut Cx<'_>, slots: &[Value]) -> Result<ObjectId, 
 /// table name.
 fn methods(cx: &mut Cx<'_>, object: ObjectId, list: &[Native]) -> Result<(), HeapError> {
     for &native in list {
-        let function = native_function(cx, native)?;
+        let function = native_pending(cx, native, None)?;
         define(
             cx,
             object,
@@ -1008,7 +1059,7 @@ fn symbol_method(
     native: Native,
     flags: PropertyFlags,
 ) -> Result<(), HeapError> {
-    let function = native_function(cx, native)?;
+    let function = native_pending(cx, native, None)?;
     define_key(
         cx,
         object,
