@@ -2142,3 +2142,14 @@ fn plain_objects_are_made_and_read_in_one_step() {
         );
     }
 }
+
+#[test]
+fn an_index_key_is_read_as_a_number() {
+    use quickjs_oxide::engine::api::core::PropertyKey;
+    let key = |text: &str| PropertyKey::from_js_string(JsString::try_from_utf8(text).unwrap());
+    assert_eq!(key("7").as_index(), Some(7));
+    assert_eq!(PropertyKey::index(42).as_index(), Some(42));
+    for text in ["07", "x", "", "4294967295", "-1"] {
+        assert_eq!(key(text).as_index(), None, "{text}");
+    }
+}

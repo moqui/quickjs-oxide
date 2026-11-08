@@ -48,6 +48,15 @@ impl PropertyKey {
         }
     }
 
+    /// The array index the key is, with no string made; `None` for a
+    /// string that is no index's canonical form, or a symbol.
+    pub fn as_index(&self) -> Option<u32> {
+        match &self.0 {
+            Key::Index(index) => Some(*index),
+            _ => None,
+        }
+    }
+
     pub fn as_symbol(&self) -> Option<&SymbolRef> {
         match &self.0 {
             Key::Symbol(symbol) => Some(symbol),
