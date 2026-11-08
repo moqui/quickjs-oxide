@@ -529,6 +529,41 @@ fn a_heap_cap_surfaces_as_out_of_memory() {
     );
 }
 
+/// A compile that runs out of heap while it lowers the code fails with the
+/// cap's `OutOfMemory`, as one that runs out while it parses does, not as an
+/// internal error: an embedder that frees memory and tries again tells them
+/// apart by it.
+#[test]
+#[cfg_attr(
+    feature = "gc-stress",
+    ignore = "a collection at every allocation makes filling 8 MiB take minutes"
+)]
+fn a_compile_past_the_heap_cap_is_out_of_memory() {
+    let runtime = Runtime::with_options(RuntimeOptions {
+        heap: HeapLimits { max_bytes: 8 << 20 },
+        ..RuntimeOptions::default()
+    });
+    let context = runtime.context();
+    assert_eq!(
+        context.eval("var keep = []; for (;;) keep.push({ a: keep.length });"),
+        Err(RuntimeError::OutOfMemory)
+    );
+    let mut source = String::from("(function () { var out = 0;\n");
+    for line in 0..4000 {
+        source.push_str(&format!("out += {line} * 2 + (out > {line} ? 1 : 0);\n"));
+    }
+    source.push_str("return out; })");
+    let compiled = context.compile_with_options(
+        &source,
+        &quickjs_oxide::engine::api::core::CompileOptions::new("big.js").transient(),
+    );
+    assert!(
+        matches!(compiled, Err(RuntimeError::OutOfMemory)),
+        "{:?}",
+        compiled.err()
+    );
+}
+
 #[test]
 fn memory_report_counts_a_known_graph() {
     let (runtime, context) = runtime();

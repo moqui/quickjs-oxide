@@ -721,6 +721,13 @@ impl Runtime {
             Err(super::compile::ScriptCompileError::Front(error)) => {
                 return Err(RuntimeError::Compile(error));
             }
+            Err(super::compile::ScriptCompileError::Lower(
+                crate::engine::compiler::register::LowerError::Heap(
+                    oxide_core::HeapError::OutOfMemory,
+                ),
+            )) => {
+                return Err(RuntimeError::OutOfMemory);
+            }
             Err(super::compile::ScriptCompileError::Lower(error)) => {
                 return Err(RuntimeError::Internal(error.to_string()));
             }
