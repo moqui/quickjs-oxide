@@ -823,6 +823,15 @@ impl View<'_> {
         self.complete_with(result)
     }
 
+    /// Whether `object` is ordinary: no Proxy traps, no embedder hooks, no
+    /// other exotic internal methods. Reading an ordinary object's own
+    /// properties, keys and prototype runs no code (its accessors run only
+    /// when called), so an embedder may walk one with its own state borrowed.
+    pub(crate) fn is_ordinary_object(&mut self, object: &ObjectRef) -> JsResult<bool> {
+        let id = self.object(object)?;
+        Ok(!self.core.object_kind(id).is_exotic())
+    }
+
     pub(crate) fn is_error_object(&mut self, object: &ObjectRef) -> JsResult<bool> {
         let value = self.own(&object.slot)?;
         Ok(self.core.is_error(value))
@@ -1428,6 +1437,9 @@ js_ops! {
     /// `IsArray`.
     fn is_array_object(&mut self, object: &ObjectRef) -> JsResult<bool>;
     fn is_error_object(&mut self, object: &ObjectRef) -> JsResult<bool>;
+    /// Whether the object has no exotic internal methods (no Proxy, no host
+    /// hooks): reading its own properties and prototype runs no code.
+    fn is_ordinary_object(&mut self, object: &ObjectRef) -> JsResult<bool>;
 
     // ---- conversions and printing ----
 

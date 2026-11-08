@@ -2001,3 +2001,29 @@ fn call_and_construct_pass_every_argument_few_or_many() {
         );
     }
 }
+
+#[test]
+fn ordinary_objects_are_told_from_exotic_ones() {
+    let (runtime, context) = runtime();
+    let object_of = |text: &str| match context.eval(text).unwrap() {
+        Value::Object(object) => object,
+        other => panic!("not an object: {other:?}"),
+    };
+    for text in [
+        "({a: 1})",
+        "[1, 2]",
+        "(function () {})",
+        "({get a() { return 1 }})",
+    ] {
+        assert!(
+            runtime.is_ordinary_object(&object_of(text)).unwrap(),
+            "{text}"
+        );
+    }
+    for text in ["new Proxy({}, {})", "new String('s')", "new Uint8Array(2)"] {
+        assert!(
+            !runtime.is_ordinary_object(&object_of(text)).unwrap(),
+            "{text}"
+        );
+    }
+}
