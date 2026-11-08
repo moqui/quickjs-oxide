@@ -1264,26 +1264,47 @@ fn replace_pristine(
     if matches.is_empty() {
         return Ok(Value::string(string));
     }
-    let text = units(cx, string);
-    let mut accumulated: Vec<u16> = Vec::with_capacity(text.len());
-    let mut next_position = 0usize;
     // A replacement without `$` is copied as is.
     let literal = replacement
         .as_ref()
         .filter(|replacement| !replacement.contains(&u16::from(b'$')));
+    // The subject's units, for a `$` substitution only; the rest copies from
+    // the subject where it lies.
+    let text = match (&replacement, literal) {
+        (Some(_), None) => Some(units(cx, string)),
+        _ => None,
+    };
+    let subject_len = cx.heap.string_len(string);
+    let mut accumulated = Joined::with_capacity(subject_len);
+    let mut next_position = 0usize;
     for found in matches {
         let captures = found.captures();
         let range = captures[0].clone().unwrap_or(0..0);
         if let Some(literal) = literal {
             if range.start >= next_position {
-                accumulated.extend_from_slice(&text[next_position..range.start]);
-                accumulated.extend_from_slice(literal);
+                accumulated.push_subject(cx, string, next_position..range.start);
+                accumulated.push_units(literal);
                 next_position = range.end;
             }
             continue;
         }
-        let replaced: Vec<u16> = match &replacement {
-            None => {
+        let replaced: Vec<u16> = match (&replacement, &text) {
+            (Some(replacement), Some(text)) => {
+                let capture_units: Vec<Option<Vec<u16>>> = captures[1..]
+                    .iter()
+                    .map(|capture| capture.as_ref().map(|range| text[range.clone()].to_vec()))
+                    .collect();
+                substitute_with_groups(
+                    cx,
+                    text,
+                    range.start,
+                    &text[range.clone()],
+                    &capture_units,
+                    None,
+                    replacement,
+                )?
+            }
+            _ => {
                 let mark = cx.heap.roots().mark();
                 let mut args = Vec::with_capacity(captures.len() + 2);
                 for capture in captures {
@@ -1299,37 +1320,100 @@ fn replace_pristine(
                 let value = crate::vm::call(cx, replace_value, Value::UNDEFINED, &args);
                 cx.heap.roots().truncate(mark);
                 let value = to_string_id(cx, value?)?;
-                units(cx, value)
-            }
-            Some(replacement) => {
-                let capture_units: Vec<Option<Vec<u16>>> = captures[1..]
-                    .iter()
-                    .map(|capture| capture.as_ref().map(|range| text[range.clone()].to_vec()))
-                    .collect();
-                substitute_with_groups(
-                    cx,
-                    &text,
-                    range.start,
-                    &text[range.clone()],
-                    &capture_units,
-                    None,
-                    replacement,
-                )?
+                if range.start >= next_position {
+                    accumulated.push_subject(cx, string, next_position..range.start);
+                    accumulated.push_string(cx, value);
+                    next_position = range.end;
+                }
+                if accumulated.len() > super::string::MAX_STRING {
+                    return Err(error::string_too_long(cx));
+                }
+                continue;
             }
         };
         if range.start >= next_position {
-            accumulated.extend_from_slice(&text[next_position..range.start]);
-            accumulated.extend(replaced);
+            accumulated.push_subject(cx, string, next_position..range.start);
+            accumulated.push_units(&replaced);
             next_position = range.end;
         }
         if accumulated.len() > super::string::MAX_STRING {
             return Err(error::string_too_long(cx));
         }
     }
-    if next_position < text.len() {
-        accumulated.extend_from_slice(&text[next_position..]);
+    if next_position < subject_len {
+        accumulated.push_subject(cx, string, next_position..subject_len);
     }
-    string_units(cx, &accumulated)
+    accumulated.finish(cx)
+}
+
+/// A replace's result: bytes while every unit fits in one, else UTF-16, so a
+/// Latin-1 subject with Latin-1 replacements is never widened and narrowed
+/// again.
+enum Joined {
+    Bytes(Vec<u8>),
+    Units(Vec<u16>),
+}
+
+impl Joined {
+    fn with_capacity(capacity: usize) -> Self {
+        Joined::Bytes(Vec::with_capacity(capacity))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Joined::Bytes(bytes) => bytes.len(),
+            Joined::Units(units) => units.len(),
+        }
+    }
+
+    fn widen(&mut self) -> &mut Vec<u16> {
+        if let Joined::Bytes(bytes) = self {
+            let mut units = Vec::with_capacity(bytes.capacity().max(bytes.len() * 2));
+            units.extend(bytes.iter().map(|&byte| u16::from(byte)));
+            *self = Joined::Units(units);
+        }
+        match self {
+            Joined::Units(units) => units,
+            Joined::Bytes(_) => unreachable!("widened above"),
+        }
+    }
+
+    fn push_bytes(&mut self, part: &[u8]) {
+        match self {
+            Joined::Bytes(bytes) => bytes.extend_from_slice(part),
+            Joined::Units(units) => units.extend(part.iter().map(|&byte| u16::from(byte))),
+        }
+    }
+
+    fn push_units(&mut self, part: &[u16]) {
+        if let Joined::Bytes(bytes) = self
+            && part.iter().all(|&unit| unit <= 0xFF)
+        {
+            bytes.extend(part.iter().map(|&unit| unit as u8));
+            return;
+        }
+        self.widen().extend_from_slice(part);
+    }
+
+    /// Units `range` of the string `id`, copied from where they lie.
+    fn push_subject(&mut self, cx: &Cx<'_>, id: StringId, range: std::ops::Range<usize>) {
+        match cx.heap.string(id).repr() {
+            StringRepr::OneByte(bytes) => self.push_bytes(&bytes[range]),
+            StringRepr::TwoByte(units) => self.push_units(&units[range]),
+        }
+    }
+
+    fn push_string(&mut self, cx: &Cx<'_>, id: StringId) {
+        let len = cx.heap.string_len(id);
+        self.push_subject(cx, id, 0..len);
+    }
+
+    fn finish(self, cx: &mut Cx<'_>) -> Result<Value, Throw> {
+        match self {
+            Joined::Bytes(bytes) => super::string_repr(cx, StringRepr::OneByte(bytes.into())),
+            Joined::Units(units) => string_units(cx, &units),
+        }
+    }
 }
 
 /// `GetSubstitution` with a `groups` object read for `$<name>`.
