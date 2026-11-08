@@ -601,6 +601,31 @@ fn symbol_rope_description_survives_collection_without_other_string_roots() {
 }
 
 #[test]
+fn one_character_strings_agree_on_every_path_and_survive_collection() {
+    let (runtime, context) = runtime();
+    context
+        .eval(
+            "var s = 'ab\\u00e9\\u03b1'; var parts = [s.charAt(0), s.at(1), s[2], s[3], \
+             String.fromCharCode(98), s.split('')[2], JSON.parse('[\"a\", \"\"]')[0], \
+             s.match(/(b)/)[1], s.slice(3), s.substring(1, 2), String(7), '' + 0, \
+             JSON.parse('\"\\u00e9\"')];",
+        )
+        .unwrap();
+    runtime.run_gc().unwrap();
+    runtime.run_gc().unwrap();
+    let result = context
+        .eval(
+            "[parts.join(','), parts[0] === 'a', parts[1] === parts[4], parts[2] === parts[5], \
+             parts[3] === '\\u03b1', s.split('').join('') === s].join(';')",
+        )
+        .unwrap();
+    assert_eq!(
+        text(&result),
+        "a,b,\u{e9},\u{3b1},b,\u{e9},a,b,\u{3b1},b,7,0,\u{e9};true;true;true;true;true"
+    );
+}
+
+#[test]
 fn execution_turns_and_the_stats_entries() {
     let (runtime, context) = runtime();
     context.eval("Promise.resolve().then(() => {})").unwrap();

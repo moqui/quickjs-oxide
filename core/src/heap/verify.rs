@@ -512,6 +512,14 @@ impl Heap {
                 );
             }
         }
+        for &id in self
+            .unit_strings
+            .iter()
+            .flat_map(|table| table.iter())
+            .flatten()
+        {
+            record(&self.strings, "string", id.0, format_args!("a unit string"));
+        }
         for shape in self
             .closure_shapes
             .iter()

@@ -179,10 +179,15 @@ impl Digits {
     }
 }
 
-/// A new string of `digits`.
+/// The string of `digits`: a single digit's is its unit string.
 pub(crate) fn alloc_digits(cx: &mut Cx<'_>, digits: &Digits) -> Result<Value, Throw> {
-    cx.heap
-        .alloc_string_repr(StringRepr::OneByte(digits.as_bytes().into()))
+    let result = match *digits.as_bytes() {
+        [digit] => cx.heap.unit_string(u16::from(digit)),
+        _ => cx
+            .heap
+            .alloc_string_repr(StringRepr::OneByte(digits.as_bytes().into())),
+    };
+    result
         .map(Value::string)
         .map_err(|error| heap_error(cx, error))
 }
@@ -524,10 +529,14 @@ pub(crate) fn to_string(cx: &mut Cx<'_>, value: Value) -> Result<Value, Throw> {
         Kind::Int32 => alloc_digits(cx, &Digits::new(value.as_int32().unwrap())),
         Kind::Number => {
             let text = number::text(value.as_f64().unwrap());
-            cx.heap
-                .alloc_string_repr(StringRepr::OneByte(text.as_bytes().into()))
-                .map(Value::string)
-                .map_err(|error| heap_error(cx, error))
+            match *text.as_bytes() {
+                [digit] => cx.heap.unit_string(u16::from(digit)),
+                _ => cx
+                    .heap
+                    .alloc_string_repr(StringRepr::OneByte(text.as_bytes().into())),
+            }
+            .map(Value::string)
+            .map_err(|error| heap_error(cx, error))
         }
         Kind::Bool => Ok(Value::string(if value == Value::TRUE {
             names.true_

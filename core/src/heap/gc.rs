@@ -566,6 +566,14 @@ impl Heap {
         for &id in self.pinned_atoms.iter().chain(&self.held_atoms) {
             self.strings.mark(id.0);
         }
+        for &id in self
+            .unit_strings
+            .iter()
+            .flat_map(|table| table.iter())
+            .flatten()
+        {
+            self.strings.mark(id.0);
+        }
         // Units published but not yet instantiated.
         for position in 0..self.code.pinned().len() {
             let index = self.code.pinned()[position];

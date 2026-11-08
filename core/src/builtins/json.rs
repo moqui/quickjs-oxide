@@ -271,7 +271,11 @@ impl<'a> Parser<'a> {
             }
             0x22 | 0x27 if unit == 0x22 || self.extended => {
                 let units = self.string()?;
-                ops::alloc_units(cx, &units)?
+                match *units {
+                    [] => Value::string(cx.realm.names.empty),
+                    [unit] => super::unit_string(cx, unit)?,
+                    _ => ops::alloc_units(cx, &units)?,
+                }
             }
             _ if self.starts_number(unit) => self.number()?,
             _ if is_identifier_start(unit) => {

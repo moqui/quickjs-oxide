@@ -223,7 +223,7 @@ fn string_index(
     let unit = repr.unit(index as usize);
     let text = cx
         .heap
-        .intern_units(&[unit])
+        .unit_string(unit)
         .map_err(|error| heap_error(cx, error))?;
     Ok(Some(Descriptor::data(
         Value::string(text),

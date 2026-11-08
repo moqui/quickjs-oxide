@@ -193,3 +193,25 @@ fn symbols_and_bigints_are_traced() {
         "no negative zero"
     );
 }
+
+#[test]
+fn unit_strings_are_atoms_kept_by_the_table() {
+    let mut heap = Heap::default();
+    heap.set_atom_mode(AtomMode::Weak);
+    let a = heap.unit_string(u16::from(b'a')).unwrap();
+    assert!(heap.string(a).is_atom);
+    assert_eq!(heap.intern("a").unwrap(), a);
+    let e_acute = heap.unit_string(0xE9).unwrap();
+    assert_eq!(heap.intern("\u{e9}").unwrap(), e_acute);
+    // Past Latin-1 the unit is interned as any atom.
+    let alpha = heap.unit_string(0x3B1).unwrap();
+    assert_eq!(heap.intern("\u{3b1}").unwrap(), alpha);
+    // Nothing else holds `a` or `é`: the table keeps them.
+    heap.collect();
+    heap.collect();
+    assert_eq!(heap.unit_string(u16::from(b'a')).unwrap(), a);
+    assert_eq!(heap.string_text(a), "a");
+    assert_eq!(heap.unit_string(0xE9).unwrap(), e_acute);
+    assert_eq!(heap.string_text(e_acute), "\u{e9}");
+    assert_eq!(heap.intern("a").unwrap(), a);
+}
