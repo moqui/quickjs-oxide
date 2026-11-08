@@ -1063,6 +1063,23 @@ fn host_objects_carry_the_embedders_value() {
     let datum = context.host_data::<Counter>(&counter).unwrap().unwrap();
     assert_eq!(datum.0.get(), 42);
     assert!(context.host_data::<Counter>(&prototype).unwrap().is_none());
+    // an argument's datum, read without a handle; anything else, or no argument, is none
+    let read = context
+        .new_function(FunctionOptions::new("read"), |scope: &mut Scope<'_>| {
+            Ok(match scope.arg_host_data::<Counter>(0)? {
+                Some(counter) => Value::Int(counter.0.get()),
+                None => Value::Null,
+            })
+        })
+        .unwrap();
+    let key = context.runtime().intern_property_key("read").unwrap();
+    context
+        .set_property(&global, &key, Value::Object(read.as_object().clone()))
+        .unwrap();
+    assert_eq!(context.eval("read(counter)").unwrap(), Value::Int(42));
+    assert_eq!(context.eval("read({})").unwrap(), Value::Null);
+    assert_eq!(context.eval("read(1)").unwrap(), Value::Null);
+    assert_eq!(context.eval("read()").unwrap(), Value::Null);
 }
 
 #[test]

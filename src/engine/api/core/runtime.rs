@@ -145,9 +145,15 @@ impl Shared {
         if self.released.borrow().is_empty() {
             return;
         }
-        let released = std::mem::take(&mut *self.released.borrow_mut());
-        for handle in released {
+        // drained in place and put back, so a host call that drops handles
+        // keeps the buffer's capacity for the next one
+        let mut released = std::mem::take(&mut *self.released.borrow_mut());
+        for handle in released.drain(..) {
             core.release(handle);
+        }
+        let mut kept = self.released.borrow_mut();
+        if kept.is_empty() {
+            *kept = released;
         }
     }
 }

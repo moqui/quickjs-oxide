@@ -115,11 +115,25 @@ impl Scope<'_> {
 
     /// The value a host object receiver holds ([`Js::host_data`](super::Js::host_data) of
     /// `this`); `None` when the receiver is not a host object of `T`.
+    /// Read from the call, with no handle made for the receiver.
     pub fn this_host_data<T: 'static>(&mut self) -> JsResult<Option<Rc<T>>> {
-        match self.this() {
-            Value::Object(object) => self.host_data::<T>(&object),
-            _ => Ok(None),
-        }
+        let this = self.call.this(&self.core);
+        Ok(self.raw_host_data(this))
+    }
+
+    /// The value a host object argument `index` holds; `None` when it is
+    /// not a host object of `T` (or is past [`Scope::argc`]). Read from the
+    /// call, with no handle made for the argument.
+    pub fn arg_host_data<T: 'static>(&mut self, index: usize) -> JsResult<Option<Rc<T>>> {
+        let arg = self.call.arg(&self.core, index);
+        Ok(self.raw_host_data(arg))
+    }
+
+    fn raw_host_data<T: 'static>(&self, value: oxide_core::Value) -> Option<Rc<T>> {
+        let object = value.as_object()?;
+        self.core
+            .host_data(object)
+            .and_then(|data: Rc<dyn std::any::Any>| data.downcast::<T>().ok())
     }
 }
 
