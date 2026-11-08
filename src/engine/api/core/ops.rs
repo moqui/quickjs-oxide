@@ -1444,6 +1444,32 @@ impl View<'_> {
         Ok(self.lift_object(object))
     }
 
+    /// The host datum of the value `[[Get]]` of `key` on the core object
+    /// `id` gives, with no handle made for that value.
+    pub(crate) fn raw_property_host_data<T: 'static>(
+        &mut self,
+        id: oxide_core::ObjectId,
+        key: &PropertyKey,
+    ) -> JsResult<Option<Rc<T>>> {
+        let key = self.key(key)?;
+        let result = self.core.get(id, key, oxide_core::Value::object(id));
+        let value = self.complete_with(result)?;
+        Ok(value.as_object().and_then(|found| {
+            self.core
+                .host_data(found)
+                .and_then(|data: Rc<dyn Any>| data.downcast::<T>().ok())
+        }))
+    }
+
+    pub(crate) fn property_host_data<T: 'static>(
+        &mut self,
+        object: &ObjectRef,
+        key: &PropertyKey,
+    ) -> JsResult<Option<Rc<T>>> {
+        let id = self.object(object)?;
+        self.raw_property_host_data(id, key)
+    }
+
     pub(crate) fn host_data<T: 'static>(&mut self, object: &ObjectRef) -> JsResult<Option<Rc<T>>> {
         let id = self.object(object)?;
         Ok(self
@@ -1813,6 +1839,10 @@ js_ops! {
     /// The value a host object or a host exotic object holds; `None` for
     /// an ordinary object or a value of another type.
     fn host_data[T: 'static](&mut self, object: &ObjectRef) -> JsResult<Option<Rc<T>>>;
+    /// The host datum of `object[key]` (a `[[Get]]`, which may run a
+    /// getter), with no handle made for the property's value; `None` when
+    /// the value is no host object of type `T`.
+    fn property_host_data[T: 'static](&mut self, object: &ObjectRef, key: &PropertyKey) -> JsResult<Option<Rc<T>>>;
 
     // ---- host exotic objects ----
 

@@ -144,6 +144,21 @@ impl Scope<'_> {
         })
     }
 
+    /// [`Js::property_host_data`](super::Js::property_host_data) of argument
+    /// `index`, with no handle made for the argument or the property's
+    /// value; `None` when the argument is not an object.
+    pub fn arg_property_host_data<T: 'static>(
+        &mut self,
+        index: usize,
+        key: &super::PropertyKey,
+    ) -> JsResult<Option<Rc<T>>> {
+        let arg = self.call.arg(&self.core, index);
+        let Some(object) = arg.as_object() else {
+            return Ok(None);
+        };
+        self.view().raw_property_host_data(object, key)
+    }
+
     fn raw_host_data<T: 'static>(&self, value: oxide_core::Value) -> Option<Rc<T>> {
         let object = value.as_object()?;
         self.core
