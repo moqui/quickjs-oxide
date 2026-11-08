@@ -358,7 +358,17 @@ pub(crate) fn parse(units: &[u16]) -> f64 {
         return 0.0;
     };
     let end = units.iter().rposition(|&unit| !is_space(unit)).unwrap() + 1;
-    let Ok(text) = String::from_utf16(&units[start..end]) else {
+    let units = &units[start..end];
+    // Short ASCII text is parsed from a stack copy.
+    let mut buffer = [0u8; 64];
+    if units.len() <= buffer.len() && units.iter().all(|&unit| unit < 0x80) {
+        for (byte, &unit) in buffer.iter_mut().zip(units) {
+            *byte = unit as u8;
+        }
+        let text = std::str::from_utf8(&buffer[..units.len()]).expect("ASCII");
+        return parse_trimmed(text);
+    }
+    let Ok(text) = String::from_utf16(units) else {
         return f64::NAN;
     };
     parse_trimmed(&text)
