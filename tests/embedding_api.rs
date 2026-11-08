@@ -2318,3 +2318,45 @@ fn a_plain_objects_properties_are_shown_with_strings_borrowed() {
         );
     }
 }
+
+#[test]
+fn nested_plain_objects_and_arrays_are_made_in_one_step() {
+    use quickjs_oxide::engine::api::core::{InitValue, PropertyKey};
+    let (runtime, context) = runtime();
+    let key = |text: &str| PropertyKey::from_js_string(JsString::try_from_utf8(text).unwrap());
+    let rows: Vec<InitValue<'_>> = (0..50)
+        .map(|index| {
+            InitValue::Object(vec![
+                (key("id"), InitValue::Text("row")),
+                (key("n"), Value::Int(index).into()),
+                (
+                    key("tags"),
+                    InitValue::Array(vec![InitValue::Text("a"), InitValue::Array(vec![])]),
+                ),
+            ])
+        })
+        .collect();
+    let made = runtime
+        .new_object_from(&[
+            (key("rows"), InitValue::Array(rows)),
+            (key("x"), InitValue::Object(vec![])),
+        ])
+        .unwrap();
+    // a collection after the call keeps what the one handle reaches
+    runtime.run_gc().unwrap();
+    let show = match context
+        .eval("(o) => o.rows.length + ' ' + o.rows[49].n + ' ' + JSON.stringify(o.rows[3]) + ' ' + JSON.stringify(o.x)")
+        .unwrap()
+    {
+        Value::Object(object) => runtime.as_callable(&object).unwrap().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        context
+            .call(&show, Value::Undefined, &[Value::Object(made)])
+            .unwrap(),
+        Value::String(
+            JsString::try_from_utf8(r#"50 49 {"id":"row","n":3,"tags":["a",[]]} {}"#).unwrap()
+        )
+    );
+}

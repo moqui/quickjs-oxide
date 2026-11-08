@@ -214,6 +214,12 @@ impl OrdinaryPropertyDescriptor {
 pub enum InitValue<'a> {
     Value(Value),
     Text(&'a str),
+    /// A plain object made as [`Js::new_object_from`](super::Js::new_object_from)
+    /// makes one, in the same crossing and with no handle of its own.
+    Object(Vec<(PropertyKey, InitValue<'a>)>),
+    /// An array made as [`Js::new_array_from_inits`](super::Js::new_array_from_inits)
+    /// makes one, in the same crossing and with no handle of its own.
+    Array(Vec<InitValue<'a>>),
 }
 
 impl From<Value> for InitValue<'_> {
