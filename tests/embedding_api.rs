@@ -2360,3 +2360,50 @@ fn nested_plain_objects_and_arrays_are_made_in_one_step() {
         )
     );
 }
+
+#[test]
+fn a_propertys_host_datum_is_read_with_no_handle() {
+    use quickjs_oxide::engine::api::core::{FunctionOptions, PropertyKey, Scope};
+    let (runtime, context) = runtime();
+    let key = PropertyKey::from_js_string(JsString::try_from_utf8("$held").unwrap());
+    let cx = runtime.context();
+    let held = cx.new_host_object(String::from("datum"), None).unwrap();
+    let holder = cx.new_object().unwrap();
+    cx.set_property(&holder, &key, Value::Object(held)).unwrap();
+    assert_eq!(
+        cx.property_host_data::<String>(&holder, &key)
+            .unwrap()
+            .as_deref()
+            .map(String::as_str),
+        Some("datum")
+    );
+    assert!(
+        cx.property_host_data::<i32>(&holder, &key)
+            .unwrap()
+            .is_none()
+    );
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let into = Rc::clone(&seen);
+    let read_key = key.clone();
+    let function = context
+        .new_function(
+            FunctionOptions::new("read"),
+            move |scope: &mut Scope<'_>| {
+                for index in 0..scope.argc() {
+                    let found = scope.arg_property_host_data::<String>(index, &read_key)?;
+                    into.borrow_mut().push(found.map(|text| (*text).clone()));
+                }
+                Ok(Value::Undefined)
+            },
+        )
+        .unwrap();
+    let other = cx.new_object().unwrap();
+    context
+        .call(
+            &function,
+            Value::Undefined,
+            &[Value::Object(holder), Value::Object(other), Value::Int(3)],
+        )
+        .unwrap();
+    assert_eq!(*seen.borrow(), [Some("datum".to_string()), None, None]);
+}
