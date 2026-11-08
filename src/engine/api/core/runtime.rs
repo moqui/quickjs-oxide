@@ -806,6 +806,11 @@ impl Runtime {
         self.engine()?.view().is_array_object(object)
     }
 
+    /// [`Js::is_ordinary_object`](super::Js::is_ordinary_object).
+    pub fn is_ordinary_object(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
+        self.engine()?.view().is_ordinary_object(object)
+    }
+
     pub fn is_error_object(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
         self.engine()?.view().is_error_object(object)
     }
