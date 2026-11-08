@@ -40,6 +40,9 @@ const DIGIT_CHARS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// thresholds; every other radix prints positionally.
 pub fn to_string_radix(value: f64, radix: u32) -> String {
     debug_assert!((2..=36).contains(&radix));
+    if radix == 10 {
+        return super::number::to_string(value);
+    }
     if value.is_nan() {
         return "NaN".into();
     }
@@ -56,8 +59,6 @@ pub fn to_string_radix(value: f64, radix: u32) -> String {
         // Every integer below 2^53 is a double, so no shorter digit string
         // can round-trip: the shortest digits are the exact ones.
         u64_digits(magnitude as u64, radix)
-    } else if radix == 10 {
-        place_free(decimal_sequence(magnitude), 10)
     } else {
         free_big(magnitude, radix)
     };
@@ -308,7 +309,7 @@ fn free_big(value: f64, radix: u32) -> String {
 /// step 5), which Rust's shortest formatting gives; QuickJS's choice stands
 /// when it is as short. Elsewhere the interval is symmetric, so the
 /// farther neighbor misses whenever the nearest does.
-fn decimal_sequence(value: f64) -> (String, i32) {
+pub(super) fn decimal_sequence(value: f64) -> (String, i32) {
     let power_of_two = value.to_bits() & ((1 << 52) - 1) == 0;
     let split = |text: &str| {
         let (mantissa, exponent) = text.split_once('e').expect("an exponent");
@@ -1028,6 +1029,115 @@ mod tests {
             let value = (lcg(&mut state) >> 11) as f64;
             for radix in [3, 7, 10, 36] {
                 assert_eq!(to_string_radix(value, radix), free_big(value, radix));
+            }
+        }
+    }
+
+    /// `Number::toString(10)` as it was before `number::text`: the walk of
+    /// [`decimal_sequence`] from 17 digits down for every value that is not
+    /// a safe integer.
+    fn walked_text(value: f64) -> String {
+        if value.is_nan() {
+            return "NaN".into();
+        }
+        if value.is_infinite() {
+            return if value > 0.0 { "Infinity" } else { "-Infinity" }.into();
+        }
+        if value.fract() == 0.0 && value.abs() < 9_007_199_254_740_992.0 {
+            return (value as i64).to_string();
+        }
+        let body = place_free(decimal_sequence(value.abs()), 10);
+        if value < 0.0 {
+            format!("-{body}")
+        } else {
+            body
+        }
+    }
+
+    /// The values whose text changes layout or path: every power of two, the
+    /// subnormal edges, zeros, the 1e21 and 1e-6 thresholds, the short and
+    /// safe-integer ranges' ends, and their neighbors.
+    fn edge_values() -> Vec<f64> {
+        let mut values = vec![0.0, f64::from_bits(1), f64::from_bits(2), f64::MAX];
+        values.push(f64::from_bits((1 << 52) - 1));
+        values.push(f64::MIN_POSITIVE);
+        for exponent in -1074..=1023 {
+            values.push(2f64.powi(exponent));
+        }
+        for anchor in [
+            1e21,
+            1e-6,
+            1e-7,
+            1e-5,
+            1e-4,
+            1e15,
+            1e16,
+            1e17,
+            9_007_199_254_740_992.0,
+            0.1,
+            0.5,
+            1.0,
+            2_251_799_813_685_248.0,
+        ] {
+            let bits = f64::to_bits(anchor);
+            for step in 0..4 {
+                values.push(f64::from_bits(bits + step));
+                values.push(f64::from_bits(bits - step));
+            }
+        }
+        for exponent in -330..=310 {
+            values.push(format!("1e{exponent}").parse().unwrap());
+            values.push(format!("5e{exponent}").parse().unwrap());
+        }
+        // Exact ties between two shortest strings, as 192181864906432.125.
+        values.push(f64::from_bits(0x42e5_d93a_7947_d804));
+        values.push(600_479_950_316_068.25);
+        values
+    }
+
+    fn assert_text_matches_walk(value: f64) {
+        for value in [value, -value] {
+            assert_eq!(
+                super::super::number::text(value).as_str(),
+                walked_text(value),
+                "{:#x}",
+                value.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn number_text_matches_the_walk_at_the_edges() {
+        for value in edge_values() {
+            assert_text_matches_walk(value);
+        }
+    }
+
+    /// The stack formatter against the walk over random doubles: raw bit
+    /// patterns, short decimals, binary fractions (where exact ties live)
+    /// and 17-digit values in the positional range. `NUMBER_TEXT_CASES`
+    /// sets the count (one million for the full check; the default is a
+    /// quick run).
+    #[test]
+    fn number_text_matches_the_walk_over_random_doubles() {
+        let cases: u64 = std::env::var("NUMBER_TEXT_CASES")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(40_000);
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for case in 0..cases {
+            let random = lcg(&mut state);
+            let value = match case % 4 {
+                0 => f64::from_bits(random & !(1 << 63)),
+                1 => (random >> 20) as f64 / 10f64.powi((random % 18) as i32),
+                2 => (random >> (11 + random % 40)) as f64 / 2f64.powi((random % 12) as i32 + 1),
+                _ => {
+                    let mantissa = (random >> 11) as f64 / 9_007_199_254_740_992.0;
+                    mantissa * 10f64.powi((lcg(&mut state) % 30) as i32 - 8)
+                }
+            };
+            if value.is_finite() {
+                assert_text_matches_walk(value);
             }
         }
     }

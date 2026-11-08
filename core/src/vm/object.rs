@@ -759,9 +759,9 @@ pub(crate) fn number_key(cx: &mut Cx<'_>, index: f64) -> Result<PropertyKey, Thr
     if (0.0..4294967295.0).contains(&index) && index.fract() == 0.0 {
         return index_key(cx, index as u32);
     }
-    let text = super::number::to_string(index);
+    let text = super::number::text(index);
     cx.heap
-        .property_key(&text)
+        .property_key(text.as_str())
         .map_err(|error| heap_error(cx, error))
 }
 
