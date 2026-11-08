@@ -45,6 +45,36 @@ impl Joined {
         }
     }
 
+    #[inline]
+    pub(crate) fn push_byte(&mut self, byte: u8) {
+        match self {
+            Joined::Bytes(bytes) => bytes.push(byte),
+            Joined::Units(units) => units.push(u16::from(byte)),
+        }
+    }
+
+    /// The units another builder holds.
+    pub(crate) fn push_joined(&mut self, other: &Joined) {
+        match other {
+            Joined::Bytes(bytes) => self.push_bytes(bytes),
+            Joined::Units(units) => self.widen().extend_from_slice(units),
+        }
+    }
+
+    /// Drops the units past `len`; a widened builder left with no unit past
+    /// `0xFF` is narrowed again, so it stays canonical.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        match self {
+            Joined::Bytes(bytes) => bytes.truncate(len),
+            Joined::Units(units) => {
+                units.truncate(len);
+                if units.iter().all(|&unit| unit <= 0xFF) {
+                    *self = Joined::Bytes(units.iter().map(|&unit| unit as u8).collect());
+                }
+            }
+        }
+    }
+
     /// `count` copies of the Latin-1 unit `byte`.
     pub(crate) fn push_byte_run(&mut self, byte: u8, count: usize) {
         match self {
