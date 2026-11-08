@@ -129,6 +129,21 @@ impl Scope<'_> {
         Ok(self.raw_host_data(arg))
     }
 
+    /// Argument `index` as Rust text when it is a string, lone surrogates
+    /// replaced as [`JsString::to_utf8_lossy`](crate::engine::value::JsString::to_utf8_lossy)
+    /// replaces them: copied once from the heap, with no handle and no
+    /// [`JsString`](crate::engine::value::JsString) between. `None` for any
+    /// other value (no conversion runs).
+    pub fn arg_text(&mut self, index: usize) -> Option<String> {
+        let arg = self.call.arg(&self.core, index);
+        Some(match self.core.string_repr(arg)? {
+            oxide_core::heap::string::StringRepr::OneByte(bytes) if bytes.is_ascii() => {
+                String::from_utf8(bytes.to_vec()).unwrap_or_default()
+            }
+            repr => repr.to_rust_string(),
+        })
+    }
+
     fn raw_host_data<T: 'static>(&self, value: oxide_core::Value) -> Option<Rc<T>> {
         let object = value.as_object()?;
         self.core

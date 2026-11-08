@@ -820,9 +820,17 @@ impl Runtime {
     /// [`Js::new_object_from`](super::Js::new_object_from).
     pub fn new_object_from(
         &self,
-        entries: &[(super::PropertyKey, super::Value)],
+        entries: &[(super::PropertyKey, super::InitValue<'_>)],
     ) -> Result<ObjectRef, RuntimeError> {
         self.engine()?.view().new_object_from(entries)
+    }
+
+    /// [`Js::new_array_from_inits`](super::Js::new_array_from_inits).
+    pub fn new_array_from_inits(
+        &self,
+        values: &[super::InitValue<'_>],
+    ) -> Result<ObjectRef, RuntimeError> {
+        self.engine()?.view().new_array_from_inits(values)
     }
 
     /// [`Js::plain_own_data`](super::Js::plain_own_data).

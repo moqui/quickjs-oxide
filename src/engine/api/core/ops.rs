@@ -17,7 +17,7 @@ use super::function::{FunctionOptions, HostFunction, Raw, Scope, host_body};
 use super::image::CodeImage;
 use super::promise::PromiseCapability;
 use super::property::{
-    AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, Key,
+    AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, InitValue, Key,
     OrdinaryPropertyDescriptor, OwnData, PropertyKey, WellKnownSymbol,
 };
 use super::runtime::{Preloaded, PromiseSnapshot, PromiseState, Shared, slot};
@@ -823,19 +823,36 @@ impl View<'_> {
         self.complete_with(result)
     }
 
+    /// The core value of `init`, rooted until the view drops: Rust text made
+    /// a heap string in one copy.
+    fn lower_init(&mut self, init: &InitValue<'_>) -> JsResult<oxide_core::Value> {
+        match init {
+            InitValue::Value(value) => self.lower(value),
+            InitValue::Text(text) => {
+                if text.len() > JsString::MAX_LEN && text.encode_utf16().count() > JsString::MAX_LEN
+                {
+                    return Err(crate::engine::value::JsStringError::TooLong.into());
+                }
+                let value = self.core.new_string_repr(StringRepr::from_text(text))?;
+                self.temp(value);
+                Ok(value)
+            }
+        }
+    }
+
     /// A plain object inheriting from `%Object.prototype%` with `entries` as
     /// its own data properties in order, each by `CreateDataProperty`: no
     /// `[[Set]]`, so no setter runs and no receiver is lowered. A key given
     /// twice keeps its first place and its last value.
     pub(crate) fn new_object_from(
         &mut self,
-        entries: &[(PropertyKey, Value)],
+        entries: &[(PropertyKey, InitValue<'_>)],
     ) -> JsResult<ObjectRef> {
         let object = self.core.new_object()?;
         self.temp(oxide_core::Value::object(object));
         for (key, value) in entries {
             let key = self.key(key)?;
-            let value = self.lower(value)?;
+            let value = self.lower_init(value)?;
             let descriptor = oxide_core::PropertyDescriptor {
                 value: Some(value),
                 get: None,
@@ -850,6 +867,18 @@ impl View<'_> {
             }
         }
         Ok(self.lift_object(object))
+    }
+
+    /// `CreateArrayFromList` of `values`, Rust text made heap strings in one
+    /// copy.
+    pub(crate) fn new_array_from_inits(&mut self, values: &[InitValue<'_>]) -> JsResult<ObjectRef> {
+        let mut lowered = Vec::with_capacity(values.len());
+        for value in values {
+            lowered.push(self.lower_init(value)?);
+        }
+        let result = self.core.new_array_from(&lowered);
+        let array = self.complete_with(result)?;
+        Ok(self.lift_object(array))
     }
 
     /// The own properties of a plain object, in `[[OwnPropertyKeys]]` order:
@@ -1558,7 +1587,9 @@ js_ops! {
     fn is_ordinary_object(&mut self, object: &ObjectRef) -> JsResult<bool>;
     /// A plain object inheriting from `%Object.prototype%` with `entries` as
     /// its own data properties, each by `CreateDataProperty` (no setter runs).
-    fn new_object_from(&mut self, entries: &[(PropertyKey, Value)]) -> JsResult<ObjectRef>;
+    fn new_object_from(&mut self, entries: &[(PropertyKey, InitValue<'_>)]) -> JsResult<ObjectRef>;
+    /// `CreateArrayFromList(values)`, Rust text made strings in one copy.
+    fn new_array_from_inits(&mut self, values: &[InitValue<'_>]) -> JsResult<ObjectRef>;
     /// A plain object's own properties in order, when it is ordinary with no
     /// internal slots, inherits from `prototype` and has only data
     /// properties; `None` otherwise. Runs no code.

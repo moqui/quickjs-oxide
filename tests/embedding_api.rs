@@ -2047,7 +2047,7 @@ fn ordinary_objects_are_told_from_exotic_ones() {
 
 #[test]
 fn plain_objects_are_made_and_read_in_one_step() {
-    use quickjs_oxide::engine::api::core::PropertyKey;
+    use quickjs_oxide::engine::api::core::{InitValue, PropertyKey};
     let (runtime, context) = runtime();
     let key = |text: &str| PropertyKey::from_js_string(JsString::try_from_utf8(text).unwrap());
     let text = |text: &str| Value::String(JsString::try_from_utf8(text).unwrap());
@@ -2057,9 +2057,9 @@ fn plain_objects_are_made_and_read_in_one_step() {
         .unwrap();
     let made = runtime
         .new_object_from(&[
-            (key("a"), Value::Int(1)),
-            (key("b"), text("two")),
-            (key("a"), Value::Int(3)),
+            (key("a"), Value::Int(1).into()),
+            (key("b"), InitValue::Text("two")),
+            (key("a"), Value::Int(3).into()),
         ])
         .unwrap();
     let show = match context
@@ -2127,6 +2127,13 @@ fn plain_objects_are_made_and_read_in_one_step() {
         runtime.dense_array_values(&object_of("[1, 'x']")).unwrap(),
         Some(vec![Value::Int(1), text("x")])
     );
+    let made = runtime
+        .new_array_from_inits(&[InitValue::Text("é ☃"), Value::Null.into()])
+        .unwrap();
+    assert_eq!(
+        runtime.dense_array_values(&made).unwrap(),
+        Some(vec![text("é ☃"), Value::Null])
+    );
     for source in [
         "[1, , 3]",
         "Object.defineProperty([1], 0, {get() { return 2 }})",
@@ -2152,4 +2159,48 @@ fn an_index_key_is_read_as_a_number() {
     for text in ["07", "x", "", "4294967295", "-1"] {
         assert_eq!(key(text).as_index(), None, "{text}");
     }
+}
+
+#[test]
+fn a_text_argument_is_read_as_rust_text() {
+    use quickjs_oxide::engine::api::core::{FunctionOptions, Scope};
+    let (runtime, context) = runtime();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let into = Rc::clone(&seen);
+    let function = context
+        .new_function(
+            FunctionOptions::new("texts"),
+            move |scope: &mut Scope<'_>| {
+                for index in 0..scope.argc() {
+                    let lifted = match scope.arg(index) {
+                        Value::String(text) => Some(text.to_utf8_lossy()),
+                        _ => None,
+                    };
+                    let text = scope.arg_text(index);
+                    assert_eq!(text, lifted);
+                    into.borrow_mut().push(text);
+                }
+                Ok(Value::Undefined)
+            },
+        )
+        .unwrap();
+    let args = match context
+        .eval(r"['ascii', 'caf\u00e9', '\u2603', '\ud800', 7, 'a' + 'b'.repeat(3)]")
+        .unwrap()
+    {
+        Value::Object(array) => runtime.dense_array_values(&array).unwrap().unwrap(),
+        other => panic!("not an array: {other:?}"),
+    };
+    context.call(&function, Value::Undefined, &args).unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        [
+            Some("ascii".to_string()),
+            Some("café".to_string()),
+            Some("☃".to_string()),
+            Some("\u{fffd}".to_string()),
+            None,
+            Some("abbb".to_string()),
+        ]
+    );
 }
