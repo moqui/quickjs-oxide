@@ -207,16 +207,18 @@ impl View<'_> {
                 },
                 Ok,
             )?,
-            // A flat string is read in place: a key whose atom exists costs
-            // a lookup and no allocation.
-            Key::String(text) => match (text.flat_latin1(), text.flat_utf16()) {
-                (Some(bytes), _) => self.core.key_from_latin1(bytes)?,
-                (_, Some(units)) => self.core.key_from_units(units)?,
-                _ => {
-                    let units: Vec<u16> = text.utf16_units().collect();
-                    self.core.key_from_units(&units)?
+            // A key used again is found by its string's identity; else a
+            // flat string is read in place: a key whose atom exists costs a
+            // lookup and no allocation.
+            Key::String(text) => {
+                let collections = self.core.heap().gc().stats.collections;
+                let cached = self.shared.key_atoms.borrow_mut().get(collections, text);
+                if let Some(key) = cached {
+                    key
+                } else {
+                    self.intern_key_text(text)?
                 }
-            },
+            }
             // The symbol's handle roots it.
             Key::Symbol(symbol) => {
                 let value = self.own(&symbol.slot)?;
@@ -230,6 +232,26 @@ impl View<'_> {
         if let Some(value) = key.heap_value() {
             self.temp(value);
         }
+        Ok(key)
+    }
+
+    /// The core key of a string key's text, noted for the next use of the
+    /// same string.
+    fn intern_key_text(&mut self, text: &JsString) -> JsResult<oxide_core::PropertyKey> {
+        let key = match (text.flat_latin1(), text.flat_utf16()) {
+            (Some(bytes), _) => self.core.key_from_latin1(bytes)?,
+            (_, Some(units)) => self.core.key_from_units(units)?,
+            _ => {
+                let units: Vec<u16> = text.utf16_units().collect();
+                self.core.key_from_units(&units)?
+            }
+        };
+        // interning may collect: the entry belongs to the epoch after it
+        let collections = self.core.heap().gc().stats.collections;
+        self.shared
+            .key_atoms
+            .borrow_mut()
+            .put(collections, text, key);
         Ok(key)
     }
 

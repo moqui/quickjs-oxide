@@ -2204,3 +2204,50 @@ fn a_text_argument_is_read_as_rust_text() {
         ]
     );
 }
+
+#[test]
+fn a_key_used_again_reads_the_same_property_across_collections() {
+    use quickjs_oxide::engine::api::core::PropertyKey;
+    let (runtime, context) = runtime();
+    let key = PropertyKey::from_js_string(JsString::try_from_utf8("someKeyName").unwrap());
+    let other = PropertyKey::from_js_string(JsString::try_from_utf8("someOtherName").unwrap());
+    let cx = runtime.context();
+    for round in 0..4 {
+        let object = cx.new_object().unwrap();
+        cx.set_property(&object, &key, Value::Int(round)).unwrap();
+        cx.set_property(&object, &other, Value::Int(-round))
+            .unwrap();
+        // a collection may free the atoms between uses; the key interns again
+        runtime.run_gc().unwrap();
+        assert_eq!(cx.get_property(&object, &key).unwrap(), Value::Int(round));
+        assert_eq!(
+            cx.get_property(&object, &other).unwrap(),
+            Value::Int(-round)
+        );
+        let seen = match context
+            .eval("(o) => o.someKeyName * 10 + (o.someOtherName || 0)")
+            .unwrap()
+        {
+            Value::Object(function) => runtime.as_callable(&function).unwrap().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            context
+                .call(&seen, Value::Undefined, &[Value::Object(object)])
+                .unwrap(),
+            Value::Int(round * 10 - round)
+        );
+    }
+}
+
+#[test]
+fn a_string_is_compared_with_rust_text() {
+    let text = |source: &str| JsString::try_from_utf8(source).unwrap();
+    assert!(text("abc").eq_str("abc"));
+    assert!(!text("abc").eq_str("abd"));
+    assert!(!text("abc").eq_str("ab"));
+    assert!(text("café").eq_str("café"));
+    assert!(text("☃x").eq_str("☃x"));
+    assert!(!text("caf").eq_str("café"));
+    assert!(text("").eq_str(""));
+}

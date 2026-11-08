@@ -88,6 +88,54 @@ pub(crate) struct Shared {
     pub(crate) spares: RefCell<Vec<oxide_core::Spare>>,
     /// The text of string keys lifted for hooks (`View::lift_key`).
     pub(crate) key_texts: RefCell<KeyTexts>,
+    /// The core keys of the embedder's string keys, by the string's identity.
+    pub(crate) key_atoms: RefCell<KeyAtoms>,
+}
+
+/// The core key a [`PropertyKey`](super::PropertyKey)'s string interned
+/// to, by the string's identity, so an embedder's key made once and used
+/// again is not hashed and looked up again. Each entry holds its string, so
+/// the identity is not reused while cached; the cache empties when the
+/// collector runs, as a weak atom may go then.
+#[derive(Default)]
+pub(crate) struct KeyAtoms {
+    collections: u64,
+    slots: Vec<Option<(JsString, oxide_core::PropertyKey)>>,
+}
+
+impl KeyAtoms {
+    const SLOTS: usize = 256;
+
+    fn slot(text: &JsString) -> usize {
+        (text.identity() >> 4) % Self::SLOTS
+    }
+
+    pub(crate) fn get(
+        &mut self,
+        collections: u64,
+        text: &JsString,
+    ) -> Option<oxide_core::PropertyKey> {
+        if self.collections != collections {
+            self.collections = collections;
+            self.slots.clear();
+            return None;
+        }
+        match self.slots.get(Self::slot(text)) {
+            Some(Some((cached, key))) if cached.identity() == text.identity() => Some(*key),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put(&mut self, collections: u64, text: &JsString, key: oxide_core::PropertyKey) {
+        if self.collections != collections {
+            self.collections = collections;
+            self.slots.clear();
+        }
+        if self.slots.is_empty() {
+            self.slots.resize(Self::SLOTS, None);
+        }
+        self.slots[Self::slot(text)] = Some((text.clone(), key));
+    }
 }
 
 /// The `JsString` of each string key lifted recently, so a hook that reads
@@ -378,6 +426,7 @@ impl Runtime {
                 lent: RefCell::new(None),
                 spares: RefCell::new(Vec::new()),
                 key_texts: RefCell::new(KeyTexts::default()),
+                key_atoms: RefCell::new(KeyAtoms::default()),
                 turns: Cell::new(0),
             }),
         }
