@@ -169,6 +169,13 @@ pub struct Room {
     left: isize,
     /// Nominal bytes that may be allocated before the next collection.
     threshold: usize,
+    /// The safepoint's fast path while `allocated` stays below it: the
+    /// threshold, or less under a cap, where it is also the nominal bytes that
+    /// may be allocated before the cap is checked again.
+    fast: usize,
+    /// Bytes of growth steps a capped heap may take before its safepoints
+    /// check the cap again; `isize::MAX` without a cap.
+    cap_left: isize,
 }
 
 impl Room {
@@ -177,6 +184,8 @@ impl Room {
         Room {
             left: isize::MAX,
             threshold: usize::MAX,
+            fast: usize::MAX,
+            cap_left: isize::MAX,
         }
     }
 
@@ -186,18 +195,42 @@ impl Room {
         Room {
             left: left.min(isize::MAX as usize) as isize,
             threshold,
+            fast: threshold,
+            cap_left: isize::MAX,
         }
     }
 
     /// Charges a growth step of `bytes`.
     #[inline]
     pub fn take(&mut self, bytes: usize) {
-        self.left = self
-            .left
-            .saturating_sub(bytes.min(isize::MAX as usize) as isize);
+        let bytes = bytes.min(isize::MAX as usize) as isize;
+        self.left = self.left.saturating_sub(bytes);
         if self.left < 0 {
             self.threshold = 0;
+            self.fast = 0;
         }
+        self.cap_left = self.cap_left.saturating_sub(bytes);
+        if self.cap_left < 0 {
+            self.fast = 0;
+        }
+    }
+
+    /// Every safepoint takes the slow path until the next check of the cap.
+    fn check_cap(&mut self) {
+        self.fast = 0;
+    }
+
+    /// After a check of the cap at `allocated` nominal bytes: `headroom`
+    /// bytes, of growth steps and of nominal allocation each, before the
+    /// safepoints check it again; none when it is negative.
+    fn set_cap_headroom(&mut self, allocated: usize, headroom: isize) {
+        self.cap_left = headroom;
+        self.fast = if headroom < 0 {
+            0
+        } else {
+            self.threshold
+                .min(allocated.saturating_add(headroom as usize))
+        };
     }
 
     #[inline]
@@ -251,9 +284,13 @@ pub const DEFAULT_MIN_HEAP: usize = 1 << 20;
 
 impl GcState {
     pub fn new(limits: HeapLimits) -> Self {
+        let mut room = Room::new(DEFAULT_MIN_HEAP, DEFAULT_MIN_HEAP);
+        if limits.max_bytes != usize::MAX {
+            room.check_cap();
+        }
         GcState {
             allocated: 0,
-            room: Room::new(DEFAULT_MIN_HEAP, DEFAULT_MIN_HEAP),
+            room,
             budget: DEFAULT_MIN_HEAP,
             min_heap: DEFAULT_MIN_HEAP,
             growth_factor: 2.0,
@@ -284,6 +321,9 @@ impl GcState {
         self.growth_factor = growth_factor;
         self.budget = min_heap;
         self.room = Room::new(min_heap.saturating_sub(reserved), min_heap);
+        if self.limits.max_bytes != usize::MAX {
+            self.room.check_cap();
+        }
     }
 
     /// Nominal bytes that may be allocated before the next collection.
@@ -300,15 +340,15 @@ impl GcState {
         self.manual
     }
 
-    /// Whether every safepoint takes the slow path: under a cap (to check it)
-    /// or under stress.
+    /// Whether every safepoint takes the slow path: under stress. A cap
+    /// lowers the room's fast limit instead ([`Heap::set_cap_headroom`]).
     #[inline]
     fn always_slow(&self) -> bool {
         #[cfg(feature = "gc-stress")]
         if self.stress {
             return true;
         }
-        self.limits.max_bytes != usize::MAX
+        false
     }
 
     #[cfg(feature = "gc-stress")]
@@ -334,7 +374,7 @@ impl Heap {
     #[inline]
     pub(crate) fn safepoint(&mut self, need: &Need, keep: &[Value]) -> Result<(), HeapError> {
         let nominal = need.nominal_bytes();
-        if self.gc.allocated + nominal < self.gc.room.threshold && !self.gc.always_slow() {
+        if self.gc.allocated + nominal < self.gc.room.fast && !self.gc.always_slow() {
             self.gc.allocated += nominal;
             return Ok(());
         }
@@ -367,8 +407,35 @@ impl Heap {
                 return Err(HeapError::OutOfMemory);
             }
         }
+        if capped {
+            self.set_cap_headroom();
+        }
         self.gc.allocated += nominal;
         Ok(())
+    }
+
+    /// After a check of the cap that passed: what the heap may allocate and
+    /// grow by before its safepoints check the cap again. Reserved bytes grow
+    /// by the arenas' and the value heap's steps, which charge the room, by
+    /// out-of-line bytes, which are nominal, and by the tables beside them.
+    /// The headroom leaves room below the cap for every arena to double once
+    /// more (a step is at most an arena's capacity) and for the tables to
+    /// double, and is half of what is left after that: a safepoint takes the
+    /// fast path only while the heap is far from the cap, and checks it
+    /// exactly near it, as before.
+    fn set_cap_headroom(&mut self) {
+        let max = self.gc.limits.max_bytes;
+        let kept = self
+            .bytes()
+            .saturating_mul(2)
+            .saturating_add(self.table_bytes());
+        let headroom = if kept >= max {
+            -1
+        } else {
+            ((max - kept) / 2).min(isize::MAX as usize) as isize
+        };
+        let allocated = self.gc.allocated;
+        self.gc.room.set_cap_headroom(allocated, headroom);
     }
 
     /// Bytes the arenas and the value heap grow by to satisfy `need`.
@@ -450,6 +517,11 @@ impl Heap {
         } else {
             Room::new(gc.budget - reserved, threshold)
         };
+        // a capped heap checks the cap at its next safepoint, which sets the
+        // headroom again
+        if gc.limits.max_bytes != usize::MAX {
+            gc.room.check_cap();
+        }
     }
 
     fn clear_marks(&mut self) {
