@@ -690,6 +690,16 @@ impl Heap {
 
     /// The element at `index`: `Value::EMPTY` for a hole or past the end.
     #[inline]
+    /// Whether `object` holds an element: a value, not a hole, in its
+    /// dense range.
+    pub fn has_elements(&self, object: ObjectId) -> bool {
+        let elements = self.objects.get(object.0).elements();
+        self.values
+            .slice(elements)
+            .iter()
+            .any(|value| !value.is_empty())
+    }
+
     pub fn get_element(&self, object: ObjectId, index: u32) -> Value {
         let header = self.objects.get(object.0);
         let elements = header.elements();

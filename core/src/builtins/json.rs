@@ -5,16 +5,20 @@
 //! `toJSON` are observed in spec order.
 
 use std::borrow::Cow;
+use std::rc::Rc;
 
+use super::joined::Joined;
 use super::{Native, define, methods, to_string_tag};
 use crate::ErrorKind;
 use crate::PropertyKey;
-use crate::heap::object::{InternalTag, ObjectKind};
+use crate::heap::atom::KeyKind;
+use crate::heap::hash::{FxHashMap, FxHashSet};
+use crate::heap::object::{InternalTag, NONE, ObjectKind};
 use crate::heap::string::StringRepr;
 use crate::heap::{Heap, HeapError};
 use crate::runtime::{Intrinsic, Names};
 use crate::shape::PropertyFlags;
-use crate::value::{Kind, ObjectId, Value};
+use crate::value::{Kind, ObjectId, ShapeId, Value};
 use crate::vm::native::CallSite;
 use crate::vm::object as internal;
 use crate::vm::{Cx, Throw, error, number, ops, property};
@@ -902,8 +906,49 @@ struct Serializer {
     gap: Vec<u16>,
     indent: Vec<u16>,
     /// The containers being serialized, for the cycle check.
-    stack: crate::heap::hash::FxHashSet<ObjectId>,
-    out: Vec<u16>,
+    stack: FxHashSet<ObjectId>,
+    out: Joined,
+    /// Each ordinary shape's members ([`Plan`]), decided once per call, or
+    /// `None` for a shape the per-key walk takes. A collection may reissue a
+    /// shape id, so the plans are dropped when the collection count moves.
+    plans: FxHashMap<ShapeId, Option<Rc<Plan>>>,
+    plans_collections: u64,
+}
+
+/// What a shape gives `SerializeJSONObject` with no property list: its
+/// enumerable string-keyed data properties in key order, each with its slot
+/// and its quoted key. A shape with an index-like key, an accessor or a
+/// pending property, or an own `toJSON`, has none. Shapes other than
+/// dictionaries never change, so the plan holds for every object of the
+/// shape while it keeps that shape.
+struct Plan {
+    members: Vec<PlanMember>,
+}
+
+struct PlanMember {
+    key: PropertyKey,
+    slot: u32,
+    /// `"key"`, escaped.
+    quoted: Joined,
+}
+
+/// The members of a container being written.
+enum Members {
+    /// An array's length.
+    Array(u64),
+    /// An object's keys, from the property list or `EnumerableOwnProperties`.
+    Keys(Vec<PropertyKey>),
+    /// An ordinary object's members by its shape's plan; read from their
+    /// slots while the object still has `ShapeId`, else by `Get`.
+    Plan(Rc<Plan>, ShapeId),
+}
+
+/// A member's key: an array element's index is made a key only when the
+/// key is needed (`Get` past the elements, `toJSON`, a replacer).
+#[derive(Clone, Copy)]
+enum MemberKey {
+    Key(PropertyKey),
+    Index(u64),
 }
 
 /// What `SerializeJSONProperty` found before serializing a value.
@@ -919,10 +964,7 @@ enum Prepared {
 /// on this explicit stack, so deep nesting uses no host stack.
 struct Level {
     object: ObjectId,
-    /// The keys of an object; `None` for an array.
-    keys: Option<Vec<PropertyKey>>,
-    /// An array's length.
-    length: u64,
+    members: Members,
     next: u64,
     any: bool,
     stepback: usize,
@@ -939,7 +981,9 @@ pub(super) fn stringify(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
         gap: Vec::new(),
         indent: Vec::new(),
         stack: Default::default(),
-        out: Vec::new(),
+        out: Joined::with_capacity(0),
+        plans: Default::default(),
+        plans_collections: cx.heap.gc().stats.collections,
     };
     if ops::is_callable(cx.heap, replacer) {
         serializer.replacer = Some(replacer);
@@ -959,7 +1003,7 @@ pub(super) fn stringify(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
     if !serializer.property(cx, wrapper, empty)? {
         return Ok(Value::UNDEFINED);
     }
-    ops::alloc_units(cx, &serializer.out)
+    serializer.out.finish(cx)
 }
 
 /// The keys a replacer array selects, deduplicated, in order.
@@ -1023,10 +1067,6 @@ fn gap(cx: &mut Cx<'_>, space: Value) -> Result<Vec<u16>, Throw> {
 }
 
 impl Serializer {
-    fn text(&mut self, text: &str) {
-        self.out.extend(text.encode_utf16());
-    }
-
     /// `SerializeJSONProperty(key, holder)`; false when the value is not
     /// serializable (undefined, a symbol, a function). Nested containers are
     /// walked on an explicit stack of [`Level`]s.
@@ -1051,7 +1091,8 @@ impl Serializer {
         mark: crate::RootMark,
     ) -> Result<bool, Throw> {
         let mut levels: Vec<Level> = Vec::new();
-        match self.prepare(cx, holder, key)? {
+        let value = internal::get(cx, holder, key, Value::object(holder))?;
+        match self.prepare(cx, holder, MemberKey::Key(key), value)? {
             Prepared::Done(serialized) => return Ok(serialized),
             Prepared::Container(object, is_array) => {
                 levels.push(self.open(cx, object, is_array, mark)?);
@@ -1059,40 +1100,68 @@ impl Serializer {
         }
         while let Some(level) = levels.last_mut() {
             let object = level.object;
-            let member = match &level.keys {
-                Some(keys) => keys.get(level.next as usize).copied(),
-                None if level.next < level.length => {
-                    Some(internal::number_key(cx, level.next as f64)?)
+            let next = level.next;
+            // The member's key, its value when read in place, and its
+            // quoted key from a plan.
+            let (member, value, plan) = match &level.members {
+                Members::Array(length) if next < *length => {
+                    let value = u32::try_from(next)
+                        .map(|index| cx.heap.get_element(object, index))
+                        .unwrap_or(Value::EMPTY);
+                    let value = (!value.is_empty()).then_some(value);
+                    (MemberKey::Index(next), value, None)
                 }
-                None => None,
+                Members::Keys(keys) if (next as usize) < keys.len() => {
+                    (MemberKey::Key(keys[next as usize]), None, None)
+                }
+                Members::Plan(plan, shape) if (next as usize) < plan.members.len() => {
+                    let member = &plan.members[next as usize];
+                    let value = (cx.heap.shape_of(object) == *shape)
+                        .then(|| cx.heap.get_slot(object, member.slot));
+                    (MemberKey::Key(member.key), value, Some(plan.clone()))
+                }
+                _ => {
+                    let level = levels.pop().expect("a level");
+                    self.close(cx, &level);
+                    continue;
+                }
             };
-            let Some(member) = member else {
-                let level = levels.pop().expect("a level");
-                self.close(cx, &level);
-                continue;
-            };
-            let level = levels.last_mut().expect("a level");
-            let is_object = level.keys.is_some();
+            let is_object = !matches!(level.members, Members::Array(_));
             let rollback = self.out.len();
             if is_object {
                 if level.any {
-                    self.out.push(0x2c);
+                    self.out.push_byte(b',');
                 }
-            } else if level.next > 0 {
-                self.out.push(0x2c);
+            } else if next > 0 {
+                self.out.push_byte(b',');
             }
             level.next += 1;
             self.separator();
             if is_object {
-                let name = super::object::key_string(cx, member)?;
-                quote_string(&mut self.out, cx.heap, name);
-                self.out.push(0x3a);
+                match &plan {
+                    Some(plan) => self.out.push_joined(&plan.members[next as usize].quoted),
+                    None => {
+                        let MemberKey::Key(key) = member else {
+                            unreachable!("an object member has a key")
+                        };
+                        let name = super::object::key_string(cx, key)?;
+                        quote_string(&mut self.out, cx.heap, name);
+                    }
+                }
+                self.out.push_byte(b':');
                 if !self.gap.is_empty() {
-                    self.out.push(0x20);
+                    self.out.push_byte(b' ');
                 }
             }
             let child_mark = cx.heap.roots().mark();
-            match self.prepare(cx, object, member)? {
+            let value = match value {
+                Some(value) => value,
+                None => {
+                    let key = member_key(cx, member)?;
+                    internal::get(cx, object, key, Value::object(object))?
+                }
+            };
+            match self.prepare(cx, object, member, value)? {
                 Prepared::Done(serialized) => {
                     cx.heap.roots().truncate(child_mark);
                     let level = levels.last_mut().expect("a level");
@@ -1103,7 +1172,7 @@ impl Serializer {
                             self.out.truncate(rollback);
                         }
                     } else if !serialized {
-                        self.text("null");
+                        self.out.push_bytes(b"null");
                     }
                 }
                 Prepared::Container(child, is_array) => {
@@ -1116,28 +1185,34 @@ impl Serializer {
         Ok(true)
     }
 
-    /// The part of `SerializeJSONProperty` before a container's members:
-    /// `toJSON`, the replacer, unwrapping and primitives.
+    /// The part of `SerializeJSONProperty` after `Get(holder, key)`, before
+    /// a container's members: `toJSON`, the replacer, unwrapping and
+    /// primitives.
     fn prepare(
         &mut self,
         cx: &mut Cx<'_>,
         holder: ObjectId,
-        key: PropertyKey,
+        key: MemberKey,
+        value: Value,
     ) -> Result<Prepared, Throw> {
-        let mut value = internal::get(cx, holder, key, Value::object(holder))?;
+        let mut value = value;
         cx.heap.roots().push(value);
-        if matches!(value.kind(), Kind::Object | Kind::BigInt) {
+        let reaches_to_json = match value.as_object() {
+            Some(object) => !no_to_json(cx, object),
+            None => value.kind() == Kind::BigInt,
+        };
+        if reaches_to_json {
             let to_json = Names::key(cx.realm.names.to_json);
             let method = property::get(cx, value, to_json)?;
             if ops::is_callable(cx.heap, method) {
-                let name = super::object::key_string(cx, key)?;
+                let name = member_name(cx, key)?;
                 cx.heap.roots().push(name);
                 value = crate::vm::call(cx, method, value, &[name])?;
                 cx.heap.roots().push(value);
             }
         }
         if let Some(replacer) = self.replacer {
-            let name = super::object::key_string(cx, key)?;
+            let name = member_name(cx, key)?;
             cx.heap.roots().push(name);
             value = crate::vm::call(cx, replacer, Value::object(holder), &[name, value])?;
             cx.heap.roots().push(value);
@@ -1156,8 +1231,7 @@ impl Serializer {
                         .map_err(|error| error::heap_error(cx, error))?;
                     let raw = internal::get(cx, object, key, value)?;
                     let raw = ops::to_string(cx, raw)?;
-                    let units = ops::units(cx.heap, raw.as_string().unwrap());
-                    self.out.extend(units);
+                    self.out.push_string(cx, raw.as_string().unwrap());
                     return Ok(Prepared::Done(true));
                 }
                 _ => {}
@@ -1165,22 +1239,22 @@ impl Serializer {
             cx.heap.roots().push(value);
         }
         match value.kind() {
-            Kind::Null => self.text("null"),
-            Kind::Bool => self.text(if value == Value::TRUE {
-                "true"
+            Kind::Null => self.out.push_bytes(b"null"),
+            Kind::Bool => self.out.push_bytes(if value == Value::TRUE {
+                b"true"
             } else {
-                "false"
+                b"false"
             }),
             Kind::String => quote_string(&mut self.out, cx.heap, value),
-            Kind::Int32 => push_int(&mut self.out, value.as_int32().unwrap()),
+            Kind::Int32 => self
+                .out
+                .push_bytes(ops::Digits::new(value.as_int32().unwrap()).as_bytes()),
             Kind::Number => {
                 let number = value.as_f64().unwrap();
                 if number.is_finite() {
-                    let text = number::text(number);
-                    self.out
-                        .extend(text.as_bytes().iter().map(|&byte| u16::from(byte)));
+                    self.out.push_bytes(number::text(number).as_bytes());
                 } else {
-                    self.text("null");
+                    self.out.push_bytes(b"null");
                 }
             }
             Kind::BigInt => {
@@ -1212,21 +1286,20 @@ impl Serializer {
     ) -> Result<Level, Throw> {
         self.stack.insert(object);
         let stepback = self.indent.len();
-        self.indent.extend_from_slice(&self.gap.clone());
-        let (keys, length) = if is_array {
-            (None, internal::length_of_array_like(cx, object)?)
+        self.indent.extend_from_slice(&self.gap);
+        let members = if is_array {
+            Members::Array(internal::length_of_array_like(cx, object)?)
+        } else if let Some(keys) = &self.keys {
+            Members::Keys(keys.clone())
+        } else if let Some((plan, shape)) = self.plan(cx, object) {
+            Members::Plan(plan, shape)
         } else {
-            let keys = match &self.keys {
-                Some(keys) => keys.clone(),
-                None => internal::enumerable_own_keys(cx, object)?,
-            };
-            (Some(keys), 0)
+            Members::Keys(internal::enumerable_own_keys(cx, object)?)
         };
-        self.out.push(if is_array { 0x5b } else { 0x7b });
+        self.out.push_byte(if is_array { b'[' } else { b'{' });
         Ok(Level {
             object,
-            keys,
-            length,
+            members,
             next: 0,
             any: false,
             stepback,
@@ -1234,14 +1307,41 @@ impl Serializer {
         })
     }
 
+    /// The plan of an ordinary object's shape, made on its first use in
+    /// this call; `None` for an object the per-key walk takes.
+    fn plan(&mut self, cx: &Cx<'_>, object: ObjectId) -> Option<(Rc<Plan>, ShapeId)> {
+        let heap = &*cx.heap;
+        if heap.object_kind(object) != ObjectKind::Ordinary
+            || heap.is_dictionary(object)
+            || heap.has_elements(object)
+        {
+            return None;
+        }
+        let collections = heap.gc().stats.collections;
+        if collections != self.plans_collections {
+            self.plans.clear();
+            self.plans_collections = collections;
+        }
+        let shape = heap.shape_of(object);
+        let plan = self
+            .plans
+            .entry(shape)
+            .or_insert_with(|| make_plan(heap, shape, Names::key(cx.realm.names.to_json)))
+            .clone()?;
+        Some((plan, shape))
+    }
+
     /// Ends a container: the closing bracket after its last member.
     fn close(&mut self, cx: &mut Cx<'_>, level: &Level) {
         self.indent.truncate(level.stepback);
-        let is_array = level.keys.is_none();
-        if (is_array && level.length > 0) || (!is_array && level.any) {
+        let (is_array, nonempty) = match &level.members {
+            Members::Array(length) => (true, *length > 0),
+            _ => (false, level.any),
+        };
+        if nonempty {
             self.separator();
         }
-        self.out.push(if is_array { 0x5d } else { 0x7d });
+        self.out.push_byte(if is_array { b']' } else { b'}' });
         self.stack.remove(&level.object);
         cx.heap.roots().truncate(level.mark);
     }
@@ -1249,76 +1349,153 @@ impl Serializer {
     /// The line break and indentation before a member, with a gap.
     fn separator(&mut self) {
         if !self.gap.is_empty() {
-            self.out.push(0x0a);
-            self.out.extend_from_slice(&self.indent);
+            self.out.push_byte(b'\n');
+            self.out.push_units(&self.indent);
         }
     }
 }
 
-/// An int32's digits, written without a `String`.
-fn push_int(out: &mut Vec<u16>, value: i32) {
-    let mut digits = [0u16; 11];
-    let mut at = digits.len();
-    let mut rest = value.unsigned_abs();
-    loop {
-        at -= 1;
-        digits[at] = u16::from(b'0') + (rest % 10) as u16;
-        rest /= 10;
-        if rest == 0 {
-            break;
+/// The [`Plan`] of the shape `shape`, or `None` when the per-key walk must
+/// take it.
+fn make_plan(heap: &Heap, shape: ShapeId, to_json: PropertyKey) -> Option<Rc<Plan>> {
+    let mut members = Vec::new();
+    for (key, flags, slot) in heap.shape_entries(shape) {
+        if key == to_json {
+            return None;
         }
+        let name = match key.kind() {
+            KeyKind::Symbol(_) => continue,
+            KeyKind::Index(_) => return None,
+            KeyKind::String(name) => name,
+        };
+        if heap.string(name).array_index != NONE {
+            return None;
+        }
+        if flags.has(PropertyFlags::ACCESSOR) || flags.has(PropertyFlags::AUTOINIT) {
+            return None;
+        }
+        if !flags.has(PropertyFlags::ENUMERABLE) {
+            continue;
+        }
+        let mut quoted = Joined::with_capacity(heap.string_len(name) + 2);
+        quote_string(&mut quoted, heap, Value::string(name));
+        members.push(PlanMember { key, slot, quoted });
     }
-    if value < 0 {
-        at -= 1;
-        digits[at] = u16::from(b'-');
+    Some(Rc::new(Plan { members }))
+}
+
+/// No `toJSON` can be found on `object` or its prototypes: every object on
+/// the chain is ordinary or an array (no proxy, host or other exotic `Get`)
+/// and has no own `toJSON`, so `Get(object, "toJSON")` is `undefined` and
+/// runs no code.
+fn no_to_json(cx: &Cx<'_>, object: ObjectId) -> bool {
+    let to_json = Names::key(cx.realm.names.to_json);
+    let mut current = Some(object);
+    while let Some(object) = current {
+        if !matches!(
+            cx.heap.object_kind(object),
+            ObjectKind::Ordinary | ObjectKind::Array
+        ) || cx.heap.lookup_own(object, to_json).is_some()
+        {
+            return false;
+        }
+        current = cx.heap.prototype_of(object);
     }
-    out.extend_from_slice(&digits[at..]);
+    true
+}
+
+/// The property key of `member`.
+fn member_key(cx: &mut Cx<'_>, member: MemberKey) -> Result<PropertyKey, Throw> {
+    match member {
+        MemberKey::Key(key) => Ok(key),
+        MemberKey::Index(index) => internal::number_key(cx, index as f64),
+    }
+}
+
+/// The key of `member` as a string, for `toJSON` and the replacer.
+fn member_name(cx: &mut Cx<'_>, member: MemberKey) -> Result<Value, Throw> {
+    let key = member_key(cx, member)?;
+    super::object::key_string(cx, key)
 }
 
 /// [`quote`] of the string `value`, read in place.
-fn quote_string(out: &mut Vec<u16>, heap: &Heap, value: Value) {
+fn quote_string(out: &mut Joined, heap: &Heap, value: Value) {
     match heap.string(value.as_string().expect("a string")).repr() {
-        StringRepr::OneByte(bytes) => quote(out, bytes),
-        StringRepr::TwoByte(units) => quote(out, units),
+        StringRepr::OneByte(bytes) => quote_bytes(out, bytes),
+        StringRepr::TwoByte(units) => quote_units(out, units),
     }
 }
 
-/// `QuoteJSONString`: lone surrogates and control characters escaped.
-fn quote<T: Copy + Into<u16>>(out: &mut Vec<u16>, units: &[T]) {
-    out.reserve(units.len() + 2);
-    out.push(0x22);
-    let mut index = 0;
+/// `QuoteJSONString` of Latin-1 text: the runs with nothing to escape are
+/// copied whole.
+fn quote_bytes(out: &mut Joined, bytes: &[u8]) {
+    out.push_byte(b'"');
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte >= 0x20 && byte != b'"' && byte != b'\\' {
+            continue;
+        }
+        out.push_bytes(&bytes[start..index]);
+        push_escape(out, u16::from(byte));
+        start = index + 1;
+    }
+    out.push_bytes(&bytes[start..]);
+    out.push_byte(b'"');
+}
+
+/// `QuoteJSONString` of UTF-16 text: lone surrogates and control characters
+/// escaped.
+fn quote_units(out: &mut Joined, units: &[u16]) {
+    out.push_byte(b'"');
+    let (mut start, mut index) = (0, 0);
     while index < units.len() {
-        let unit: u16 = units[index].into();
-        index += 1;
-        let escape = match unit {
-            0x08 => "\\b",
-            0x09 => "\\t",
-            0x0a => "\\n",
-            0x0c => "\\f",
-            0x0d => "\\r",
-            0x22 => "\\\"",
-            0x5c => "\\\\",
+        let unit = units[index];
+        let clean = match unit {
+            0x22 | 0x5c | 0x00..=0x1f => false,
             0xd800..=0xdbff
                 if units
-                    .get(index)
-                    .is_some_and(|&next| (0xdc00..=0xdfff).contains(&next.into())) =>
+                    .get(index + 1)
+                    .is_some_and(|next| (0xdc00..=0xdfff).contains(next)) =>
             {
-                out.push(unit);
-                out.push(units[index].into());
-                index += 1;
+                index += 2;
                 continue;
             }
-            0x00..=0x1f | 0xd800..=0xdfff => {
-                out.extend(format!("\\u{unit:04x}").encode_utf16());
-                continue;
-            }
-            _ => {
-                out.push(unit);
-                continue;
-            }
+            0xd800..=0xdfff => false,
+            _ => true,
         };
-        out.extend(escape.encode_utf16());
+        if !clean {
+            out.push_units(&units[start..index]);
+            push_escape(out, unit);
+            start = index + 1;
+        }
+        index += 1;
     }
-    out.push(0x22);
+    out.push_units(&units[start..]);
+    out.push_byte(b'"');
+}
+
+/// The escape of one unit `QuoteJSONString` does not copy.
+fn push_escape(out: &mut Joined, unit: u16) {
+    let short = match unit {
+        0x08 => b'b',
+        0x09 => b't',
+        0x0a => b'n',
+        0x0c => b'f',
+        0x0d => b'r',
+        0x22 => b'"',
+        0x5c => b'\\',
+        _ => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            out.push_bytes(&[
+                b'\\',
+                b'u',
+                HEX[usize::from(unit >> 12)],
+                HEX[usize::from(unit >> 8 & 0xf)],
+                HEX[usize::from(unit >> 4 & 0xf)],
+                HEX[usize::from(unit & 0xf)],
+            ]);
+            return;
+        }
+    };
+    out.push_bytes(&[b'\\', short]);
 }
