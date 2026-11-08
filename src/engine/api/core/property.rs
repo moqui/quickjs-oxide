@@ -48,6 +48,15 @@ impl PropertyKey {
         }
     }
 
+    /// The array index the key is, with no string made; `None` for a
+    /// string that is no index's canonical form, or a symbol.
+    pub fn as_index(&self) -> Option<u32> {
+        match &self.0 {
+            Key::Index(index) => Some(*index),
+            _ => None,
+        }
+    }
+
     pub fn as_symbol(&self) -> Option<&SymbolRef> {
         match &self.0 {
             Key::Symbol(symbol) => Some(symbol),
@@ -195,6 +204,30 @@ impl OrdinaryPropertyDescriptor {
             ..Self::default()
         }
     }
+}
+
+/// What [`Js::new_object_from`](super::Js::new_object_from) and
+/// [`Js::new_array_from_inits`](super::Js::new_array_from_inits) make a
+/// property or an element of: a value, or Rust text made into a string on
+/// the heap in one copy (no [`JsString`] between).
+#[derive(Clone, Debug, PartialEq)]
+pub enum InitValue<'a> {
+    Value(Value),
+    Text(&'a str),
+}
+
+impl From<Value> for InitValue<'_> {
+    fn from(value: Value) -> Self {
+        InitValue::Value(value)
+    }
+}
+
+/// An own data property of a plain object, as [`Js::plain_own_data`](super::Js::plain_own_data) reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnData {
+    pub key: PropertyKey,
+    pub value: Value,
+    pub enumerable: bool,
 }
 
 /// A complete own property, as `[[GetOwnProperty]]` reports it.

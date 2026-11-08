@@ -2044,3 +2044,163 @@ fn ordinary_objects_are_told_from_exotic_ones() {
         );
     }
 }
+
+#[test]
+fn plain_objects_are_made_and_read_in_one_step() {
+    use quickjs_oxide::engine::api::core::{InitValue, PropertyKey};
+    let (runtime, context) = runtime();
+    let key = |text: &str| PropertyKey::from_js_string(JsString::try_from_utf8(text).unwrap());
+    let text = |text: &str| Value::String(JsString::try_from_utf8(text).unwrap());
+    // a setter on Object.prototype does not run for a data property made in one step
+    context
+        .eval("Object.defineProperty(Object.prototype, 'b', {set(v) { globalThis.ran = v }, configurable: true})")
+        .unwrap();
+    let made = runtime
+        .new_object_from(&[
+            (key("a"), Value::Int(1).into()),
+            (key("b"), InitValue::Text("two")),
+            (key("a"), Value::Int(3).into()),
+        ])
+        .unwrap();
+    let show = match context
+        .eval("(o) => JSON.stringify(o) + ' ' + typeof globalThis.ran")
+        .unwrap()
+    {
+        Value::Object(object) => runtime.as_callable(&object).unwrap().expect("a function"),
+        other => panic!("not a function: {other:?}"),
+    };
+    let cx = runtime.context();
+    assert_eq!(
+        cx.call(&show, Value::Undefined, &[Value::Object(made.clone())])
+            .unwrap(),
+        text(r#"{"a":3,"b":"two"} undefined"#)
+    );
+    let object_prototype = runtime.get_prototype_of(&made).unwrap();
+    let entries = runtime
+        .plain_own_data(&made, object_prototype.as_ref())
+        .unwrap()
+        .expect("a plain object");
+    let read: Vec<(Option<JsString>, Value, bool)> = entries
+        .into_iter()
+        .map(|entry| (entry.key.to_js_string(), entry.value, entry.enumerable))
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            (JsString::try_from_utf8("a").ok(), Value::Int(3), true),
+            (JsString::try_from_utf8("b").ok(), text("two"), true),
+        ]
+    );
+    let object_of = |source: &str| match context.eval(source).unwrap() {
+        Value::Object(object) => object,
+        other => panic!("not an object: {other:?}"),
+    };
+    let hidden = object_of("Object.defineProperty({x: 1}, 'y', {value: 2})");
+    let hidden = runtime
+        .plain_own_data(&hidden, object_prototype.as_ref())
+        .unwrap()
+        .expect("a plain object");
+    assert_eq!(
+        hidden
+            .iter()
+            .map(|entry| entry.enumerable)
+            .collect::<Vec<_>>(),
+        [true, false]
+    );
+    for source in [
+        "({get a() { return 1 }})",
+        "Object.create(null)",
+        "[1]",
+        "new Proxy({}, {})",
+        "new Map()",
+        "(function () {})",
+    ] {
+        assert!(
+            runtime
+                .plain_own_data(&object_of(source), object_prototype.as_ref())
+                .unwrap()
+                .is_none(),
+            "{source}"
+        );
+    }
+    assert_eq!(
+        runtime.dense_array_values(&object_of("[1, 'x']")).unwrap(),
+        Some(vec![Value::Int(1), text("x")])
+    );
+    let made = runtime
+        .new_array_from_inits(&[InitValue::Text("é ☃"), Value::Null.into()])
+        .unwrap();
+    assert_eq!(
+        runtime.dense_array_values(&made).unwrap(),
+        Some(vec![text("é ☃"), Value::Null])
+    );
+    for source in [
+        "[1, , 3]",
+        "Object.defineProperty([1], 0, {get() { return 2 }})",
+        "({length: 0})",
+        "new Proxy([], {})",
+    ] {
+        assert!(
+            runtime
+                .dense_array_values(&object_of(source))
+                .unwrap()
+                .is_none(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn an_index_key_is_read_as_a_number() {
+    use quickjs_oxide::engine::api::core::PropertyKey;
+    let key = |text: &str| PropertyKey::from_js_string(JsString::try_from_utf8(text).unwrap());
+    assert_eq!(key("7").as_index(), Some(7));
+    assert_eq!(PropertyKey::index(42).as_index(), Some(42));
+    for text in ["07", "x", "", "4294967295", "-1"] {
+        assert_eq!(key(text).as_index(), None, "{text}");
+    }
+}
+
+#[test]
+fn a_text_argument_is_read_as_rust_text() {
+    use quickjs_oxide::engine::api::core::{FunctionOptions, Scope};
+    let (runtime, context) = runtime();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let into = Rc::clone(&seen);
+    let function = context
+        .new_function(
+            FunctionOptions::new("texts"),
+            move |scope: &mut Scope<'_>| {
+                for index in 0..scope.argc() {
+                    let lifted = match scope.arg(index) {
+                        Value::String(text) => Some(text.to_utf8_lossy()),
+                        _ => None,
+                    };
+                    let text = scope.arg_text(index);
+                    assert_eq!(text, lifted);
+                    into.borrow_mut().push(text);
+                }
+                Ok(Value::Undefined)
+            },
+        )
+        .unwrap();
+    let args = match context
+        .eval(r"['ascii', 'caf\u00e9', '\u2603', '\ud800', 7, 'a' + 'b'.repeat(3)]")
+        .unwrap()
+    {
+        Value::Object(array) => runtime.dense_array_values(&array).unwrap().unwrap(),
+        other => panic!("not an array: {other:?}"),
+    };
+    context.call(&function, Value::Undefined, &args).unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        [
+            Some("ascii".to_string()),
+            Some("café".to_string()),
+            Some("☃".to_string()),
+            Some("\u{fffd}".to_string()),
+            None,
+            Some("abbb".to_string()),
+        ]
+    );
+}
