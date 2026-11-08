@@ -24,6 +24,7 @@ mod generator;
 mod global;
 mod iterator;
 mod iterator_helpers;
+mod joined;
 mod json;
 mod math;
 mod number;

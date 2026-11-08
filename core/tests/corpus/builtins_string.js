@@ -22,3 +22,6 @@ var wide = 'α,β,γ', narrow = 'a,b,c';
 print(wide.replaceAll(',', ';'), narrow.replace('α', '!'), wide.indexOf(','), wide.includes('β,'), narrow.indexOf('b', 2), wide.replace('x', '?') === wide, 'é,é'.replaceAll(',', 'α'));
 var named = /(?<n>x)/g;
 print('abc'.replace(named, '!'), 'axc'.replace(named, '[$<n>]'), 'abab'.replace(/b/g, function (m, i) { return m.toUpperCase() + i; }));
+print([1, 2.5, -0, 1e21, 'x', null, undefined, [3, 4], true].join(';'), ['a', 'β'].join('·'), ['a', 'b'].join('β'), [].join('β') === '', [7].join());
+print('ab'.padStart(7, 'xyz'), 'ab'.padEnd(5), 'ab'.padEnd(4, 'β'), 'β'.padStart(3, 'a'), 'ab'.padStart(1, 'x'), 'ab'.padEnd(6, ''));
+print('éÿß'.toUpperCase(), 'ÉΑ'.toLowerCase(), 'é'.toUpperCase().length, 'ÿ'.toUpperCase().charCodeAt(0));

@@ -8,6 +8,7 @@
 
 use std::cmp::Ordering;
 
+use super::joined::Joined;
 use super::{
     Native, accessor, install_constructor, link_constructor, methods, plain_object, string_units,
     this_object,
@@ -17,7 +18,7 @@ use crate::heap::atom::PropertyKey;
 use crate::heap::object::{ObjectKind, flags};
 use crate::runtime::{Intrinsic, Names, WellKnown};
 use crate::shape::PropertyFlags;
-use crate::value::{ObjectId, Value};
+use crate::value::{Kind, ObjectId, Value};
 use crate::vm::native::CallSite;
 use crate::vm::object::{self as internal};
 use crate::vm::{Cx, Throw, error, iter, number, ops};
@@ -756,24 +757,32 @@ pub(crate) fn join_with(
         return Err(error::stack_overflow(cx));
     }
     let result = (|| {
-        let mut joined: Vec<u16> = Vec::new();
+        let mut joined = Joined::with_capacity(0);
         for index in 0..length {
             if index > 0 {
-                joined.extend_from_slice(separator);
+                joined.push_units(separator);
             }
             let value = get_at(cx, object, index)?;
-            if value.is_undefined() || value.is_null() {
-                continue;
+            match value.kind() {
+                Kind::Undefined | Kind::Null => {}
+                Kind::String => joined.push_string(cx, value.as_string().unwrap()),
+                Kind::Int32 => {
+                    joined.push_bytes(ops::Digits::new(value.as_int32().unwrap()).as_bytes());
+                }
+                Kind::Number => {
+                    joined.push_bytes(number::text(value.as_f64().unwrap()).as_bytes());
+                }
+                _ => {
+                    // The text is copied out before anything else allocates.
+                    let text = ops::to_string(cx, value)?;
+                    joined.push_string(cx, text.as_string().unwrap());
+                }
             }
-            if let Some(string) = value.as_string() {
-                joined.extend(cx.heap.string(string).repr().units());
-                continue;
+            if joined.len() > super::string::MAX_STRING {
+                return Err(error::string_too_long(cx));
             }
-            // The text is copied out before anything else allocates.
-            let text = ops::to_string(cx, value)?;
-            joined.extend(cx.heap.string(text.as_string().unwrap()).repr().units());
         }
-        string_units(cx, &joined)
+        joined.finish(cx)
     })();
     cx.heap.vm.leave_native();
     result
