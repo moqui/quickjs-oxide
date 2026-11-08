@@ -536,6 +536,45 @@ struct ControlFrame {
     undo_len: usize,
 }
 
+/// The buffers of the last search's [`AttemptState`], kept for the thread's
+/// next (a nested search takes none and allocates its own).
+#[derive(Default)]
+struct Spare {
+    captures: Vec<Option<usize>>,
+    registers: Vec<RegisterValue>,
+    undo: Vec<Undo>,
+    controls: Vec<ControlFrame>,
+}
+
+/// The most backtrack or undo entries a kept buffer may hold room for.
+const SPARE_MAX: usize = 4096;
+
+std::thread_local! {
+    static SPARE: std::cell::RefCell<Option<Spare>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The buffers go back for the thread's next search, unless a deep
+/// backtrack grew them past [`SPARE_MAX`] entries.
+impl Drop for AttemptState {
+    fn drop(&mut self) {
+        if self.undo.capacity() > SPARE_MAX || self.controls.capacity() > SPARE_MAX {
+            return;
+        }
+        let spare = Spare {
+            captures: std::mem::take(&mut self.captures),
+            registers: std::mem::take(&mut self.registers),
+            undo: std::mem::take(&mut self.undo),
+            controls: std::mem::take(&mut self.controls),
+        };
+        // a thread being torn down has no slot left: the buffers just drop
+        let _ = SPARE.try_with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                *slot = Some(spare);
+            }
+        });
+    }
+}
+
 struct AttemptState {
     pc: usize,
     position: usize,
@@ -555,15 +594,36 @@ impl AttemptState {
         self.controls.clear();
     }
 
+    /// A state for a program with `capture_count` captures and
+    /// `register_count` registers, on this thread's spare buffers when the
+    /// last search left them (its drop), so a search allocates
+    /// nothing for its state once one has run.
     fn new(capture_count: u8, register_count: u8, position: usize) -> Result<Self, ExecError> {
-        let mut captures = Vec::new();
+        let Spare {
+            mut captures,
+            mut registers,
+            mut undo,
+            mut controls,
+        } = SPARE
+            .try_with(|spare| {
+                spare
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut spare| spare.take())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        captures.clear();
+        registers.clear();
+        undo.clear();
+        controls.clear();
         let capture_slots = usize::from(capture_count) * 2;
         captures
             .try_reserve_exact(capture_slots)
             .map_err(|_| ExecError::OutOfMemory)?;
         captures.resize(capture_slots, None);
 
-        let mut registers = Vec::new();
         registers
             .try_reserve_exact(usize::from(register_count))
             .map_err(|_| ExecError::OutOfMemory)?;
@@ -574,8 +634,8 @@ impl AttemptState {
             position,
             captures,
             registers,
-            undo: Vec::new(),
-            controls: Vec::new(),
+            undo,
+            controls,
         })
     }
 
