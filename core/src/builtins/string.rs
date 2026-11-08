@@ -329,7 +329,7 @@ pub(super) fn code_point_at(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Th
 // ---- searching ----
 
 /// The first index from `from` at which `needle` occurs in `haystack`.
-pub(crate) fn find(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+pub(crate) fn find<T: PartialEq>(haystack: &[T], needle: &[T], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return (from <= haystack.len()).then_some(from);
     }
@@ -339,15 +339,56 @@ pub(crate) fn find(haystack: &[u16], needle: &[u16], from: usize) -> Option<usiz
     (from..=haystack.len() - needle.len()).find(|&at| haystack[at..at + needle.len()] == *needle)
 }
 
+/// [`find`] of the string `needle` in the string `haystack`, read where they
+/// lie: two one-byte strings compare as bytes, with no copy of either.
+fn find_string(cx: &Cx<'_>, haystack: StringId, needle: StringId, from: usize) -> Option<usize> {
+    match (
+        cx.heap.string(haystack).repr(),
+        cx.heap.string(needle).repr(),
+    ) {
+        (StringRepr::OneByte(haystack), StringRepr::OneByte(needle)) => {
+            find(haystack, needle, from)
+        }
+        (StringRepr::TwoByte(haystack), StringRepr::TwoByte(needle)) => {
+            find(haystack, needle, from)
+        }
+        (StringRepr::TwoByte(haystack), StringRepr::OneByte(needle)) => {
+            find_widened(haystack, needle, from)
+        }
+        (StringRepr::OneByte(haystack), StringRepr::TwoByte(needle)) => {
+            find_widened(haystack, needle, from)
+        }
+    }
+}
+
+/// [`find`] across the two representations, comparing unit by unit.
+fn find_widened<A: Copy + Into<u16>, B: Copy + Into<u16>>(
+    haystack: &[A],
+    needle: &[B],
+    from: usize,
+) -> Option<usize> {
+    if needle.is_empty() {
+        return (from <= haystack.len()).then_some(from);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    (from..=haystack.len() - needle.len()).find(|&at| {
+        haystack[at..at + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(&unit, &other)| unit.into() == other.into())
+    })
+}
+
 pub(super) fn index_of(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let string = this_string(cx, &site)?;
     let search = site.arg(cx, 0);
     let search = to_string_id(cx, search)?;
     let position = site.arg(cx, 1);
     let position = integer(cx, position)?;
-    let haystack = units(cx, string);
-    let from = position.clamp(0.0, haystack.len() as f64) as usize;
-    let found = find(&haystack, &units(cx, search), from);
+    let from = position.clamp(0.0, length(cx, string) as f64) as usize;
+    let found = find_string(cx, string, search, from);
     Ok(Value::int32(found.map_or(-1, |at| at as i32)))
 }
 
@@ -399,11 +440,8 @@ pub(super) fn includes(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> 
     let search = plain_search(cx, search)?;
     let position = site.arg(cx, 1);
     let position = integer(cx, position)?;
-    let haystack = units(cx, string);
-    let from = position.clamp(0.0, haystack.len() as f64) as usize;
-    Ok(Value::bool(
-        find(&haystack, &units(cx, search), from).is_some(),
-    ))
+    let from = position.clamp(0.0, length(cx, string) as f64) as usize;
+    Ok(Value::bool(find_string(cx, string, search, from).is_some()))
 }
 
 pub(super) fn starts_with(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
@@ -982,23 +1020,26 @@ fn replace_impl(cx: &mut Cx<'_>, site: CallSite, all: bool) -> Result<Value, Thr
         let replacement = to_string_id(cx, replace_value)?;
         Some(units(cx, replacement))
     };
-    let haystack = units(cx, string);
-    let needle = units(cx, search);
+    // The matches are found where the strings lie: a subject with none is
+    // returned with no copy of its units.
+    let (haystack_len, needle_len) = (length(cx, string), length(cx, search));
     let mut positions = Vec::new();
     let mut from = 0;
-    while let Some(at) = find(&haystack, &needle, from) {
+    while let Some(at) = find_string(cx, string, search, from) {
         positions.push(at);
         if !all {
             break;
         }
-        from = at + needle.len().max(1);
-        if from > haystack.len() {
+        from = at + needle_len.max(1);
+        if from > haystack_len {
             break;
         }
     }
     if positions.is_empty() {
         return Ok(Value::string(string));
     }
+    let haystack = units(cx, string);
+    let needle = units(cx, search);
     let mut out = Vec::with_capacity(haystack.len());
     let mut end_of_last = 0;
     for position in positions {

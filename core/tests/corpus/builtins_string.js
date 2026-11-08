@@ -18,3 +18,7 @@ try { String.prototype.charAt.call(null, 0); } catch (e) { print(e.name); }
 var built = ''; for (var i = 0; i < 100; i++) built += String.fromCharCode(97 + i % 26);
 print(built.length, built.charCodeAt(99), built.slice(-3));
 print('Ünïcödé'.indexOf('c'), 'Ünïcödé'.slice(1, 3), 'Ünïcödé'.charCodeAt(0));
+var wide = 'α,β,γ', narrow = 'a,b,c';
+print(wide.replaceAll(',', ';'), narrow.replace('α', '!'), wide.indexOf(','), wide.includes('β,'), narrow.indexOf('b', 2), wide.replace('x', '?') === wide, 'é,é'.replaceAll(',', 'α'));
+var named = /(?<n>x)/g;
+print('abc'.replace(named, '!'), 'axc'.replace(named, '[$<n>]'), 'abab'.replace(/b/g, function (m, i) { return m.toUpperCase() + i; }));
