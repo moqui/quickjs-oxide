@@ -197,6 +197,14 @@ impl OrdinaryPropertyDescriptor {
     }
 }
 
+/// An own data property of a plain object, as [`Js::plain_own_data`](super::Js::plain_own_data) reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnData {
+    pub key: PropertyKey,
+    pub value: Value,
+    pub enumerable: bool,
+}
+
 /// A complete own property, as `[[GetOwnProperty]]` reports it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CompleteOrdinaryPropertyDescriptor {

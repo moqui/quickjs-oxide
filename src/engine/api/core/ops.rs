@@ -18,7 +18,7 @@ use super::image::CodeImage;
 use super::promise::PromiseCapability;
 use super::property::{
     AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, Key,
-    OrdinaryPropertyDescriptor, PropertyKey, WellKnownSymbol,
+    OrdinaryPropertyDescriptor, OwnData, PropertyKey, WellKnownSymbol,
 };
 use super::runtime::{Preloaded, PromiseSnapshot, PromiseState, Shared, slot};
 use super::value::{CallableRef, ObjectRef, Slot, SymbolRef, Value};
@@ -823,6 +823,122 @@ impl View<'_> {
         self.complete_with(result)
     }
 
+    /// A plain object inheriting from `%Object.prototype%` with `entries` as
+    /// its own data properties in order, each by `CreateDataProperty`: no
+    /// `[[Set]]`, so no setter runs and no receiver is lowered. A key given
+    /// twice keeps its first place and its last value.
+    pub(crate) fn new_object_from(
+        &mut self,
+        entries: &[(PropertyKey, Value)],
+    ) -> JsResult<ObjectRef> {
+        let object = self.core.new_object()?;
+        self.temp(oxide_core::Value::object(object));
+        for (key, value) in entries {
+            let key = self.key(key)?;
+            let value = self.lower(value)?;
+            let descriptor = oxide_core::PropertyDescriptor {
+                value: Some(value),
+                get: None,
+                set: None,
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(true),
+            };
+            let result = self.core.define_own_property(object, key, &descriptor);
+            if !self.complete_with(result)? {
+                return Err(RuntimeError::Invariant("a new object's data property"));
+            }
+        }
+        Ok(self.lift_object(object))
+    }
+
+    /// The own properties of a plain object, in `[[OwnPropertyKeys]]` order:
+    /// `None` unless `object` is ordinary with no internal slots (not an
+    /// array, a function or any builtin or host object), inherits from
+    /// `prototype`, and has only data properties. Runs no code.
+    pub(crate) fn plain_own_data(
+        &mut self,
+        object: &ObjectRef,
+        prototype: Option<&ObjectRef>,
+    ) -> JsResult<Option<Vec<OwnData>>> {
+        let id = self.object(object)?;
+        if self.core.object_kind(id) != oxide_core::ObjectKind::Ordinary {
+            return Ok(None);
+        }
+        let expected = prototype.map(|p| self.object(p)).transpose()?;
+        let result = self.core.get_prototype_of(id);
+        if self.complete_with(result)? != expected {
+            return Ok(None);
+        }
+        let result = self.core.own_property_keys(id);
+        let keys = self.complete_with(result)?;
+        let mut entries = Vec::with_capacity(keys.len());
+        for key in keys {
+            let result = self.core.get_own_property(id, key);
+            let Some(descriptor) = self.complete_with(result)? else {
+                continue;
+            };
+            if descriptor.is_accessor() {
+                return Ok(None);
+            }
+            let value = descriptor.value.unwrap_or(oxide_core::Value::UNDEFINED);
+            entries.push(OwnData {
+                key: self.lift_key(key)?,
+                value: self.lift(value)?,
+                enumerable: descriptor.enumerable.unwrap_or(false),
+            });
+        }
+        Ok(Some(entries))
+    }
+
+    /// The elements of an Array, `0` to its `length`: `None` unless `object`
+    /// is an Array whose every index below its length is an own data
+    /// property (no hole, which would read through the prototype, and no
+    /// accessor). Runs no code.
+    pub(crate) fn dense_array_values(
+        &mut self,
+        object: &ObjectRef,
+    ) -> JsResult<Option<Vec<Value>>> {
+        let id = self.object(object)?;
+        if self.core.object_kind(id) != oxide_core::ObjectKind::Array {
+            return Ok(None);
+        }
+        let length_key = self.core.key_from_latin1(b"length")?;
+        let result = self.core.get_own_property(id, length_key);
+        let length = match self.complete_with(result)? {
+            Some(descriptor) if !descriptor.is_accessor() => descriptor.value.and_then(|value| {
+                value
+                    .as_int32()
+                    .and_then(|length| u32::try_from(length).ok())
+                    .or_else(|| {
+                        value
+                            .as_f64()
+                            .filter(|n| n.fract() == 0.0 && *n >= 0.0 && *n <= f64::from(u32::MAX))
+                            .map(|n| n as u32)
+                    })
+            }),
+            _ => None,
+        };
+        let Some(length) = length else {
+            return Ok(None);
+        };
+        let mut values = Vec::with_capacity(length as usize);
+        for index in 0..length {
+            let Some(key) = oxide_core::PropertyKey::index(index) else {
+                return Ok(None);
+            };
+            let result = self.core.get_own_property(id, key);
+            match self.complete_with(result)? {
+                Some(descriptor) if !descriptor.is_accessor() => {
+                    let value = descriptor.value.unwrap_or(oxide_core::Value::UNDEFINED);
+                    values.push(self.lift(value)?);
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(values))
+    }
+
     /// Whether `object` is ordinary: no Proxy traps, no embedder hooks, no
     /// other exotic internal methods. Reading an ordinary object's own
     /// properties, keys and prototype runs no code (its accessors run only
@@ -1440,6 +1556,17 @@ js_ops! {
     /// Whether the object has no exotic internal methods (no Proxy, no host
     /// hooks): reading its own properties and prototype runs no code.
     fn is_ordinary_object(&mut self, object: &ObjectRef) -> JsResult<bool>;
+    /// A plain object inheriting from `%Object.prototype%` with `entries` as
+    /// its own data properties, each by `CreateDataProperty` (no setter runs).
+    fn new_object_from(&mut self, entries: &[(PropertyKey, Value)]) -> JsResult<ObjectRef>;
+    /// A plain object's own properties in order, when it is ordinary with no
+    /// internal slots, inherits from `prototype` and has only data
+    /// properties; `None` otherwise. Runs no code.
+    fn plain_own_data(&mut self, object: &ObjectRef, prototype: Option<&ObjectRef>) -> JsResult<Option<Vec<OwnData>>>;
+    /// An Array's elements, when every index below its length is an own data
+    /// property; `None` otherwise (a hole, an accessor, not an Array). Runs
+    /// no code.
+    fn dense_array_values(&mut self, object: &ObjectRef) -> JsResult<Option<Vec<Value>>>;
 
     // ---- conversions and printing ----
 

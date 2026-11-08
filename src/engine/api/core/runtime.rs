@@ -817,6 +817,31 @@ impl Runtime {
         self.engine()?.view().is_ordinary_object(object)
     }
 
+    /// [`Js::new_object_from`](super::Js::new_object_from).
+    pub fn new_object_from(
+        &self,
+        entries: &[(super::PropertyKey, super::Value)],
+    ) -> Result<ObjectRef, RuntimeError> {
+        self.engine()?.view().new_object_from(entries)
+    }
+
+    /// [`Js::plain_own_data`](super::Js::plain_own_data).
+    pub fn plain_own_data(
+        &self,
+        object: &ObjectRef,
+        prototype: Option<&ObjectRef>,
+    ) -> Result<Option<Vec<super::OwnData>>, RuntimeError> {
+        self.engine()?.view().plain_own_data(object, prototype)
+    }
+
+    /// [`Js::dense_array_values`](super::Js::dense_array_values).
+    pub fn dense_array_values(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<Option<Vec<super::Value>>, RuntimeError> {
+        self.engine()?.view().dense_array_values(object)
+    }
+
     pub fn is_error_object(&self, object: &ObjectRef) -> Result<bool, RuntimeError> {
         self.engine()?.view().is_error_object(object)
     }
