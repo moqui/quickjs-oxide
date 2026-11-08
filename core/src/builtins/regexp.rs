@@ -1133,6 +1133,10 @@ pub(super) fn symbol_replace(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, T
             advance_empty(cx, object, string, unicode)?;
         }
     }
+    if results.is_empty() {
+        // The subject as it is, with no copy of its units.
+        return Ok(Value::string(string));
+    }
     let text = units(cx, string);
     let mut accumulated: Vec<u16> = Vec::with_capacity(text.len());
     let mut next_position = 0usize;
@@ -1277,6 +1281,8 @@ fn replace_pristine(
     let subject_len = cx.heap.string_len(string);
     let mut accumulated = Joined::with_capacity(subject_len);
     let mut next_position = 0usize;
+    // A callback's arguments, refilled for each match.
+    let mut args = Vec::new();
     for found in matches {
         let captures = found.captures();
         let range = captures[0].clone().unwrap_or(0..0);
@@ -1306,7 +1312,7 @@ fn replace_pristine(
             }
             _ => {
                 let mark = cx.heap.roots().mark();
-                let mut args = Vec::with_capacity(captures.len() + 2);
+                args.clear();
                 for capture in captures {
                     let value = match capture {
                         Some(range) => substring_value(cx, string, range.start, range.end)?,
