@@ -778,8 +778,8 @@ pub(crate) fn string_units(cx: &mut Cx<'_>, units: &[u16]) -> Result<Value, Thro
     if units.len() > string::MAX_STRING {
         return Err(vm_error::string_too_long(cx));
     }
-    let result = if units.len() == 1 {
-        cx.heap.intern_units(units)
+    let result = if let [unit] = *units {
+        cx.heap.unit_string(unit)
     } else if units.is_empty() {
         return Ok(Value::string(cx.realm.names.empty));
     } else {
@@ -793,11 +793,22 @@ pub(crate) fn string_units(cx: &mut Cx<'_>, units: &[u16]) -> Result<Value, Thro
 /// A string value from a representation already canonical.
 pub(crate) fn string_repr(cx: &mut Cx<'_>, repr: StringRepr) -> Result<Value, Throw> {
     if repr.len() <= 1 {
-        let units: Vec<u16> = repr.units().collect();
-        return string_units(cx, &units);
+        return match repr.len() {
+            0 => Ok(Value::string(cx.realm.names.empty)),
+            _ => unit_string(cx, repr.unit(0)),
+        };
     }
     cx.heap
         .alloc_string_repr(repr)
+        .map(Value::string)
+        .map_err(|error| vm_error::heap_error(cx, error))
+}
+
+/// The one-unit string `unit`, an atom.
+#[inline]
+pub(crate) fn unit_string(cx: &mut Cx<'_>, unit: u16) -> Result<Value, Throw> {
+    cx.heap
+        .unit_string(unit)
         .map(Value::string)
         .map_err(|error| vm_error::heap_error(cx, error))
 }

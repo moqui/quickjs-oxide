@@ -154,6 +154,13 @@ pub(crate) fn substring_value(
     if start == 0 && end == length(cx, string) {
         return Ok(Value::string(string));
     }
+    if end - start <= 1 {
+        if end == start {
+            return Ok(Value::string(cx.realm.names.empty));
+        }
+        let unit = cx.heap.string(string).repr().unit(start);
+        return super::unit_string(cx, unit);
+    }
     let repr = match &cx.heap.string(string).repr() {
         StringRepr::OneByte(bytes) => StringRepr::OneByte(bytes[start..end].into()),
         StringRepr::TwoByte(units) => StringRepr::from_units(&units[start..end]),

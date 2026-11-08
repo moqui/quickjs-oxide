@@ -189,6 +189,12 @@ pub struct Heap {
     /// the fast paths that compare an instance's shape with it hold after
     /// every instance has been collected.
     pub(crate) regexp_instance_shape: Option<(ShapeId, u32)>,
+    /// The atoms of the one-unit Latin-1 strings, indexed by the unit: made
+    /// as each is first asked for ([`Heap::unit_string`]) and marked as
+    /// roots, so `charAt`, `s[i]`, `split("")` and one-character matches
+    /// find theirs with no hashing or allocation. Boxed and made on first
+    /// use, so a runtime that never asks costs one pointer.
+    pub(crate) unit_strings: Option<Box<[Option<StringId>; 256]>>,
     /// The job queue: roots until each runs.
     pub(crate) jobs: std::collections::VecDeque<crate::vm::jobs::Job>,
 }
@@ -257,6 +263,7 @@ impl Heap {
             pending_closure_shapes: [None; CLOSURE_SHAPES],
             arguments_shapes: [None; 2],
             regexp_instance_shape: None,
+            unit_strings: None,
             jobs: std::collections::VecDeque::new(),
         };
         let cell = heap
@@ -1358,6 +1365,30 @@ impl Heap {
 
     pub fn intern_units(&mut self, units: &[u16]) -> Result<StringId, HeapError> {
         self.intern_repr(StringRepr::from_units(units))
+    }
+
+    /// The one-unit string `unit`, an atom: a Latin-1 unit's from
+    /// [`Heap::unit_strings`], which keeps it alive, so the atom mode does
+    /// not need to hold it.
+    #[inline]
+    pub fn unit_string(&mut self, unit: u16) -> Result<StringId, HeapError> {
+        if let Some(table) = &self.unit_strings
+            && let Some(&Some(id)) = table.get(usize::from(unit))
+        {
+            return Ok(id);
+        }
+        self.new_unit_string(unit)
+    }
+
+    #[inline(never)]
+    fn new_unit_string(&mut self, unit: u16) -> Result<StringId, HeapError> {
+        let Ok(byte) = u8::try_from(unit) else {
+            return self.intern_units(&[unit]);
+        };
+        let id = self.intern_latin1(&[byte])?;
+        self.unit_strings
+            .get_or_insert_with(|| Box::new([None; 256]))[usize::from(byte)] = Some(id);
+        Ok(id)
     }
 
     /// The atom of the Latin-1 string `bytes`; it allocates only when the

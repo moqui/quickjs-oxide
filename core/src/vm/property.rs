@@ -243,7 +243,7 @@ pub(crate) fn get(cx: &mut Cx<'_>, receiver: Value, key: PropertyKey) -> Result<
                     let unit = cx.heap.string(id).repr().unit(index as usize);
                     let string = cx
                         .heap
-                        .intern_units(&[unit])
+                        .unit_string(unit)
                         .map_err(|_| error::oom(cx.realm))?;
                     return Ok(Value::string(string));
                 }
