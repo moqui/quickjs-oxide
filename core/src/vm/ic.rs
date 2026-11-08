@@ -261,6 +261,18 @@ pub struct IcStore {
     stats: IcStats,
 }
 
+/// Free entries below which [`IcStore::compact`] leaves the store as it is.
+const COMPACT_MIN: usize = 1024;
+
+/// Gives back a vector's capacity once it is less than half used, keeping a
+/// quarter more than its length for the next growth.
+fn shrink<T>(vector: &mut Vec<T>) {
+    let len = vector.len();
+    if vector.capacity() > 2 * len + 64 {
+        vector.shrink_to(len + len / 4);
+    }
+}
+
 impl IcStore {
     /// Reserves the entries of a unit entered for the first time and sets its
     /// `ic_base`: the first free range that fits, else the end of the store.
@@ -325,6 +337,12 @@ impl IcStore {
         }
         #[cfg(any(feature = "ic-stats", debug_assertions))]
         self.stats.site_misses[range].fill(0);
+        self.free_range(start, count);
+    }
+
+    /// Returns the empty range `start .. start + count` to the free list,
+    /// merged with its neighbours.
+    fn free_range(&mut self, start: u32, count: u32) {
         let position = self.free.partition_point(|&(free, _)| free < start);
         let after = self
             .free
@@ -346,6 +364,94 @@ impl IcStore {
             }
             (false, false) => self.free.insert(position, (start, count)),
         }
+    }
+
+    /// Moves the ranges of `units` (the heap's dynamic units, none of them
+    /// running: no frame holds a base) down into the free ranges below them,
+    /// highest first, each to the lowest that fits, so the free entries
+    /// gather at the end for [`IcStore::trim`]. Worth it only once a good
+    /// share of the store is free.
+    pub(crate) fn compact<'u>(&mut self, units: impl IntoIterator<Item = &'u CodeUnit>) {
+        let free = self.free_len();
+        if free < COMPACT_MIN || free * 4 < self.entries.len() {
+            return;
+        }
+        let mut held = units
+            .into_iter()
+            .filter(|unit| {
+                unit.ic_count > 0 && unit.ic_base.get() != crate::bytecode::IC_UNRESERVED
+            })
+            .collect::<Vec<_>>();
+        held.sort_unstable_by_key(|unit| std::cmp::Reverse(unit.ic_base.get()));
+        for unit in held {
+            let (old, count) = (unit.ic_base.get(), unit.ic_count);
+            let Some(position) = self
+                .free
+                .iter()
+                .position(|&(start, len)| start < old && len >= count)
+            else {
+                continue;
+            };
+            let (start, len) = self.free[position];
+            if len == count {
+                self.free.remove(position);
+            } else {
+                self.free[position] = (start + count, len - count);
+            }
+            let (from, to) = (old as usize, start as usize);
+            let count = count as usize;
+            self.entries.copy_within(from..from + count, to);
+            self.entries[from..from + count].fill(IcEntry::EMPTY);
+            self.kinds.copy_within(from..from + count, to);
+            #[cfg(any(feature = "ic-stats", debug_assertions))]
+            {
+                self.stats.site_misses.copy_within(from..from + count, to);
+                self.stats.site_misses[from..from + count].fill(0);
+            }
+            unit.ic_base.set(start);
+            self.free_range(old, count as u32);
+        }
+    }
+
+    /// Gives back the free entries at the end of the store and the free
+    /// polymorphic rows at the end of theirs, and the capacity the store no
+    /// longer needs once it is less than half used, so a runtime whose
+    /// units went does not keep their caches' room.
+    pub(crate) fn trim(&mut self) {
+        let end = self.entries.len() as u32;
+        if let Some(&(start, len)) = self.free.last()
+            && start + len == end
+        {
+            self.free.pop();
+            self.entries.truncate(start as usize);
+            self.kinds.truncate(start as usize);
+            #[cfg(any(feature = "ic-stats", debug_assertions))]
+            self.stats.site_misses.truncate(start as usize);
+        }
+        if self.poly_free.len() == self.poly.len() {
+            self.poly.clear();
+            self.poly_kinds.clear();
+            self.poly_free.clear();
+        } else if !self.poly_free.is_empty() {
+            self.poly_free.sort_unstable();
+            while self
+                .poly_free
+                .last()
+                .is_some_and(|&row| row as usize + 1 == self.poly.len())
+            {
+                self.poly_free.pop();
+                self.poly.pop();
+                self.poly_kinds.pop();
+            }
+        }
+        shrink(&mut self.entries);
+        shrink(&mut self.kinds);
+        shrink(&mut self.free);
+        shrink(&mut self.poly);
+        shrink(&mut self.poly_kinds);
+        shrink(&mut self.poly_free);
+        #[cfg(any(feature = "ic-stats", debug_assertions))]
+        shrink(&mut self.stats.site_misses);
     }
 
     /// Entries no unit holds.

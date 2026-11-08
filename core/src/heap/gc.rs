@@ -970,6 +970,12 @@ impl Heap {
         freed += self.shapes.sweep(|_, _| {});
         let ics = &mut self.ics;
         self.code.sweep(|unit| ics.release(unit));
+        // With no frame running, no loop holds a cache base: the dynamic
+        // units' caches can move down, and the free end goes.
+        if self.vm.frames.is_empty() {
+            self.ics.compact(self.code.live_units());
+        }
+        self.ics.trim();
         self.regexps.sweep();
         let (rope_bytes, atoms) = (&self.rope_bytes, &mut self.atoms);
         freed += self.strings.sweep(|index, record| {
