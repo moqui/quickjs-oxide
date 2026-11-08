@@ -470,6 +470,10 @@ impl View<'_> {
                     let error = Error::new(crate::engine::api::error::ErrorKind::Syntax, message);
                     Err(self.throw_compile_error(&error, source, filename))
                 }
+                // the lowering ran out of heap: the cap's error, as the parse's is
+                crate::engine::compiler::register::LowerError::Heap(
+                    oxide_core::HeapError::OutOfMemory,
+                ) => Err(RuntimeError::OutOfMemory),
                 other => Err(RuntimeError::Internal(other.to_string())),
             },
         }
