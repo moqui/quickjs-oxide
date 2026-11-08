@@ -859,17 +859,16 @@ impl View<'_> {
                 self.temp(value);
                 Ok(value)
             }
+            InitValue::Object(entries) => self.object_from(entries).map(oxide_core::Value::object),
+            InitValue::Array(values) => self.array_from(values).map(oxide_core::Value::object),
         }
     }
 
-    /// A plain object inheriting from `%Object.prototype%` with `entries` as
-    /// its own data properties in order, each by `CreateDataProperty`: no
-    /// `[[Set]]`, so no setter runs and no receiver is lowered. A key given
-    /// twice keeps its first place and its last value.
-    pub(crate) fn new_object_from(
+    /// [`Self::new_object_from`]'s object, rooted until the view drops.
+    fn object_from(
         &mut self,
         entries: &[(PropertyKey, InitValue<'_>)],
-    ) -> JsResult<ObjectRef> {
+    ) -> JsResult<oxide_core::ObjectId> {
         let object = self.core.new_object()?;
         self.temp(oxide_core::Value::object(object));
         for (key, value) in entries {
@@ -888,18 +887,39 @@ impl View<'_> {
                 return Err(RuntimeError::Invariant("a new object's data property"));
             }
         }
-        Ok(self.lift_object(object))
+        Ok(object)
     }
 
-    /// `CreateArrayFromList` of `values`, Rust text made heap strings in one
-    /// copy.
-    pub(crate) fn new_array_from_inits(&mut self, values: &[InitValue<'_>]) -> JsResult<ObjectRef> {
+    /// [`Self::new_array_from_inits`]'s array, rooted until the view drops.
+    fn array_from(&mut self, values: &[InitValue<'_>]) -> JsResult<oxide_core::ObjectId> {
         let mut lowered = Vec::with_capacity(values.len());
         for value in values {
             lowered.push(self.lower_init(value)?);
         }
         let result = self.core.new_array_from(&lowered);
         let array = self.complete_with(result)?;
+        self.temp(oxide_core::Value::object(array));
+        Ok(array)
+    }
+
+    /// A plain object inheriting from `%Object.prototype%` with `entries` as
+    /// its own data properties in order, each by `CreateDataProperty`: no
+    /// `[[Set]]`, so no setter runs and no receiver is lowered. A key given
+    /// twice keeps its first place and its last value. A nested
+    /// [`InitValue::Object`] or [`InitValue::Array`] is made in the same
+    /// crossing, with no handle of its own.
+    pub(crate) fn new_object_from(
+        &mut self,
+        entries: &[(PropertyKey, InitValue<'_>)],
+    ) -> JsResult<ObjectRef> {
+        let object = self.object_from(entries)?;
+        Ok(self.lift_object(object))
+    }
+
+    /// `CreateArrayFromList` of `values`, Rust text made heap strings in one
+    /// copy, nested objects and arrays made in the same crossing.
+    pub(crate) fn new_array_from_inits(&mut self, values: &[InitValue<'_>]) -> JsResult<ObjectRef> {
+        let array = self.array_from(values)?;
         Ok(self.lift_object(array))
     }
 
