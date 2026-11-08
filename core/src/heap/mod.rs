@@ -180,6 +180,10 @@ pub struct Heap {
     /// are read: the keys of `closure_shapes`, each with the `AUTOINIT` flag,
     /// over no slots. Learned and marked like `closure_shapes`.
     pub(crate) pending_closure_shapes: [Option<ShapeId>; CLOSURE_SHAPES],
+    /// The `name` atom of each builtin native made pending (by its native
+    /// index), which its pending `name` reads until it is materialized:
+    /// marked as roots.
+    pub(crate) native_names: Vec<Option<StringId>>,
     /// The shapes of a new `arguments` object (`length`, `@@iterator`,
     /// `callee`), sloppy then strict: learned from the first of each and
     /// marked as roots.
@@ -261,6 +265,7 @@ impl Heap {
             holes_writable: true,
             closure_shapes: [None; CLOSURE_SHAPES],
             pending_closure_shapes: [None; CLOSURE_SHAPES],
+            native_names: Vec::new(),
             arguments_shapes: [None; 2],
             regexp_instance_shape: None,
             unit_strings: None,
@@ -1042,10 +1047,28 @@ impl Heap {
         native: u32,
         data: Option<ObjectId>,
     ) -> Result<ObjectId, HeapError> {
-        let function = self.alloc_function(prototype, data.map(|data| ScopeId(data.0)))?;
+        self.alloc_native_closure_with(prototype, native, data, 2)
+    }
+
+    /// [`Heap::alloc_native_closure`] with room for `slot_capacity`
+    /// properties: none for a native given a pending shape.
+    pub(crate) fn alloc_native_closure_with(
+        &mut self,
+        prototype: Option<ObjectId>,
+        native: u32,
+        data: Option<ObjectId>,
+        slot_capacity: u32,
+    ) -> Result<ObjectId, HeapError> {
+        let function =
+            self.alloc_function_with(prototype, data.map(|data| ScopeId(data.0)), slot_capacity)?;
         let payload = self.objects.get(function.0).payload;
         self.payloads.functions.get_mut(payload).native = native;
         Ok(function)
+    }
+
+    /// The `name` of a pending builtin native, by its native index.
+    pub(crate) fn native_name(&self, native: u32) -> Option<StringId> {
+        self.native_names.get(native as usize).copied().flatten()
     }
 
     /// Gives a fresh object a cached shape `shape` and its slot values: no
