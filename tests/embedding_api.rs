@@ -590,6 +590,53 @@ fn memory_report_counts_a_known_graph() {
     assert!(text.contains("objects"), "{text}");
 }
 
+/// The caches of units a collection frees go back: a collection with no
+/// script running moves the live dynamic units' caches down and gives back
+/// the free end and the room, and a moved unit's caches still serve it.
+#[test]
+fn a_collection_gives_back_the_caches_of_units_that_went() {
+    let (runtime, context) = runtime();
+    let report = || runtime.memory_report().unwrap();
+    let start = report();
+    // 400 run-time units, each with five property caches, and one kept
+    // after them.
+    context
+        .eval(
+            "for (let i = 0; i < 400; i++) (0, eval)('(function (o) { return o.a' + i + ' + o.b + o.c + o.d + o.e; })')({}); \
+             var keep = (0, eval)('(function (o) { return o.x + o.y; })'); keep({ x: 1, y: 2 });",
+        )
+        .unwrap();
+    let busy = report();
+    // A collection at every allocation frees the units as the loop goes.
+    let stress = cfg!(feature = "gc-stress");
+    assert!(
+        stress || busy.ic_entries >= start.ic_entries + 2000,
+        "{} -> {}",
+        start.ic_entries,
+        busy.ic_entries
+    );
+    runtime.run_gc().unwrap();
+    let after = report();
+    assert!(
+        after.ic_entries < start.ic_entries + 200,
+        "entries {} -> {} -> {}, free {}",
+        start.ic_entries,
+        busy.ic_entries,
+        after.ic_entries,
+        after.ic_free
+    );
+    assert!(
+        stress || after.table_bytes + 16 * 1000 < busy.table_bytes,
+        "table bytes {} -> {}",
+        busy.table_bytes,
+        after.table_bytes
+    );
+    for _ in 0..3 {
+        assert_eq!(context.eval("keep({ x: 3, y: 4 })").unwrap(), Value::Int(7));
+    }
+    assert_eq!(context.eval("keep({ y: 1, x: 5 })").unwrap(), Value::Int(6));
+}
+
 #[test]
 fn symbol_rope_description_survives_collection_without_other_string_roots() {
     let (runtime, context) = runtime();

@@ -153,6 +153,11 @@ impl DynamicUnits {
 
     /// Frees every unmarked unit, passing each to `dead` before it is
     /// dropped. Returns the bytes freed.
+    /// The units alive.
+    pub(crate) fn live_units(&self) -> impl Iterator<Item = &CodeUnit> {
+        self.slots.iter().flatten().map(|unit| &**unit)
+    }
+
     pub(crate) fn sweep(&mut self, mut dead: impl FnMut(&CodeUnit)) -> usize {
         #[cfg(feature = "gc-stress")]
         let held = {
