@@ -150,7 +150,7 @@ impl Printer<'_, '_> {
                 if number == 0.0 && number.is_sign_negative() {
                     self.out.push_str("-0");
                 } else {
-                    self.out.push_str(&super::number::to_string(number));
+                    self.out.push_str(super::number::text(number).as_str());
                 }
             }
             Kind::BigInt => {

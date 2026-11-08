@@ -273,7 +273,19 @@ pub(crate) fn concat(cx: &mut Cx<'_>, a: StringId, b: StringId) -> Result<Value,
 /// which need no string record of their own.
 enum Piece {
     String(StringId),
-    Digits(String),
+    Int(Digits),
+    Number(number::NumberText),
+}
+
+impl Piece {
+    /// A number's digits; `None` for a string.
+    fn digits(&self) -> Option<&[u8]> {
+        match self {
+            Piece::String(_) => None,
+            Piece::Int(digits) => Some(digits.as_bytes()),
+            Piece::Number(text) => Some(text.as_bytes()),
+        }
+    }
 }
 
 /// `x0 + x1 + … + xn`, the operands of `ConcatN`: a chain of `+` from the
@@ -299,17 +311,17 @@ pub(crate) fn concat_n(cx: &mut Cx<'_>, operands: &[Value]) -> Result<Value, Thr
             let primitive = to_primitive(cx, operand, Hint::Default)?;
             root(cx, primitive);
             let piece = match primitive.kind() {
-                Kind::Int32 => Piece::Digits(primitive.as_int32().unwrap().to_string()),
-                Kind::Number => Piece::Digits(number::to_string(primitive.as_f64().unwrap())),
+                Kind::Int32 => Piece::Int(Digits::new(primitive.as_int32().unwrap())),
+                Kind::Number => Piece::Number(number::text(primitive.as_f64().unwrap())),
                 _ => {
                     let string = to_string(cx, primitive)?;
                     root(cx, string);
                     Piece::String(string.as_string().unwrap())
                 }
             };
-            len += match &piece {
-                Piece::String(id) => cx.heap.string_len(*id),
-                Piece::Digits(digits) => digits.len(),
+            len += match (&piece, piece.digits()) {
+                (Piece::String(id), _) => cx.heap.string_len(*id),
+                (_, digits) => digits.map_or(0, <[u8]>::len),
             };
             if len > MAX_STRING_LEN {
                 return Err(error::string_too_long(cx));
@@ -328,9 +340,12 @@ pub(crate) fn concat_n(cx: &mut Cx<'_>, operands: &[Value]) -> Result<Value, Thr
         }
         let mut sum = first;
         for piece in &pieces {
-            let next = match piece {
-                Piece::String(id) => *id,
-                Piece::Digits(digits) => alloc_text(cx, digits)?.as_string().unwrap(),
+            let next = match (piece, piece.digits()) {
+                (Piece::String(id), _) => *id,
+                (_, digits) => cx
+                    .heap
+                    .alloc_string_repr(StringRepr::OneByte(digits.unwrap_or_default().into()))
+                    .map_err(|error| heap_error(cx, error))?,
             };
             root(cx, Value::string(next));
             sum = concat(cx, sum, next)?.as_string().unwrap();
@@ -379,7 +394,7 @@ fn join(cx: &mut Cx<'_>, first: Option<StringId>, pieces: &[Piece]) -> Result<Va
         .into_iter()
         .chain(pieces.iter().filter_map(|piece| match piece {
             Piece::String(id) => Some(*id),
-            Piece::Digits(_) => None,
+            _ => None,
         }));
     let one_byte = strings.clone().all(|id| heap.string_is_one_byte(id));
     let (mut bytes, mut units): (Vec<u8>, Vec<u16>) = (Vec::new(), Vec::new());
@@ -390,8 +405,14 @@ fn join(cx: &mut Cx<'_>, first: Option<StringId>, pieces: &[Piece]) -> Result<Va
                 StringRepr::OneByte(part) if one_byte => bytes.extend_from_slice(part),
                 repr => units.extend(repr.units()),
             },
-            Piece::Digits(digits) if one_byte => bytes.extend_from_slice(digits.as_bytes()),
-            Piece::Digits(digits) => units.extend(digits.bytes().map(u16::from)),
+            _ => {
+                let digits = piece.digits().unwrap_or_default();
+                if one_byte {
+                    bytes.extend_from_slice(digits);
+                } else {
+                    units.extend(digits.iter().map(|&byte| u16::from(byte)));
+                }
+            }
         }
     }
     if one_byte {
@@ -501,7 +522,13 @@ pub(crate) fn to_string(cx: &mut Cx<'_>, value: Value) -> Result<Value, Throw> {
     match value.kind() {
         Kind::String => Ok(value),
         Kind::Int32 => alloc_digits(cx, &Digits::new(value.as_int32().unwrap())),
-        Kind::Number => alloc_text(cx, &number::to_string(value.as_f64().unwrap())),
+        Kind::Number => {
+            let text = number::text(value.as_f64().unwrap());
+            cx.heap
+                .alloc_string_repr(StringRepr::OneByte(text.as_bytes().into()))
+                .map(Value::string)
+                .map_err(|error| heap_error(cx, error))
+        }
         Kind::Bool => Ok(Value::string(if value == Value::TRUE {
             names.true_
         } else {

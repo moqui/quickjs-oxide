@@ -1172,8 +1172,9 @@ impl Serializer {
             Kind::Number => {
                 let number = value.as_f64().unwrap();
                 if number.is_finite() {
-                    let text = number::to_string(number);
-                    self.text(&text);
+                    let text = number::text(number);
+                    self.out
+                        .extend(text.as_bytes().iter().map(|&byte| u16::from(byte)));
                 } else {
                     self.text("null");
                 }

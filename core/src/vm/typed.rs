@@ -75,8 +75,10 @@ pub(crate) fn numeric_index(heap: &Heap, key: PropertyKey) -> Option<f64> {
                 return Some(-0.0);
             }
             let value = number::parse(&units);
-            let text = number::to_string(value);
-            (text.encode_utf16().eq(units.iter().copied())).then_some(value)
+            let text = number::text(value);
+            (text.as_bytes().iter().map(|&byte| u16::from(byte)))
+                .eq(units.iter().copied())
+                .then_some(value)
         }
     }
 }
