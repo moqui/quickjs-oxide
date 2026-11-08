@@ -434,6 +434,22 @@ impl JsString {
         }
     }
 
+    /// The address of this string's storage: equal for two handles of one
+    /// string, while either lives.
+    pub(crate) fn identity(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
+    /// Whether the string's code units are those of `text`: flat Latin-1
+    /// compared as bytes, with no iteration of code units when `text` is
+    /// ASCII.
+    pub fn eq_str(&self, text: &str) -> bool {
+        match self.0.data() {
+            StringData::Latin1(units) if text.is_ascii() => units.as_slice() == text.as_bytes(),
+            _ => self.utf16_units().eq(text.encode_utf16()),
+        }
+    }
+
     pub(crate) fn flat_utf16(&self) -> Option<&[u16]> {
         if let StringData::Utf16(units) = self.0.data() {
             Some(units)
