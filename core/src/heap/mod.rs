@@ -1464,6 +1464,15 @@ impl Heap {
     }
 
     pub fn property_key_units(&mut self, units: &[u16]) -> Result<PropertyKey, HeapError> {
+        // A short Latin-1 key is looked up from a stack copy, with no
+        // representation made for it unless its atom is new.
+        let mut buffer = [0u8; 64];
+        if units.len() <= buffer.len() && units.iter().all(|&unit| unit <= 0xFF) {
+            for (byte, &unit) in buffer.iter_mut().zip(units) {
+                *byte = unit as u8;
+            }
+            return self.property_key_latin1(&buffer[..units.len()]);
+        }
         self.key_for_repr(StringRepr::from_units(units))
     }
 

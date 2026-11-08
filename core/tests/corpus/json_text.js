@@ -50,3 +50,7 @@ var o = { a: { toJSON() { delete o.b; o.c = 'changed'; o.d = 4; return 1; } }, b
 var o2 = { a: { toJSON() { o2.b = 'x'; return 1; } }, b: 2 };
 print(JSON.stringify(o), JSON.stringify(o2));
 print(JSON.stringify([{ toJSON() { Object.prototype.toJSON = function () { return 'late'; }; return 0; } }, { a: 1 }])); delete Object.prototype.toJSON;
+var p = JSON.parse('{"a":1,"b":2,"a":3,"__proto__":{"x":1},"7":"seven","4294967295":"big","c":-0,"d":[123456789012345,1234567890123456,12345678901234567890,-42,0,1e2,1.5,-0.0]}');
+print(JSON.stringify(p), Object.keys(p).join(','), 1 / p.c, 1 / p.d[7], Object.getPrototypeOf(p) === Object.prototype, p.__proto__.x);
+var many = '{' + Array.from({ length: 70 }, function (_, i) { return '"k' + i + '":' + i; }).join(',') + ',"k5":"again"}';
+var m = JSON.parse(many); print(Object.keys(m).length, m.k5, m.k69, Number('  12  '), Number('1e400'), Number('0x1F'), Number('9007199254740993'));

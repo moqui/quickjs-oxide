@@ -55,3 +55,5 @@ SyntaxError Bad control character in string literal
 {"x":"β"} {"β":1,"a":"b"} ["a",""]
 {"a":1,"c":"changed"} {"a":1,"b":"x"}
 [0,"late"]
+{"7":"seven","a":3,"b":2,"__proto__":{"x":1},"4294967295":"big","c":0,"d":[123456789012345,1234567890123456,12345678901234567000,-42,0,100,1.5,0]} 7,a,b,__proto__,4294967295,c,d -Infinity -Infinity true 1
+70 again 69 12 Infinity 31 9007199254740992

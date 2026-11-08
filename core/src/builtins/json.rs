@@ -360,7 +360,24 @@ impl<'a> Parser<'a> {
                     return self.syntax("expecting ':'");
                 }
                 let (value, record) = self.value(cx, depth + 1)?;
-                internal::create_data_property(cx, object, key, value)?;
+                // A named key on the fresh ordinary object is added or, a
+                // repeat, overwritten in its slot: it is a writable,
+                // enumerable, configurable data property either way. The
+                // value is on the root stack.
+                match key.kind() {
+                    KeyKind::String(name) if cx.heap.string(name).array_index == NONE => {
+                        match cx.heap.lookup_own(object, key) {
+                            Some((slot, _)) => cx.heap.set_slot(object, slot, value),
+                            None => cx
+                                .heap
+                                .add_property(object, key, PropertyFlags::DEFAULT, value)
+                                .map_err(|error| heap_failure(cx, error))?,
+                        }
+                    }
+                    _ => {
+                        internal::create_data_property(cx, object, key, value)?;
+                    }
+                }
                 match record {
                     Some(record) => entries.push((key, record)),
                     None => cx.heap.roots().truncate(mark),
@@ -535,6 +552,7 @@ impl<'a> Parser<'a> {
                 )));
             }
         }
+        let digits_start = self.cursor;
         match self.peek() {
             None => return self.syntax("Unexpected token '"),
             Some(0x30) => {
@@ -552,7 +570,16 @@ impl<'a> Parser<'a> {
                 &self.units[start..self.cursor],
             )));
         }
+        let digits_end = self.cursor;
         self.exponent()?;
+        // An integer of up to 15 digits is exact in a `u64` and a double.
+        if self.cursor == digits_end && digits_end - digits_start <= 15 {
+            let value = self.units[digits_start..digits_end]
+                .iter()
+                .fold(0u64, |value, &unit| value * 10 + u64::from(unit - 0x30))
+                as f64;
+            return Ok(number::number(if negative { -value } else { value }));
+        }
         Ok(number::number(number::parse(
             &self.units[start..self.cursor],
         )))
