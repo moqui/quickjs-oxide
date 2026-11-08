@@ -8,6 +8,7 @@
 
 use oxide_regexp::{ExecError, RegExpFlags, RegExpMatch};
 
+use super::joined::Joined;
 use super::string::{substitution, substring_value};
 use super::{
     Native, accessor, install_constructor, link_constructor, methods, plain_object, string_units,
@@ -1350,76 +1351,6 @@ fn replace_pristine(
         accumulated.push_subject(cx, string, next_position..subject_len);
     }
     accumulated.finish(cx)
-}
-
-/// A replace's result: bytes while every unit fits in one, else UTF-16, so a
-/// Latin-1 subject with Latin-1 replacements is never widened and narrowed
-/// again.
-enum Joined {
-    Bytes(Vec<u8>),
-    Units(Vec<u16>),
-}
-
-impl Joined {
-    fn with_capacity(capacity: usize) -> Self {
-        Joined::Bytes(Vec::with_capacity(capacity))
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Joined::Bytes(bytes) => bytes.len(),
-            Joined::Units(units) => units.len(),
-        }
-    }
-
-    fn widen(&mut self) -> &mut Vec<u16> {
-        if let Joined::Bytes(bytes) = self {
-            let mut units = Vec::with_capacity(bytes.capacity().max(bytes.len() * 2));
-            units.extend(bytes.iter().map(|&byte| u16::from(byte)));
-            *self = Joined::Units(units);
-        }
-        match self {
-            Joined::Units(units) => units,
-            Joined::Bytes(_) => unreachable!("widened above"),
-        }
-    }
-
-    fn push_bytes(&mut self, part: &[u8]) {
-        match self {
-            Joined::Bytes(bytes) => bytes.extend_from_slice(part),
-            Joined::Units(units) => units.extend(part.iter().map(|&byte| u16::from(byte))),
-        }
-    }
-
-    fn push_units(&mut self, part: &[u16]) {
-        if let Joined::Bytes(bytes) = self
-            && part.iter().all(|&unit| unit <= 0xFF)
-        {
-            bytes.extend(part.iter().map(|&unit| unit as u8));
-            return;
-        }
-        self.widen().extend_from_slice(part);
-    }
-
-    /// Units `range` of the string `id`, copied from where they lie.
-    fn push_subject(&mut self, cx: &Cx<'_>, id: StringId, range: std::ops::Range<usize>) {
-        match cx.heap.string(id).repr() {
-            StringRepr::OneByte(bytes) => self.push_bytes(&bytes[range]),
-            StringRepr::TwoByte(units) => self.push_units(&units[range]),
-        }
-    }
-
-    fn push_string(&mut self, cx: &Cx<'_>, id: StringId) {
-        let len = cx.heap.string_len(id);
-        self.push_subject(cx, id, 0..len);
-    }
-
-    fn finish(self, cx: &mut Cx<'_>) -> Result<Value, Throw> {
-        match self {
-            Joined::Bytes(bytes) => super::string_repr(cx, StringRepr::OneByte(bytes.into())),
-            Joined::Units(units) => string_units(cx, &units),
-        }
-    }
 }
 
 /// `GetSubstitution` with a `groups` object read for `$<name>`.

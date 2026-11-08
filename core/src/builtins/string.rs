@@ -5,6 +5,7 @@
 //! method first. `localeCompare` is QuickJS's code-unit comparison; the locale
 //! case mappings are the plain ones.
 
+use super::joined::Joined;
 use super::{
     Native, install_constructor, link_constructor, methods, string_repr, string_units, this_string,
     to_string_id,
@@ -666,30 +667,37 @@ fn pad(cx: &mut Cx<'_>, site: CallSite, at_start: bool) -> Result<Value, Throw> 
         return Ok(Value::string(string));
     }
     let filler = site.arg(cx, 1);
-    let filler: Vec<u16> = if filler.is_undefined() {
-        vec![u16::from(b' ')]
+    let filler = if filler.is_undefined() {
+        None
     } else {
-        let filler = to_string_id(cx, filler)?;
-        units(cx, filler)
+        Some(to_string_id(cx, filler)?)
     };
-    if filler.is_empty() {
+    let filler_length = filler.map_or(1, |filler| cx.heap.string_len(filler));
+    if filler_length == 0 {
         return Ok(Value::string(string));
     }
     if max as usize > MAX_STRING {
         return Err(error::range_error(cx, "invalid string length"));
     }
     let fill_length = (max - length) as usize;
-    let mut fill: Vec<u16> = filler.iter().copied().cycle().take(fill_length).collect();
-    let text = units(cx, string);
-    let out = if at_start {
-        fill.extend(text);
-        fill
-    } else {
-        let mut out = text;
-        out.extend(fill);
-        out
-    };
-    string_units(cx, &out)
+    let mut out = Joined::with_capacity(max as usize);
+    if !at_start {
+        out.push_string(cx, string);
+    }
+    match filler {
+        None => out.push_byte_run(b' ', fill_length),
+        Some(filler) => {
+            let (whole, rest) = (fill_length / filler_length, fill_length % filler_length);
+            for _ in 0..whole {
+                out.push_string(cx, filler);
+            }
+            out.push_subject(cx, filler, 0..rest);
+        }
+    }
+    if at_start {
+        out.push_string(cx, string);
+    }
+    out.finish(cx)
 }
 
 pub(super) fn pad_start(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
@@ -1038,18 +1046,28 @@ fn replace_impl(cx: &mut Cx<'_>, site: CallSite, all: bool) -> Result<Value, Thr
     if positions.is_empty() {
         return Ok(Value::string(string));
     }
-    let haystack = units(cx, string);
-    let needle = units(cx, search);
-    let mut out = Vec::with_capacity(haystack.len());
+    // A replacement without `$` is copied as is; the subject's and the
+    // search string's units are copied out for a `$` substitution only.
+    let literal = replacement
+        .as_ref()
+        .filter(|replacement| !replacement.contains(&u16::from(b'$')));
+    let text = match (&replacement, literal) {
+        (Some(_), None) => Some((units(cx, string), units(cx, search))),
+        _ => None,
+    };
+    let mut out = Joined::with_capacity(haystack_len);
     let mut end_of_last = 0;
     for position in positions {
-        out.extend_from_slice(&haystack[end_of_last..position]);
-        let replaced = match &replacement {
-            Some(replacement) => {
-                substitution(&haystack, position, &needle, &[], &|_| None, replacement)
-                    .ok_or_else(|| error::string_too_long(cx))?
+        out.push_subject(cx, string, end_of_last..position);
+        match (literal, &replacement, &text) {
+            (Some(literal), _, _) => out.push_units(literal),
+            (None, Some(replacement), Some((haystack, needle))) => {
+                let replaced =
+                    substitution(haystack, position, needle, &[], &|_| None, replacement)
+                        .ok_or_else(|| error::string_too_long(cx))?;
+                out.push_units(&replaced);
             }
-            None => {
+            _ => {
                 let value = crate::vm::call(
                     cx,
                     replace_value,
@@ -1061,14 +1079,16 @@ fn replace_impl(cx: &mut Cx<'_>, site: CallSite, all: bool) -> Result<Value, Thr
                     ],
                 )?;
                 let value = to_string_id(cx, value)?;
-                units(cx, value)
+                out.push_string(cx, value);
             }
-        };
-        out.extend(replaced);
-        end_of_last = position + needle.len();
+        }
+        end_of_last = position + needle_len;
+        if out.len() > MAX_STRING {
+            return Err(error::string_too_long(cx));
+        }
     }
-    out.extend_from_slice(&haystack[end_of_last.min(haystack.len())..]);
-    string_units(cx, &out)
+    out.push_subject(cx, string, end_of_last.min(haystack_len)..haystack_len);
+    out.finish(cx)
 }
 
 pub(super) fn replace(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
@@ -1129,13 +1149,13 @@ fn map_case(cx: &mut Cx<'_>, site: CallSite, upper: bool) -> Result<Value, Throw
         return string_repr(cx, StringRepr::OneByte(mapped));
     }
     let text = units(cx, string);
-    let mapped = if upper {
-        super::case::to_upper(&text)
-    } else {
-        super::case::to_lower(&text)
-    };
-    match mapped {
-        Some(mapped) => string_units(cx, &mapped),
+    // A Latin-1 result is made from its bytes, with no widening and
+    // narrowing again.
+    match super::case::convert(&text, upper) {
+        Some(oxide_regexp::unicode::CodeUnitBuf::Latin1(bytes)) => {
+            string_repr(cx, StringRepr::OneByte(bytes.into()))
+        }
+        Some(oxide_regexp::unicode::CodeUnitBuf::Utf16(units)) => string_units(cx, &units),
         None => Err(error::string_too_long(cx)),
     }
 }
