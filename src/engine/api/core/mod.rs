@@ -30,8 +30,8 @@ pub use module::{CompiledModule, ModuleLoader, ModuleScope, ModuleSource};
 pub use ops::{Js, JsResult};
 pub use promise::PromiseCapability;
 pub use property::{
-    AccessorValue, CompleteOrdinaryPropertyDescriptor, DescriptorField, InitValue,
-    OrdinaryPropertyDescriptor, OwnData, PropertyKey, WellKnownSymbol,
+    AccessorValue, CompleteOrdinaryPropertyDescriptor, DataRef, DescriptorField, InitValue,
+    OrdinaryPropertyDescriptor, OwnData, OwnDataRef, PropertyKey, TextRef, WellKnownSymbol,
 };
 pub use runtime::{
     GcPolicy, GcStats, InterruptHandle, PendingJobOutcome, PromiseSnapshot, PromiseState, Runtime,

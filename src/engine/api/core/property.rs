@@ -222,6 +222,58 @@ impl From<Value> for InitValue<'_> {
     }
 }
 
+/// A string's code units borrowed from the heap, for
+/// [`Js::visit_plain_own_data`](super::Js::visit_plain_own_data).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TextRef<'a> {
+    Latin1(&'a [u8]),
+    Utf16(&'a [u16]),
+}
+
+impl TextRef<'_> {
+    /// Whether the code units are those of `text`.
+    pub fn eq_str(&self, text: &str) -> bool {
+        match self {
+            TextRef::Latin1(bytes) if text.is_ascii() => *bytes == text.as_bytes(),
+            TextRef::Latin1(bytes) => bytes
+                .iter()
+                .map(|&byte| u16::from(byte))
+                .eq(text.encode_utf16()),
+            TextRef::Utf16(units) => units.iter().copied().eq(text.encode_utf16()),
+        }
+    }
+
+    /// The text, lone surrogates replaced, as
+    /// [`JsString::to_utf8_lossy`] gives it.
+    pub fn to_string_lossy(&self) -> String {
+        match self {
+            TextRef::Latin1(bytes) if bytes.is_ascii() => {
+                String::from_utf8(bytes.to_vec()).unwrap_or_default()
+            }
+            TextRef::Latin1(bytes) => bytes.iter().map(|&byte| char::from(byte)).collect(),
+            TextRef::Utf16(units) => String::from_utf16_lossy(units),
+        }
+    }
+}
+
+/// A value [`Js::visit_plain_own_data`](super::Js::visit_plain_own_data)
+/// shows: a string borrowed, a callable marked without a handle, else the
+/// value.
+#[derive(Debug)]
+pub enum DataRef<'a> {
+    Value(Value),
+    Text(TextRef<'a>),
+    Callable,
+}
+
+/// An own data property [`Js::visit_plain_own_data`](super::Js::visit_plain_own_data) shows.
+#[derive(Debug)]
+pub struct OwnDataRef<'a> {
+    pub key: &'a PropertyKey,
+    pub enumerable: bool,
+    pub value: DataRef<'a>,
+}
+
 /// An own data property of a plain object, as [`Js::plain_own_data`](super::Js::plain_own_data) reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnData {

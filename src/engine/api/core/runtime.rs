@@ -891,6 +891,18 @@ impl Runtime {
         self.engine()?.view().plain_own_data(object, prototype)
     }
 
+    /// [`Js::visit_plain_own_data`](super::Js::visit_plain_own_data).
+    pub fn visit_plain_own_data(
+        &self,
+        object: &ObjectRef,
+        prototype: Option<&ObjectRef>,
+        visit: &mut dyn FnMut(super::OwnDataRef<'_>) -> bool,
+    ) -> Result<Option<bool>, RuntimeError> {
+        self.engine()?
+            .view()
+            .visit_plain_own_data(object, prototype, visit)
+    }
+
     /// [`Js::dense_array_values`](super::Js::dense_array_values).
     pub fn dense_array_values(
         &self,

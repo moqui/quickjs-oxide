@@ -2251,3 +2251,70 @@ fn a_string_is_compared_with_rust_text() {
     assert!(!text("caf").eq_str("café"));
     assert!(text("").eq_str(""));
 }
+
+#[test]
+fn a_plain_objects_properties_are_shown_with_strings_borrowed() {
+    use quickjs_oxide::engine::api::core::{DataRef, TextRef};
+    let (runtime, context) = runtime();
+    let object_of = |source: &str| match context.eval(source).unwrap() {
+        Value::Object(object) => object,
+        other => panic!("not an object: {other:?}"),
+    };
+    let object = object_of(
+        "Object.defineProperty({a: 'ascii', b: 'caf\\u00e9', c: '\\u2603', d: 4, f() {}, o: {}}, 'h', {value: 'x'})",
+    );
+    let prototype = runtime.get_prototype_of(&object).unwrap();
+    let mut seen = Vec::new();
+    let all = runtime
+        .visit_plain_own_data(&object, prototype.as_ref(), &mut |property| {
+            let name = property.key.to_js_string().unwrap().to_utf8_lossy();
+            let shown = match property.value {
+                DataRef::Text(text) => {
+                    assert!(matches!(
+                        (name.as_str(), text),
+                        ("a" | "b" | "h", TextRef::Latin1(_)) | ("c", TextRef::Utf16(_))
+                    ));
+                    assert!(text.eq_str(&text.to_string_lossy()));
+                    format!("text {}", text.to_string_lossy())
+                }
+                DataRef::Callable => "callable".to_string(),
+                DataRef::Value(Value::Object(_)) => "object".to_string(),
+                DataRef::Value(value) => format!("{value:?}"),
+            };
+            seen.push(format!("{name} {} {shown}", property.enumerable));
+            true
+        })
+        .unwrap();
+    assert_eq!(all, Some(true));
+    assert_eq!(
+        seen,
+        [
+            "a true text ascii",
+            "b true text café",
+            "c true text ☃",
+            "d true Int(4)",
+            "f true callable",
+            "o true object",
+            "h false text x",
+        ]
+    );
+    let mut count = 0;
+    assert_eq!(
+        runtime
+            .visit_plain_own_data(&object, prototype.as_ref(), &mut |_| {
+                count += 1;
+                count < 2
+            })
+            .unwrap(),
+        Some(false)
+    );
+    for source in ["({get a() { return 1 }})", "[1]", "Object.create(null)"] {
+        assert_eq!(
+            runtime
+                .visit_plain_own_data(&object_of(source), prototype.as_ref(), &mut |_| true)
+                .unwrap(),
+            None,
+            "{source}"
+        );
+    }
+}
