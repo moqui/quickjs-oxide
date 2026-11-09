@@ -262,8 +262,10 @@ pub struct CodeUnit {
     /// The property keys the instructions name: an instruction of a key
     /// format holds an index into this table in `imm` ([`CodeUnit::key`]),
     /// so the instructions name nothing of the runtime and are shared in
-    /// the body.
-    pub keys: Box<[PropertyKey]>,
+    /// the body. A unit loaded from a code image shares the image's table
+    /// when its keys are the process's shared atoms
+    /// ([`crate::image`]'s key tables).
+    pub keys: std::sync::Arc<[PropertyKey]>,
     /// The tables that name nothing of a runtime, shared by every runtime
     /// that loaded the unit from one code image ([`crate::image`]); the
     /// unit reads them as its own fields ([`CodeUnit`] derefs to them).
@@ -320,13 +322,22 @@ impl CodeUnit {
     /// Bytes the unit holds itself, without its body or its cache entries.
     pub fn own_bytes(&self) -> usize {
         size_of::<CodeUnit>()
-            + std::mem::size_of_val(&*self.keys)
+            + self.own_keys_bytes()
             + std::mem::size_of_val(&*self.children)
             + std::mem::size_of_val(&*self.atoms)
     }
 }
 
 impl CodeUnit {
+    /// The bytes of the key table when it is the unit's alone.
+    pub fn own_keys_bytes(&self) -> usize {
+        if std::sync::Arc::strong_count(&self.keys) == 1 {
+            std::mem::size_of_val(&*self.keys)
+        } else {
+            0
+        }
+    }
+
     /// The first operand temporary, `T(0)`: after the locals, or after the
     /// spill register when the locals do not all fit in the window.
     #[inline]
