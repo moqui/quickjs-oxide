@@ -56,6 +56,11 @@ pub(crate) struct ImageUnit {
     /// The unit's key table: what each key operand of its instructions
     /// (which are in the shared body) names.
     pub(crate) keys: Box<[ImageKey]>,
+    /// The key table every runtime that loads the image shares: set by the
+    /// first load whose keys are all the process's shared atoms (or array
+    /// indices), so the same in every runtime that has no atom of its own
+    /// for one of their texts. Such a runtime builds its own table.
+    pub(crate) shared_keys: std::sync::OnceLock<Arc<[crate::PropertyKey]>>,
     /// The instructions, shared with every runtime that loads the image.
     pub(crate) code: Arc<[Insn]>,
     pub(crate) counts: Counts,
@@ -382,6 +387,7 @@ impl Encoder<'_> {
         }
         self.out[index as usize] = Some(ImageUnit {
             keys: keys.into(),
+            shared_keys: std::sync::OnceLock::new(),
             code,
             counts,
             body,
@@ -627,7 +633,12 @@ impl<'i> Loader<'i> {
         let counts = unit.counts;
         CodeUnit {
             code: Arc::clone(&unit.code),
-            keys: vec![crate::PropertyKey::from_raw(0); unit.keys.len()].into(),
+            // The validator reads only the table's length: the image's
+            // shared table when it has one, so a load allocates no copy.
+            keys: match unit.shared_keys.get() {
+                Some(shared) => Arc::clone(shared),
+                None => vec![crate::PropertyKey::from_raw(0); unit.keys.len()].into(),
+            },
             register_count: counts.register_count,
             parameter_count: counts.parameter_count,
             local_count: counts.local_count,
@@ -661,20 +672,65 @@ impl<'i> Loader<'i> {
     ) -> Result<(), LoadError> {
         let image = self.image;
         let source = &image.units[index];
-        let mut keys = Vec::with_capacity(source.keys.len());
-        for key in source.keys.iter() {
-            keys.push(match *key {
-                ImageKey::Atom(atom) => crate::PropertyKey::atom(self.atom(heap, atom)?),
-                ImageKey::Index(bits) => crate::PropertyKey::from_raw(bits),
-            });
-        }
-        unit.keys = keys.into();
+        unit.keys = self.keys(heap, source)?;
         unit.name_atom = source
             .name_atom
             .map(|index| self.atom(heap, index))
             .transpose()?;
         unit.children = children;
         Ok(())
+    }
+
+    /// The key table of `source` in this runtime: the image's shared table
+    /// when each key resolves to its entry, else the runtime's own (which
+    /// becomes the shared table when it names only shared atoms and the
+    /// image has none yet). Every atom is interned either way, so the
+    /// runtime's atom table finds it.
+    fn keys(
+        &mut self,
+        heap: &mut Heap,
+        source: &ImageUnit,
+    ) -> Result<Arc<[crate::PropertyKey]>, LoadError> {
+        let mut resolve = |loader: &mut Self, key: &ImageKey| -> Result<_, LoadError> {
+            Ok(match *key {
+                ImageKey::Atom(atom) => crate::PropertyKey::atom(loader.atom(heap, atom)?),
+                ImageKey::Index(bits) => crate::PropertyKey::from_raw(bits),
+            })
+        };
+        if let Some(shared) = source.shared_keys.get() {
+            let mut position = 0;
+            while position < source.keys.len() {
+                let key = resolve(self, &source.keys[position])?;
+                if key != shared[position] {
+                    // A runtime atom of its own came first: its own table.
+                    let mut keys = Vec::with_capacity(source.keys.len());
+                    keys.extend_from_slice(&shared[..position]);
+                    keys.push(key);
+                    for key in &source.keys[position + 1..] {
+                        keys.push(resolve(self, key)?);
+                    }
+                    return Ok(keys.into());
+                }
+                position += 1;
+            }
+            return Ok(Arc::clone(shared));
+        }
+        let mut keys = Vec::with_capacity(source.keys.len());
+        for key in source.keys.iter() {
+            keys.push(resolve(self, key)?);
+        }
+        let keys: Arc<[crate::PropertyKey]> = keys.into();
+        let shareable = keys.iter().all(|key| match key.kind() {
+            crate::heap::atom::KeyKind::String(id) => crate::heap::shared::is_shared(id.0),
+            crate::heap::atom::KeyKind::Index(_) => true,
+            crate::heap::atom::KeyKind::Symbol(_) => false,
+        });
+        if shareable {
+            // Another thread's load may have set it meanwhile: either holds
+            // the same keys.
+            return Ok(Arc::clone(source.shared_keys.get_or_init(|| keys)));
+        }
+        Ok(keys)
     }
 
     /// The constant table of image unit `index`, each value pushed on the

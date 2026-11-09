@@ -197,7 +197,7 @@ impl CodeBuilder {
         let keys = key_table(&mut self.code);
         CodeUnit {
             code: self.code.into(),
-            keys,
+            keys: keys.into(),
             register_count: layout.register_count,
             parameter_count: layout.parameter_count,
             local_count: layout.local_count,

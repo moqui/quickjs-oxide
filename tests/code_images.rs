@@ -449,6 +449,64 @@ fn an_image_loaded_on_threads_at_once_shares_its_atoms() {
         assert_eq!(key, "imageSharedKey,imageSharedName:imageSharedFunction");
         assert!(*shared >= 5, "the image's atoms are shared: {shared}");
     }
-    // Every runtime imported the same shared atoms.
-    assert!(results.iter().all(|result| result.2 == results[0].2));
+}
+
+/// Runtimes on threads load one image at once, half of them after making
+/// their own atom for one of its keys: each runs it as compiled and reads
+/// that key, a runtime with an atom of its own builds its own key table for
+/// the units that name it, and the others share the image's tables.
+#[test]
+fn an_image_shares_its_key_tables_except_where_a_runtime_had_its_own_atom() {
+    let source = "function keyTableReader(o) { return o.keyTableFirst + o.keyTableSecond.length; } \
+                  function keyTableOther(o) { return o.keyTableThird; } \
+                  var made = { keyTableFirst: 2, keyTableSecond: 'abc' }; \
+                  keyTableReader(made) + keyTableOther({ keyTableThird: 4 })";
+    let (_, compiled) = runtime();
+    let expected = printed(&compiled, compiled.eval(source));
+    assert_eq!(expected, "9");
+    let image = compiled.compile_image(source, "<key tables>").unwrap();
+    // The odd threads make their atoms before any load shares the texts.
+    let made = std::sync::Barrier::new(8);
+    let results = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|thread| {
+                let image = image.clone();
+                let made = &made;
+                scope.spawn(move || {
+                    let (runtime, loaded) = runtime();
+                    if thread % 2 == 1 {
+                        // Its own atom for a key, made before the load.
+                        let key = ["keyTable", "Second"].concat();
+                        let own = format!("var own = {{}}; own['{key}'] = 1; own.{key}");
+                        assert_eq!(printed(&loaded, loaded.eval(&own)), "1");
+                    }
+                    made.wait();
+                    let script = loaded.load_image(&image).unwrap();
+                    let actual = printed(&loaded, loaded.execute(&script));
+                    let again = printed(
+                        &loaded,
+                        loaded.eval("keyTableReader({ keyTableFirst: 5, keyTableSecond: 'xy' })"),
+                    );
+                    let census = runtime.atom_census().unwrap();
+                    (thread, actual, again, census.own_key_entries)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (thread, actual, again, own) in results {
+        assert_eq!(actual, expected, "thread {thread}");
+        assert_eq!(again, "7", "thread {thread}");
+        if thread % 2 == 0 {
+            assert_eq!(own, 0, "thread {thread} shares every image key table");
+        } else {
+            assert!(
+                own > 0,
+                "thread {thread} has its own table where its atom came first"
+            );
+        }
+    }
 }

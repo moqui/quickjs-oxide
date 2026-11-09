@@ -1,7 +1,7 @@
 # Shared atoms: a design
 
-Status: phases 1 (the builtin atoms) and 2 (the image atoms) are implemented (`core/src/heap/shared.rs`,
-`Compiler::load_image`); phase 3 is not. The change to the threading model below was accepted. The results are at the
+Status: phases 1 (the builtin atoms), 2 (the image atoms) and 3 (shared key tables, with the embedder's keys shared)
+are implemented (`core/src/heap/shared.rs`, `Compiler::load_image`, `image::Loader::keys`, `NativeCx::key_from_*`). The change to the threading model below was accepted. The results are at the
 end ("Results").
 
 ## Why
@@ -163,3 +163,16 @@ A worker keeps 600 to 850 atoms of its own: the host's keys and the rest.
 Phase 3 would share a unit's key table where all its keys are shared. The busiest workers hold 3.1k to 3.8k image units
 with 29k to 36k key entries: 115 to 145 KB of keys, plus an allocation for each unit's table. Across 23 workers that is
 3 to 5 MB, about 6% of what phase 2 leaves.
+
+Phase 3 shares a unit's key table. An image unit keeps one table (`ImageUnit::shared_keys`), set by the first load
+whose keys are all shared atoms or array indices. A later load resolves each key and takes that table when every key
+matches, so it allocates no table, not even the validator's provisional one. A runtime that has its own atom for one
+of the texts builds its own table.
+
+Sharing the image keys alone shared 27% of the workers' key entries. The units name the host's keys, which each worker
+had interned before its first image load. So the embedder's keys (`NativeCx::key_from_latin1`, `key_from_units`) are
+shared atoms too, while the table has room: they are the same texts in every runtime.
+
+With both, mr-mantle's service workers hold 128,844 of 419,528 key entries in tables of their own (406,593 of 406,593
+before). js_speed's engine start makes 6,421 allocations, against 7,775 before (quickjs-oxide-bench
+`rounds/r51/shared-key-tables`).
