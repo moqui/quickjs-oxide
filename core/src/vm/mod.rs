@@ -313,9 +313,29 @@ pub struct Services {
     /// Set from any thread to interrupt the running script at the next
     /// poll; it stays set until cleared.
     pub(crate) interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The embedder's sampling profiler, when one is started
+    /// ([`Sampler`]).
+    pub(crate) sampler: Option<Box<Sampler>>,
     /// The host exotic classes, by `vm::exotic::ExoticClass` index.
     pub(crate) exotic_classes: Vec<std::rc::Rc<dyn exotic::ExoticHooks>>,
 }
+
+/// A sampling profiler of the running scripts. Another thread sets `flag`
+/// (on a timer); the next poll that finds it set clears it and counts the
+/// running stack, innermost frame first, as `name:line` frames joined by
+/// `;` (the folded form flame graph tools read). A frame below a re-entry
+/// from Rust, whose instruction is unknown, has `?` for its line. Polls come
+/// about every thousand loop back-edges and calls, so a sample lands within
+/// that much script of its request, and time in a native function counts
+/// toward the script that runs after it.
+#[derive(Debug, Default)]
+pub struct Sampler {
+    pub(crate) flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) counts: crate::heap::hash::FxHashMap<String, u64>,
+}
+
+/// Most frames a sample keeps, innermost first.
+pub(crate) const SAMPLE_FRAMES: usize = 48;
 
 impl std::fmt::Debug for Services {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -344,6 +364,7 @@ impl Default for Services {
             agent: None,
             track_rejections: false,
             interrupt: Default::default(),
+            sampler: None,
             exotic_classes: Vec::new(),
         }
     }

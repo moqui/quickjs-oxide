@@ -2164,7 +2164,9 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                     let poll = &mut cx.heap.vm.poll;
                     *poll -= 1;
                     if *poll == 0 {
-                        if let Err(throw) = error::poll_interrupts(cx) {
+                        // the back-edge itself, for a sample's position
+                        let at = Some(pc.saturating_sub(1) as u32);
+                        if let Err(throw) = error::poll_interrupts_at(cx, at) {
                             break 'op Err(throw);
                         }
                         regs = window!();

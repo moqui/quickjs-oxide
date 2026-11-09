@@ -539,6 +539,27 @@ impl Runtime {
         }
     }
 
+    /// Starts the sampling profiler: another thread sets `flag` (on a
+    /// timer), and the next poll that finds it set clears it and counts the
+    /// running stack, innermost frame first, as `name:line` frames joined by
+    /// `;`. Several runtimes may share one flag; the first to poll takes the
+    /// sample. A poll comes about every thousand loop back-edges and calls.
+    pub fn start_sampling(&self, flag: Arc<AtomicBool>) -> Result<(), RuntimeError> {
+        self.enter()?.core.native_cx().start_sampling(flag);
+        Ok(())
+    }
+
+    /// The samples counted since the last take, by folded stack, in no order.
+    pub fn take_samples(&self) -> Result<Vec<(String, u64)>, RuntimeError> {
+        Ok(self.enter()?.core.native_cx().take_samples())
+    }
+
+    /// Stops the sampling profiler and drops its counts.
+    pub fn stop_sampling(&self) -> Result<(), RuntimeError> {
+        self.enter()?.core.native_cx().stop_sampling();
+        Ok(())
+    }
+
     /// Whether `Atomics.wait` may block.
     pub fn set_can_block(&self, can_block: bool) -> Result<(), RuntimeError> {
         self.enter()?.core.set_can_block(can_block);

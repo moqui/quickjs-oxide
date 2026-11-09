@@ -299,6 +299,36 @@ pub(crate) fn add_stack_at(
     Ok(())
 }
 
+/// The running stack as a sample counts it: `name:line` frames, innermost
+/// first, joined by `;`.
+fn sample_key(cx: &Cx<'_>, innermost_pc: Option<u32>) -> String {
+    let vm = &cx.heap.vm;
+    let len = vm.frames.len();
+    let mut key = String::new();
+    for index in (0..len).rev().take(super::SAMPLE_FRAMES) {
+        let frame = &vm.frames[index];
+        let unit = cx.unit(frame.unit);
+        let pc = if index + 1 == len {
+            innermost_pc
+        } else {
+            let above = &vm.frames[index + 1];
+            (above.flags & frame_flags::ENTRY == 0 && above.return_pc > 0).then(|| above.return_pc - 1)
+        };
+        if !key.is_empty() {
+            key.push(';');
+        }
+        let name = debug_name(&unit);
+        key.push_str(if name.is_empty() { "<anonymous>" } else { name });
+        match pc.and_then(|pc| unit.debug.position(pc)) {
+            Some((line, _)) => {
+                let _ = write!(key, ":{line}");
+            }
+            None => key.push_str(":?"),
+        }
+    }
+    key
+}
+
 fn debug_name(unit: &crate::bytecode::CodeUnit) -> &str {
     &unit.debug.name
 }
@@ -563,6 +593,25 @@ pub(crate) fn stack_overflow(cx: &mut Cx<'_>) -> Throw {
 #[cold]
 #[inline(never)]
 pub(crate) fn poll_interrupts(cx: &mut Cx<'_>) -> Result<(), Throw> {
+    poll_interrupts_at(cx, None)
+}
+
+/// [`poll_interrupts`] at a back-edge, whose instruction `pc` is the
+/// innermost frame's position for a sample ([`super::Sampler`]).
+#[cold]
+#[inline(never)]
+pub(crate) fn poll_interrupts_at(cx: &mut Cx<'_>, pc: Option<u32>) -> Result<(), Throw> {
+    if cx
+        .host
+        .sampler
+        .as_ref()
+        .is_some_and(|sampler| sampler.flag.swap(false, std::sync::atomic::Ordering::Relaxed))
+    {
+        let key = sample_key(cx, pc);
+        if let Some(sampler) = cx.host.sampler.as_mut() {
+            *sampler.counts.entry(key).or_default() += 1;
+        }
+    }
     let pending = cx.heap.vm.interrupted
         || cx.host.interrupt.load(std::sync::atomic::Ordering::Relaxed)
         || cx.host.hooks.interrupt();

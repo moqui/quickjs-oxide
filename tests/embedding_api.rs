@@ -1399,6 +1399,48 @@ fn interrupt_later(runtime: &Runtime, after: std::time::Duration) -> std::thread
 }
 
 #[test]
+fn a_sampler_counts_the_running_stacks_by_function_and_line() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (runtime, context) = runtime();
+    // No samples before the profiler starts.
+    assert_eq!(runtime.take_samples().unwrap(), Vec::new());
+    let flag = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    runtime.start_sampling(Arc::clone(&flag)).unwrap();
+    let ticker = {
+        let (flag, done) = (Arc::clone(&flag), Arc::clone(&done));
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                flag.store(true, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        })
+    };
+    let result = context.eval(
+        "function hot(n) {\n  let s = 0;\n  for (let i = 0; i < n; i++) s += i % 7;\n  return s;\n}\n\
+         function outer() { return hot(4000000); }\nouter();",
+    );
+    done.store(true, Ordering::Relaxed);
+    ticker.join().unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    let samples = runtime.take_samples().unwrap();
+    let total: u64 = samples.iter().map(|(_, count)| count).sum();
+    assert!(total > 0, "{samples:?}");
+    // the loop's back-edge is on line 3, and hot was called from outer
+    assert!(
+        samples.iter().any(|(stack, _)| stack.starts_with("hot:3;outer:6")),
+        "{samples:?}"
+    );
+    // A take empties the counts; a stop drops the profiler.
+    assert_eq!(runtime.take_samples().unwrap(), Vec::new());
+    runtime.stop_sampling().unwrap();
+    flag.store(true, Ordering::Relaxed);
+    context.eval("hot(100000)").unwrap();
+    assert_eq!(runtime.take_samples().unwrap(), Vec::new());
+}
+
+#[test]
 fn a_thread_interrupts_an_endless_loop() {
     let (runtime, context) = runtime();
     let started = std::time::Instant::now();
