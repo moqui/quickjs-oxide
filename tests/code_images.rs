@@ -401,3 +401,54 @@ fn a_loaded_runtime_reserves_caches_as_functions_are_made() {
         assert_eq!(printed(context, context.eval("got")), "11");
     }
 }
+
+/// One image loaded by runtimes on eight threads at once: each runs it as
+/// compiled, and the image's keys, names and string constants are the
+/// process's shared atoms in every one of them.
+#[test]
+fn an_image_loaded_on_threads_at_once_shares_its_atoms() {
+    let source = "var shapes = []; for (let i = 0; i < 20; i++) \
+                  shapes.push({ imageSharedKey: i, imageSharedName: 'image-shared-constant-' + i }); \
+                  function imageSharedFunction(o) { return o.imageSharedKey + o.imageSharedName.length; } \
+                  shapes.map(imageSharedFunction).join() + '|' + JSON.stringify({ imageSharedJson: 'image-shared-text' })";
+    let (_, compiled) = runtime();
+    let expected = printed(&compiled, compiled.eval(source));
+    let image = compiled.compile_image(source, "<threads>").unwrap();
+    let results = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| {
+                let image = image.clone();
+                scope.spawn(move || {
+                    let (runtime, loaded) = runtime();
+                    let before = runtime.atom_census().unwrap();
+                    let script = loaded.load_image(&image).unwrap();
+                    let actual = printed(&loaded, loaded.execute(&script));
+                    // A key read at run time finds the image's atom.
+                    let key = printed(
+                        &loaded,
+                        loaded
+                            .eval("Object.keys(shapes[0]).join() + ':' + imageSharedFunction.name"),
+                    );
+                    let after = runtime.atom_census().unwrap();
+                    (
+                        actual,
+                        key,
+                        after.shared - before.shared,
+                        after.total - after.shared,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for (actual, key, shared, _) in &results {
+        assert_eq!(actual, &expected);
+        assert_eq!(key, "imageSharedKey,imageSharedName:imageSharedFunction");
+        assert!(*shared >= 5, "the image's atoms are shared: {shared}");
+    }
+    // Every runtime imported the same shared atoms.
+    assert!(results.iter().all(|result| result.2 == results[0].2));
+}

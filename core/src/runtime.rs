@@ -917,11 +917,6 @@ impl Runtime {
     /// What every part of the runtime holds, read without a collection. Its
     /// reserved total equals [`Heap::bytes`].
     pub fn memory_report(&self) -> crate::heap::report::MemoryReport {
-        // The shared-atoms probe: `QJS_ATOM_CENSUS` set prints each report's
-        // census (`docs/shared-atoms.md`).
-        if std::env::var_os("QJS_ATOM_CENSUS").is_some() {
-            eprintln!("atom census: {}", self.atom_census());
-        }
         let mut report = self.heap.report();
         let code = &mut report.code;
         code.static_units = self.code.len();
@@ -987,6 +982,12 @@ pub struct AtomCensus {
     /// The rest: atoms held only as values, or by nothing until the next
     /// collection.
     pub other: usize,
+    /// Units loaded from code images, and the entries of their key tables:
+    /// what shared key tables (phase 3) would save.
+    pub image_units: usize,
+    pub image_key_entries: usize,
+    /// The process's shared table when the census was taken.
+    pub process: crate::heap::shared::SharedStats,
     /// The units of each class's texts, in the same order.
     pub units: [usize; 8],
 }
@@ -1007,7 +1008,8 @@ impl std::fmt::Display for AtomCensus {
             f,
             "atoms {} ({total} units), {} shared: builtin {} ({builtin}), image code {} ({image_code}), \
              static code {} ({static_code}), dynamic code {} ({dynamic_code}), \
-             constants {} ({constants}), object keys {} ({object_keys}), other {} ({other})",
+             constants {} ({constants}), object keys {} ({object_keys}), other {} ({other}); \
+             the process shares {} ({} units, {} bytes); {} image units, {} key entries",
             self.total,
             self.shared,
             self.builtin,
@@ -1016,7 +1018,12 @@ impl std::fmt::Display for AtomCensus {
             self.dynamic_code,
             self.constants,
             self.object_keys,
-            self.other
+            self.other,
+            self.process.atoms,
+            self.process.units,
+            self.process.bytes,
+            self.image_units,
+            self.image_key_entries
         )
     }
 }
@@ -1063,10 +1070,13 @@ impl Runtime {
             set.extend(unit.name_atom.map(|id| id.0));
             set.extend(unit.atoms.iter().map(|id| id.0));
         };
+        let (mut image_units, mut image_key_entries) = (0, 0);
         for (_, unit) in self.code.units() {
             if unit.owns_shared() {
                 name(&mut static_code, unit);
             } else {
+                image_units += 1;
+                image_key_entries += unit.keys.len();
                 name(&mut image_code, unit);
             }
         }
@@ -1094,7 +1104,12 @@ impl Runtime {
                 }
             })
             .collect::<FxHashSet<u32>>();
-        let mut census = AtomCensus::default();
+        let mut census = AtomCensus {
+            image_units,
+            image_key_entries,
+            process: crate::heap::shared::stats(),
+            ..AtomCensus::default()
+        };
         let strings = &self.heap.strings;
         for id in self.heap.atoms.ids() {
             let index = id.0;

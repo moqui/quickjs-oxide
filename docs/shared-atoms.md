@@ -1,7 +1,8 @@
 # Shared atoms: a design
 
-Status: phase 1 (the builtin atoms) is implemented (`core/src/heap/shared.rs`); phases 2 and 3 are not. The change to
-the threading model below was accepted.
+Status: phases 1 (the builtin atoms) and 2 (the image atoms) are implemented (`core/src/heap/shared.rs`,
+`Compiler::load_image`); phase 3 is not. The change to the threading model below was accepted. The results are at the
+end ("Results").
 
 ## Why
 
@@ -108,8 +109,9 @@ in the first class that holds it:
 6. object keys: a key of a live shape, the host's map keys among them;
 7. other: held only as a value, or by nothing until the next collection.
 
-With `QJS_ATOM_CENSUS` set, each memory report prints the census to stderr, so an embedder's runs can be counted with
-no change on its side. `the_atom_census_classes_each_atom_once` in `tests/embedding_api.rs` tests it.
+The census also counts the shared atoms a runtime uses, the process's shared table (atoms, units, bytes), and the
+units loaded from images with their key-table entries. It is an API: an embedder prints it.
+`the_atom_census_classes_each_atom_once` in `tests/embedding_api.rs` tests it.
 
 The counts below are from mr-moqui Round 50's `js_speed` on this branch (fork 5a601429). Each cell is atoms, with the
 UTF-16 units of their text in parentheses.
@@ -135,4 +137,29 @@ What the counts say:
 - **Constants have to be shared too.** An image's string literals are atoms, interned at load (`CodeImage::atoms`), and
   they are the largest class whenever code carries text. Phase 2 must share them with the keys.
 - **The 11k atoms of R49's busiest worker are not reproduced here.** By these classes, about 90% of them should be
-  code atoms. Confirm that with `QJS_ATOM_CENSUS` on an mr-mantle run before phase 2.
+  code atoms. An mr-mantle run confirmed it before phase 2: 91% code, 96% with builtin
+  (quickjs-oxide-bench `rounds/r51/census-mantle`).
+
+## Results
+
+Phase 1 shares the atoms interned while a runtime is created. Phase 2 shares the atoms of a code image: its keys,
+function names and string constants. They go in the table as the image loads (`Compiler::load_image` sets
+`Heap::share_atoms`) while the table has room (`CAPACITY`, `CAPACITY_UNITS`).
+
+mr-mantle's specs ran with the census printed at every memory report, phase 1 against phase 2
+(quickjs-oxide-bench `rounds/r51/shared-atoms-p2`). The specs are 1947 features, with one failure in both,
+SupportAssignment's round robin.
+
+| | phase 1 | phase 2 |
+| --- | ---: | ---: |
+| busiest worker: atoms / its own | 11,614 / 11,102 | 13,302 / 831 |
+| service workers' most reserved bytes, median | 3324 KiB | 2230 KiB |
+| service workers' most reserved bytes, summed (23) | 70.8 MiB | 53.6 MiB |
+| the process's runtimes at their peak (`heap_at_max`) | 99.7 MB | 75.4 MB |
+| the process's shared table | 512 atoms | 28,858 atoms, 579k units, 4.2 MB |
+
+A worker keeps 600 to 850 atoms of its own: the host's keys and the rest.
+
+Phase 3 would share a unit's key table where all its keys are shared. The busiest workers hold 3.1k to 3.8k image units
+with 29k to 36k key entries: 115 to 145 KB of keys, plus an allocation for each unit's table. Across 23 workers that is
+3 to 5 MB, about 6% of what phase 2 leaves.

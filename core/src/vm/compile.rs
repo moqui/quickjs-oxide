@@ -405,6 +405,10 @@ impl Compiler<'_> {
                 .map_err(LoadError::Invalid)?;
         }
         let mark = self.heap.roots().mark();
+        // An image's atoms (its keys, names and string constants) are the
+        // same in every runtime that loads it: they go in the process's
+        // shared table, while it has room.
+        let sharing = std::mem::replace(&mut self.heap.share_atoms, true);
         let result = (|| {
             let mut ids: Vec<CodeUnitId> = Vec::with_capacity(count);
             // Children follow their parent in pre-order and have higher
@@ -428,6 +432,7 @@ impl Compiler<'_> {
             let tables: Vec<&[Value]> = tables.iter().map(Vec::as_slice).collect();
             Ok(self.instantiate(root, &tables)?)
         })();
+        self.heap.share_atoms = sharing;
         self.heap.roots().truncate(mark);
         result
     }
