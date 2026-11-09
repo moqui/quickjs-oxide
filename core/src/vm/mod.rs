@@ -327,8 +327,9 @@ pub struct Services {
 /// from Rust, whose instruction is unknown, has `?` for its line. While a
 /// sampler runs the loop polls at every call and loop back-edge (the
 /// interrupt checks stay at their interval), so a sample lands at the first
-/// of them after the flag is set and the counts follow time at that grain;
-/// time in a native function counts toward the script that runs after it.
+/// of them after the flag is set and the counts follow time at that grain.
+/// A sample asked while a native function runs is counted when it returns,
+/// with `name (native)` innermost.
 #[derive(Debug, Default)]
 pub struct Sampler {
     pub(crate) flag: std::sync::Arc<std::sync::atomic::AtomicBool>,

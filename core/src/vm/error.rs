@@ -299,6 +299,39 @@ pub(crate) fn add_stack_at(
     Ok(())
 }
 
+/// A sample asked while the native `callee` ran (the poll could not take
+/// it): the stack with `name (native)` innermost, its caller at the call.
+#[cold]
+#[inline(never)]
+pub(crate) fn sample_native(cx: &mut Cx<'_>, callee: Value) {
+    use std::sync::atomic::Ordering;
+    let take = cx
+        .host
+        .sampler
+        .as_ref()
+        .is_some_and(|sampler| sampler.flag.load(Ordering::Relaxed) && sampler.flag.swap(false, Ordering::Relaxed));
+    if !take {
+        return;
+    }
+    let vm = &cx.heap.vm;
+    let len = vm.frames.len();
+    let pc = vm
+        .natives
+        .last()
+        .filter(|site| site.depth as usize == len && site.pc != super::NO_PC)
+        .map(|site| site.pc);
+    let name = callee.as_object().map(|function| native_name(cx, function)).unwrap_or_default();
+    let mut key = format!("{} (native)", if name.is_empty() { "<anonymous>" } else { &name });
+    let rest = sample_key(cx, pc, None);
+    if !rest.is_empty() {
+        key.push(';');
+        key.push_str(&rest);
+    }
+    if let Some(sampler) = cx.host.sampler.as_mut() {
+        *sampler.counts.entry(key).or_default() += 1;
+    }
+}
+
 /// The running stack as a sample counts it: `name:line` frames, innermost
 /// first, joined by `;`. `entering` is a frame about to be pushed, counted
 /// at its first instruction; the frame below it is placed where it returns to.

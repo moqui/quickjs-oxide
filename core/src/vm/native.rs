@@ -79,8 +79,13 @@ impl CallSite {
 #[inline(never)]
 pub(crate) fn call(cx: &mut Cx<'_>, native: Native, site: CallSite) -> Result<Value, Throw> {
     let mark = cx.heap.roots().mark();
+    let callee = site.function;
     let result = (native.function())(cx, site);
     cx.heap.roots().truncate(mark);
+    // a sample asked while the native ran is its own, not the script's that runs next
+    if cx.host.sampler.is_some() {
+        super::error::sample_native(cx, callee);
+    }
     result
 }
 

@@ -1441,6 +1441,32 @@ fn a_sampler_counts_the_running_stacks_by_function_and_line() {
 }
 
 #[test]
+fn a_sample_asked_while_a_host_function_runs_is_its_own() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (runtime, context) = runtime();
+    let flag = Arc::new(AtomicBool::new(false));
+    runtime.start_sampling(Arc::clone(&flag)).unwrap();
+    let global = context.global_object().unwrap();
+    let asked = Arc::clone(&flag);
+    context
+        .define_function(&global, "slow", 0, move |_scope: &mut Scope<'_>| {
+            // the timer's tick lands while the host function runs
+            asked.store(true, Ordering::Relaxed);
+            Ok(Value::Undefined)
+        })
+        .unwrap();
+    context
+        .eval("function caller() {\n  for (let i = 0; i < 50; i++) slow();\n}\ncaller();")
+        .unwrap();
+    let samples = runtime.take_samples().unwrap();
+    assert!(
+        samples.iter().any(|(stack, _)| stack.starts_with("slow (native);caller:2")),
+        "{samples:?}"
+    );
+}
+
+#[test]
 fn a_thread_interrupts_an_endless_loop_while_a_sampler_runs() {
     let (runtime, context) = runtime();
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
