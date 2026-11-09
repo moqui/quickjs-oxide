@@ -370,11 +370,11 @@ impl Services {
 ///
 /// [`Runtime`]: crate::Runtime
 pub(crate) struct Cx<'a> {
-    pub heap: &'a mut Heap,
+    pub heap: &'a mut Box<Heap>,
     /// The static units only: [`Cx::unit`] reads any unit.
     pub static_code: &'a CodeStore,
     pub realm: &'a Realm,
-    pub host: &'a mut Services,
+    pub host: &'a mut Box<Services>,
     /// The shared owners of `static_code` and `realm`, which a host
     /// function lending the engine hands on (`embed::Lent`).
     pub code_owner: &'a std::rc::Rc<CodeStore>,
