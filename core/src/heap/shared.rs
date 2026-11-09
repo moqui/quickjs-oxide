@@ -163,10 +163,38 @@ pub fn find_or_insert(repr: StringRepr, hash: u32) -> Result<StringId, StringRep
     Ok(StringId(id))
 }
 
-/// How many shared atoms there are, and the units of their texts.
-pub fn stats() -> (usize, usize) {
+/// The shared table's size: its atoms, their texts' units, and the bytes
+/// the process holds for it (the segments made, the texts, the index).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SharedStats {
+    pub atoms: usize,
+    pub units: usize,
+    pub bytes: usize,
+}
+
+pub fn stats() -> SharedStats {
     let index = lock();
-    (index.len as usize, index.units)
+    let segments: usize = SEGMENTS
+        .iter()
+        .filter_map(OnceLock::get)
+        .map(|records| records.len() * size_of::<OnceLock<SharedAtom>>())
+        .sum();
+    let texts: usize = (0..index.len)
+        .map(|offset| get(SHARED_BASE + offset).repr().content_bytes())
+        .sum();
+    let lists: usize = index
+        .by_hash
+        .values()
+        .map(|ids| ids.capacity() * size_of::<u32>())
+        .sum();
+    SharedStats {
+        atoms: index.len as usize,
+        units: index.units,
+        bytes: segments
+            + texts
+            + index.by_hash.capacity() * (size_of::<(u32, Vec<u32>)>() + 1)
+            + lists,
+    }
 }
 
 #[cfg(test)]
