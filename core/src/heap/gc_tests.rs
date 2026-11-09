@@ -114,7 +114,7 @@ fn edge_check_reports_a_freed_rope_half() {
     heap.collect();
     heap.verify_edges();
 
-    heap.strings.free(left.index());
+    heap.strings.arena_mut().free(left.index());
     heap.verify_edges();
 }
 
@@ -129,7 +129,7 @@ fn edge_check_reports_a_freed_symbol_description() {
     heap.collect();
     heap.verify_edges();
 
-    heap.strings.free(description.index());
+    heap.strings.arena_mut().free(description.index());
     heap.verify_edges();
 }
 

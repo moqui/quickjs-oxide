@@ -644,6 +644,8 @@ fn the_atom_census_classes_each_atom_once() {
     let (runtime, context) = runtime();
     let fresh = runtime.atom_census().unwrap();
     assert_eq!(fresh.total, fresh.builtin);
+    // The builtins' names are the process's shared atoms.
+    assert_eq!(fresh.shared, fresh.total);
     context
         .eval(
             "var census = (0, eval)('(function (o) { return o.censusKey + o.length; })'); \

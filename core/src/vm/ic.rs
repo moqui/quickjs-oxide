@@ -19,7 +19,6 @@
 use crate::bytecode::{CodeUnit, Opcode};
 use crate::heap::arena::Arena;
 use crate::heap::object::{NONE, ObjectHeader, ObjectKind, flags};
-use crate::heap::string::StringRecord;
 use crate::heap::values::ValueHeap;
 use crate::shape::{STATIC_CELL, ValidityCell};
 use crate::value::{ShapeId, ValidityCellId, Value};
@@ -142,7 +141,7 @@ pub(crate) fn get_hit(
     objects: &Arena<ObjectHeader>,
     cells: &Arena<ValidityCell>,
     values: &ValueHeap,
-    strings: &Arena<StringRecord>,
+    strings: &crate::heap::string::Strings,
     entry: IcEntry,
     receiver: Value,
 ) -> Option<Value> {

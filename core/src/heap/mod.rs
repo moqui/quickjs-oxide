@@ -15,6 +15,7 @@ pub mod gc;
 pub(crate) mod hash;
 pub mod object;
 pub mod report;
+pub mod shared;
 pub mod string;
 pub mod symbol;
 pub mod table;
@@ -112,7 +113,7 @@ impl Need {
 pub struct Heap {
     pub(crate) objects: Arena<ObjectHeader>,
     pub(crate) shapes: Arena<Shape>,
-    pub(crate) strings: Arena<StringRecord>,
+    pub(crate) strings: string::Strings,
     /// `WeakRef` targets kept alive until the current job ends.
     pub(crate) kept: Vec<Value>,
     /// The rejected promises without a handler, in rejection order, while the
@@ -139,6 +140,9 @@ pub struct Heap {
     pub(crate) atoms: AtomTable,
     /// What [`Heap::intern`] does with the atoms it returns.
     pub(crate) atom_mode: AtomMode,
+    /// While set, a new atom goes in the process's shared table
+    /// ([`shared`]): the builtins' names while the runtime is created.
+    pub(crate) share_atoms: bool,
     /// The atoms interned in [`AtomMode::Pin`]: roots for the heap's
     /// lifetime.
     pub(crate) pinned_atoms: Vec<StringId>,
@@ -235,7 +239,7 @@ impl Heap {
         let mut heap = Heap {
             objects: Arena::new(),
             shapes: Arena::new(),
-            strings: Arena::new(),
+            strings: string::Strings::default(),
             kept: Vec::new(),
             rejections: Vec::new(),
             holey: Default::default(),
@@ -250,6 +254,7 @@ impl Heap {
             payloads: PayloadArenas::default(),
             atoms: AtomTable::default(),
             atom_mode: AtomMode::Pin,
+            share_atoms: false,
             pinned_atoms: Vec::new(),
             held_atoms: Vec::new(),
             code: code::DynamicUnits::default(),
@@ -322,7 +327,7 @@ impl Heap {
     pub fn bytes(&self) -> usize {
         self.objects.bytes()
             + self.shapes.bytes()
-            + self.strings.bytes()
+            + self.strings.arena().bytes()
             + self.rope_bytes.get()
             + self.symbols.bytes()
             + self.bigints.bytes()
@@ -348,7 +353,7 @@ impl Heap {
     pub fn used_bytes(&self) -> usize {
         self.objects.used_bytes()
             + self.shapes.used_bytes()
-            + self.strings.used_bytes()
+            + self.strings.arena().used_bytes()
             + self.rope_bytes.get()
             + self.symbols.used_bytes()
             + self.bigints.used_bytes()
@@ -406,7 +411,7 @@ impl Heap {
     }
 
     pub fn live_strings(&self) -> usize {
-        self.strings.live_count()
+        self.strings.arena().live_count()
     }
 
     pub fn live_cells(&self) -> usize {
@@ -1190,10 +1195,12 @@ impl Heap {
 
     /// The record of `id`, flattened if it was a rope.
     #[inline]
-    pub fn string(&self, id: StringId) -> &StringRecord {
+    pub fn string(&self, id: StringId) -> string::StrRef<'_> {
         let record = self.strings.get(id.0);
-        if record.flat().is_none() {
-            self.flatten(id, record);
+        if let string::StrRef::Local(local) = record
+            && local.flat().is_none()
+        {
+            self.flatten(id, local);
         }
         record
     }
@@ -1201,13 +1208,13 @@ impl Heap {
     /// The length of `id` without flattening it.
     #[inline]
     pub fn string_len(&self, id: StringId) -> usize {
-        self.strings.get(id.0).len()
+        self.strings.len_of(id.0)
     }
 
     /// Whether every unit of `id` fits in a byte, without flattening it.
     #[inline]
     pub fn string_is_one_byte(&self, id: StringId) -> bool {
-        self.strings.get(id.0).is_one_byte()
+        self.strings.is_one_byte(id.0)
     }
 
     /// Flattens a rope in place: an explicit stack walks the tree left to
@@ -1278,18 +1285,37 @@ impl Heap {
             self.retain_atom(id);
             return Ok(id);
         }
+        if let Some(id) = shared::find(&repr, hash) {
+            self.atoms.insert(hash, id);
+            return Ok(id);
+        }
         self.insert_atom(repr, hash)
     }
 
-    /// A new atom for `repr`, whose content hash is `hash`.
+    /// A new atom for `repr`, whose content hash is `hash`: a shared one
+    /// while [`Heap::share_atoms`] is set and the shared table has room,
+    /// else the runtime's own. A shared atom is imported into the runtime's
+    /// atom table, where its interning finds it from then on: a text has one
+    /// id in a runtime.
     fn insert_atom(&mut self, repr: StringRepr, hash: u32) -> Result<StringId, HeapError> {
+        let repr = if self.share_atoms {
+            match shared::find_or_insert(repr, hash) {
+                Ok(id) => {
+                    self.atoms.insert(hash, id);
+                    return Ok(id);
+                }
+                Err(repr) => repr,
+            }
+        } else {
+            repr
+        };
         let array_index = repr.array_index().unwrap_or(NONE);
         let mut record = StringRecord::new(repr);
         record.is_atom = true;
         record.array_index = array_index;
         let id = self.alloc_string_record(record)?;
         if id.0 >= KEY_INDEX_LIMIT {
-            self.strings.free(id.0);
+            self.strings.arena_mut().free(id.0);
             return Err(HeapError::OutOfMemory);
         }
         self.atoms.insert(hash, id);
@@ -1300,6 +1326,10 @@ impl Heap {
     /// Keeps an interned atom as [`Heap::atom_mode`] says.
     #[inline]
     fn retain_atom(&mut self, id: StringId) {
+        // A shared atom lives as long as the process.
+        if shared::is_shared(id.0) {
+            return;
+        }
         match self.atom_mode {
             AtomMode::Weak => {}
             AtomMode::Hold => self.hold_atom(id),
@@ -1319,6 +1349,9 @@ impl Heap {
 
     /// Keeps atom `id` for the heap's lifetime.
     pub fn pin_atom(&mut self, id: StringId) {
+        if shared::is_shared(id.0) {
+            return;
+        }
         let record = self.strings.get_mut(id.0);
         debug_assert!(record.is_atom, "pinning a string that is not an atom");
         if record.keep != AtomKeep::Pinned {
@@ -1377,7 +1410,7 @@ impl Heap {
     pub(crate) fn shrink_to_fit(&mut self) {
         self.objects.shrink_to_fit();
         self.shapes.shrink_to_fit();
-        self.strings.shrink_to_fit();
+        self.strings.arena_mut().shrink_to_fit();
         self.symbols.shrink_to_fit();
         self.bigints.shrink_to_fit();
         self.cells.shrink_to_fit();
@@ -1432,13 +1465,17 @@ impl Heap {
             self.retain_atom(id);
             return Ok(id);
         }
+        if let Some(id) = shared::find_one_byte(bytes, hash) {
+            self.atoms.insert(hash, id);
+            return Ok(id);
+        }
         self.insert_atom(StringRepr::OneByte(bytes.into()), hash)
     }
 
     /// The atom with the content of `string` (itself, if it is one).
     pub fn intern_string(&mut self, string: StringId) -> Result<StringId, HeapError> {
         let record = self.string(string);
-        if record.is_atom {
+        if record.is_atom() {
             self.retain_atom(string);
             return Ok(string);
         }

@@ -74,7 +74,7 @@ impl RegExpStore {
     /// `RegExp` object before its next allocation.
     pub(crate) fn intern(
         &mut self,
-        strings: &crate::heap::arena::Arena<crate::heap::string::StringRecord>,
+        strings: &crate::heap::string::Strings,
         source: StringId,
         flags: StringId,
     ) -> Result<u32, String> {

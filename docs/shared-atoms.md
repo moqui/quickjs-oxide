@@ -1,7 +1,7 @@
 # Shared atoms: a design
 
-Status: proposed, not implemented. It needs a decision first, because it adds state that every runtime of the process
-reads, where runtimes share nothing mutable today.
+Status: phase 1 (the builtin atoms) is implemented (`core/src/heap/shared.rs`); phases 2 and 3 are not. The change to
+the threading model below was accepted.
 
 ## Why
 

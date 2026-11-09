@@ -47,6 +47,14 @@ fn record<T: Record>(arena: &Arena<T>, name: &str, index: u32, edge: fmt::Argume
     }
 }
 
+/// Panics unless string `index` is live: in the arena, or a shared atom.
+#[track_caller]
+fn string_record(strings: &super::string::Strings, index: u32, edge: fmt::Arguments<'_>) {
+    if !strings.is_live(index) {
+        panic!("gc verify: string {index} ({edge}) is freed");
+    }
+}
+
 impl Heap {
     /// Checks every edge of every live record, side table and root.
     pub(super) fn verify_edges(&self) {
@@ -342,7 +350,7 @@ impl Heap {
     }
 
     fn verify_strings(&self) {
-        for index in self.strings.live_indices() {
+        for index in self.strings.arena().live_indices() {
             let flat = self.strings.get(index).flat().is_some();
             match self.ropes.get(&index) {
                 Some(_) if flat => panic!("gc verify: flattened rope {index} keeps its halves"),
@@ -363,19 +371,13 @@ impl Heap {
             }
         }
         for &index in self.ropes.keys() {
-            record(
-                &self.strings,
-                "string",
-                index,
-                format_args!("a rope with halves"),
-            );
+            string_record(&self.strings, index, format_args!("a rope with halves"));
         }
         for index in self.symbols.live_indices() {
             let description = self.symbols.get(index).description;
             if description != NONE {
-                record(
+                string_record(
                     &self.strings,
-                    "string",
                     description,
                     format_args!("description of symbol {index}"),
                 );
@@ -445,14 +447,9 @@ impl Heap {
             );
         }
         for id in self.atoms.ids() {
-            record(
-                &self.strings,
-                "string",
-                id.0,
-                format_args!("in the atom table"),
-            );
+            string_record(&self.strings, id.0, format_args!("in the atom table"));
             assert!(
-                self.strings.get(id.0).is_atom,
+                self.strings.get(id.0).is_atom(),
                 "gc verify: string {} is in the atom table but is no atom",
                 id.0
             );
@@ -503,10 +500,10 @@ impl Heap {
         }
         for (mode, atoms) in [("pinned", &self.pinned_atoms), ("held", &self.held_atoms)] {
             for &id in atoms {
-                record(&self.strings, "string", id.0, format_args!("{mode} atom"));
+                string_record(&self.strings, id.0, format_args!("{mode} atom"));
                 let atom = self.strings.get(id.0);
                 assert!(
-                    atom.is_atom && atom.flat().is_some(),
+                    atom.is_atom() && atom.flat().is_some(),
                     "gc verify: {mode} string {} is not a flat atom",
                     id.0
                 );
@@ -518,7 +515,7 @@ impl Heap {
             .flat_map(|table| table.iter())
             .flatten()
         {
-            record(&self.strings, "string", id.0, format_args!("a unit string"));
+            string_record(&self.strings, id.0, format_args!("a unit string"));
         }
         for shape in self
             .closure_shapes

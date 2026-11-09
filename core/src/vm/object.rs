@@ -633,7 +633,7 @@ pub(crate) fn array_index(heap: &crate::Heap, key: PropertyKey) -> Option<u32> {
         KeyKind::Index(index) => Some(index),
         KeyKind::String(id) => {
             // A key is an atom, never a rope.
-            let index = heap.strings.get(id.0).array_index;
+            let index = heap.strings.get(id.0).array_index();
             (index != NONE).then_some(index)
         }
         KeyKind::Symbol(_) => None,
@@ -720,7 +720,7 @@ pub(crate) fn truncate(cx: &mut Cx<'_>, array: ObjectId, length: u32) -> Result<
         .filter_map(|key| match key.kind() {
             KeyKind::Index(index) if index >= length => Some(index),
             KeyKind::String(id) => {
-                let index = heap.string(id).array_index;
+                let index = heap.string(id).array_index();
                 (index != NONE && index >= length).then_some(index)
             }
             _ => None,
@@ -1172,8 +1172,8 @@ fn host_own_keys(cx: &Cx<'_>, object: ObjectId, listed: Vec<PropertyKey>) -> Vec
     let heap = &*cx.heap;
     keys.sort_by_key(|key| match key.kind() {
         KeyKind::Index(index) => (0, index),
-        KeyKind::String(id) if heap.string(id).array_index != NONE => {
-            (0, heap.string(id).array_index)
+        KeyKind::String(id) if heap.string(id).array_index() != NONE => {
+            (0, heap.string(id).array_index())
         }
         KeyKind::String(_) => (1, 0),
         KeyKind::Symbol(_) => (2, 0),
@@ -1228,7 +1228,7 @@ pub(crate) fn ordinary_own_keys(cx: &Cx<'_>, object: ObjectId) -> Vec<PropertyKe
 fn is_index_key(heap: &crate::Heap, key: PropertyKey) -> bool {
     match key.kind() {
         KeyKind::Index(_) => true,
-        KeyKind::String(id) => heap.string(id).array_index != NONE,
+        KeyKind::String(id) => heap.string(id).array_index() != NONE,
         KeyKind::Symbol(_) => false,
     }
 }
@@ -1237,8 +1237,8 @@ fn is_index_key(heap: &crate::Heap, key: PropertyKey) -> bool {
 fn sort_index_keys(heap: &crate::Heap, keys: &mut [PropertyKey]) {
     keys.sort_by_key(|key| match key.kind() {
         KeyKind::Index(index) => (0, index),
-        KeyKind::String(id) if heap.string(id).array_index != NONE => {
-            (0, heap.string(id).array_index)
+        KeyKind::String(id) if heap.string(id).array_index() != NONE => {
+            (0, heap.string(id).array_index())
         }
         _ => (1, 0),
     });

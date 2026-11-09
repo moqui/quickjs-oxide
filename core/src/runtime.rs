@@ -375,6 +375,9 @@ impl Runtime {
         heap.vm.limit = options.stack_limit;
         heap.vm.native_budget = options.native_stack_budget;
         heap.vm.native_depth = options.native_depth_limit;
+        // The realm's names and the builtins' properties are the process's
+        // shared atoms: the first runtime adds them, the others find them.
+        heap.share_atoms = true;
         let root = |heap: &mut Heap, object: ObjectId| {
             heap.add_fixed_root(Value::object(object));
             object
@@ -466,6 +469,7 @@ impl Runtime {
         // The heap pinned every atom so far: the realm's names and the
         // builtins' properties. From here atoms live as long as their holders.
         runtime.heap.set_atom_mode(crate::heap::AtomMode::Weak);
+        runtime.heap.share_atoms = false;
         runtime.heap.shrink_to_fit();
         Ok(runtime)
     }
@@ -961,6 +965,8 @@ impl Runtime {
 pub struct AtomCensus {
     /// Live atoms.
     pub total: usize,
+    /// Of them, the process's shared atoms the runtime uses.
+    pub shared: usize,
     /// Atoms whose text a fresh runtime of this build has: the realm's names
     /// and the builtins' properties.
     pub builtin: usize,
@@ -999,10 +1005,11 @@ impl std::fmt::Display for AtomCensus {
         ] = self.units;
         write!(
             f,
-            "atoms {} ({total} units): builtin {} ({builtin}), image code {} ({image_code}), \
+            "atoms {} ({total} units), {} shared: builtin {} ({builtin}), image code {} ({image_code}), \
              static code {} ({static_code}), dynamic code {} ({dynamic_code}), \
              constants {} ({constants}), object keys {} ({object_keys}), other {} ({other})",
             self.total,
+            self.shared,
             self.builtin,
             self.image_code,
             self.static_code,
@@ -1026,22 +1033,24 @@ impl Runtime {
     pub fn atom_census(&self) -> AtomCensus {
         use crate::heap::hash::FxHashSet;
         fn atom_texts(runtime: &Runtime) -> FxHashSet<Vec<u16>> {
-            let strings = &runtime.heap.strings;
-            strings
-                .live_indices()
-                .filter(|&index| strings.get(index).is_atom)
-                .map(|index| strings.get(index).repr().units().collect())
+            let heap = &runtime.heap;
+            heap.atoms
+                .ids()
+                .map(|id| heap.strings.get(id.0).repr().units().collect())
                 .collect()
         }
-        let builtin = BUILTIN_TEXTS.with(|texts| {
-            texts
-                .get_or_init(|| {
-                    Runtime::new(crate::HeapLimits::default())
-                        .map(|fresh| atom_texts(&fresh))
-                        .unwrap_or_default()
-                })
-                .clone()
-        });
+        // A thread being torn down has no slot left: no builtin texts then.
+        let builtin = BUILTIN_TEXTS
+            .try_with(|texts| {
+                texts
+                    .get_or_init(|| {
+                        Runtime::new(crate::HeapLimits::default())
+                            .map(|fresh| atom_texts(&fresh))
+                            .unwrap_or_default()
+                    })
+                    .clone()
+            })
+            .unwrap_or_default();
         let mut image_code = FxHashSet::default();
         let mut static_code = FxHashSet::default();
         let mut dynamic_code = FxHashSet::default();
@@ -1087,11 +1096,10 @@ impl Runtime {
             .collect::<FxHashSet<u32>>();
         let mut census = AtomCensus::default();
         let strings = &self.heap.strings;
-        for index in strings.live_indices() {
+        for id in self.heap.atoms.ids() {
+            let index = id.0;
             let record = strings.get(index);
-            if !record.is_atom {
-                continue;
-            }
+            census.shared += usize::from(crate::heap::shared::is_shared(index));
             let units = record.len();
             let text: Vec<u16> = record.repr().units().collect();
             let class = if builtin.contains(&text) {

@@ -286,7 +286,7 @@ impl Printer<'_, '_> {
             KeyKind::Index(index) => self.out.push_str(&index.to_string()),
             KeyKind::String(id) => {
                 let units = self.units(id);
-                match self.cx.heap.string(id).array_index {
+                match self.cx.heap.string(id).array_index() {
                     NONE => self.atom_units(&units),
                     index => self.out.push_str(&index.to_string()),
                 }

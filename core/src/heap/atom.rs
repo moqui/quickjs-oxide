@@ -15,9 +15,8 @@
 
 use std::fmt;
 
-use super::arena::Arena;
 use super::hash::FxHashMap;
-use super::string::{StringRecord, StringRepr};
+use super::string::{StringRepr, Strings};
 use crate::value::{StringId, SymbolId, Value};
 
 const INDEX_TAG: u32 = 1 << 31;
@@ -132,22 +131,12 @@ pub struct AtomTable {
 }
 
 impl AtomTable {
-    pub fn find(
-        &self,
-        strings: &Arena<StringRecord>,
-        repr: &StringRepr,
-        hash: u32,
-    ) -> Option<StringId> {
+    pub fn find(&self, strings: &Strings, repr: &StringRepr, hash: u32) -> Option<StringId> {
         self.find_by(hash, |id| strings.get(id.0).flat() == Some(repr))
     }
 
     /// [`Self::find`] for the content of a one-byte representation.
-    pub fn find_one_byte(
-        &self,
-        strings: &Arena<StringRecord>,
-        bytes: &[u8],
-        hash: u32,
-    ) -> Option<StringId> {
+    pub fn find_one_byte(&self, strings: &Strings, bytes: &[u8], hash: u32) -> Option<StringId> {
         self.find_by(hash, |id| {
             matches!(strings.get(id.0).flat(), Some(StringRepr::OneByte(atom)) if **atom == *bytes)
         })

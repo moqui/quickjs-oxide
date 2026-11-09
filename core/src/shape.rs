@@ -1162,7 +1162,7 @@ impl Heap {
         for (key, _, _) in self.shape_entries(header.shape) {
             match key.kind() {
                 KeyKind::Index(index) => indices.push((index, key)),
-                KeyKind::String(id) => match self.strings.get(id.0).array_index {
+                KeyKind::String(id) => match self.strings.get(id.0).array_index() {
                     NONE => strings.push(key),
                     index => indices.push((index, key)),
                 },
@@ -1199,7 +1199,7 @@ impl Heap {
             .iter()
             .any(|(key, _, _)| match key.kind() {
                 KeyKind::Index(_) => true,
-                KeyKind::String(id) => self.strings.get(id.0).array_index != NONE,
+                KeyKind::String(id) => self.strings.get(id.0).array_index() != NONE,
                 KeyKind::Symbol(_) => false,
             })
     }

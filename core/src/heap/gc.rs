@@ -444,7 +444,7 @@ impl Heap {
         let values = self.values.growth_bytes(need.values[0] + need.values[1]);
         self.objects.growth_bytes(need.objects)
             + self.shapes.growth_bytes(need.shapes)
-            + self.strings.growth_bytes(need.strings)
+            + self.strings.arena().growth_bytes(need.strings)
             + self.symbols.growth_bytes(need.symbols)
             + self.bigints.growth_bytes(need.bigints)
             + self.cells.growth_bytes(need.cells)
@@ -527,7 +527,7 @@ impl Heap {
     fn clear_marks(&mut self) {
         self.objects.clear_marks();
         self.shapes.clear_marks();
-        self.strings.clear_marks();
+        self.strings.arena_mut().clear_marks();
         self.symbols.clear_marks();
         self.bigints.clear_marks();
         self.cells.clear_marks();
@@ -723,9 +723,10 @@ impl Heap {
                 }
                 Kind::String => {
                     let index = value.as_string().unwrap().0;
+                    // A freshly marked string is the runtime's own.
                     if self.strings.mark(index)
                         && !self.ropes.is_empty()
-                        && self.strings.get(index).flat().is_none()
+                        && self.strings.local(index).flat().is_none()
                         && let Some(&(left, right)) = self.ropes.get(&index)
                     {
                         stack.push(Value::string(left));
@@ -906,7 +907,7 @@ impl Heap {
         // A rope's halves are dropped once it dies or flattens.
         let strings = &self.strings;
         self.ropes
-            .retain(|&index, _| strings.is_marked(index) && strings.get(index).flat().is_none());
+            .retain(|&index, _| strings.is_marked(index) && strings.local(index).flat().is_none());
         let objects = &self.objects;
         self.holey.retain(|&index| objects.is_marked(index));
         if let Some((error, _)) = &self.vm.unpositioned
@@ -978,7 +979,7 @@ impl Heap {
         self.ics.trim();
         self.regexps.sweep();
         let (rope_bytes, atoms) = (&self.rope_bytes, &mut self.atoms);
-        freed += self.strings.sweep(|index, record| {
+        freed += self.strings.arena_mut().sweep(|index, record| {
             rope_bytes.set(rope_bytes.get() - record.flattened_rope_bytes());
             if record.is_atom {
                 atoms.remove(record.repr().content_hash(), crate::value::StringId(index));
@@ -1022,7 +1023,7 @@ impl Heap {
         }
         check("object", &self.objects);
         check("shape", &self.shapes);
-        check("string", &self.strings);
+        check("string", self.strings.arena());
         check("symbol", &self.symbols);
         check("bigint", &self.bigints);
         check("cell", &self.cells);
