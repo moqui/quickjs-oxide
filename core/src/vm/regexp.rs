@@ -38,6 +38,10 @@ pub struct RegExpStore {
     marks: Vec<u64>,
     live: usize,
     bytes: usize,
+    /// Calls of the protocol methods that took the pristine path, counted
+    /// as the inline caches are (`ic-stats` or a debug build).
+    #[cfg(any(feature = "ic-stats", debug_assertions))]
+    pub(crate) pristine_calls: std::cell::Cell<u64>,
 }
 
 /// Bytes a program holds, including the arrays its instructions own.

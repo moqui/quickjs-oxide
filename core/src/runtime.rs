@@ -285,6 +285,9 @@ pub struct Realm {
     /// `%RegExp.prototype%`'s flag accessors as installed, for the `flags`
     /// getter's fast path.
     pub(crate) regexp_flags: std::cell::Cell<Option<crate::builtins::RegExpFlagCache>>,
+    /// The shape `regexp_flags` holds for, read alone where a fast path
+    /// first checks it.
+    pub(crate) regexp_flags_shape: std::cell::Cell<Option<crate::value::ShapeId>>,
 }
 
 impl Realm {
@@ -457,6 +460,7 @@ impl Runtime {
             symbols,
             brand,
             regexp_flags: std::cell::Cell::new(None),
+            regexp_flags_shape: std::cell::Cell::new(None),
         };
         let mut runtime = Runtime {
             heap: Box::new(heap),
@@ -715,6 +719,16 @@ impl Runtime {
     /// constructors and `$262.evalScript`.
     pub fn set_compiler(&mut self, compile: crate::vm::compile::CompileFn) {
         self.host.compile = Some(compile);
+    }
+
+    /// How many calls of the RegExp protocol methods took the pristine
+    /// path (the matcher's captures, no observable `exec`), when the build
+    /// counts (`ic-stats` or a debug build): for tests of the fast paths.
+    pub fn regexp_pristine_calls(&self) -> Option<u64> {
+        #[cfg(any(feature = "ic-stats", debug_assertions))]
+        return Some(self.heap.regexps.pristine_calls.get());
+        #[cfg(not(any(feature = "ic-stats", debug_assertions)))]
+        None
     }
 
     /// The inline-cache report, when the counters exist (the `ic-stats` feature
