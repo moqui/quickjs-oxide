@@ -324,14 +324,17 @@ pub struct Services {
 /// (on a timer); the next poll that finds it set clears it and counts the
 /// running stack, innermost frame first, as `name:line` frames joined by
 /// `;` (the folded form flame graph tools read). A frame below a re-entry
-/// from Rust, whose instruction is unknown, has `?` for its line. Polls come
-/// about every thousand loop back-edges and calls, so a sample lands within
-/// that much script of its request, and time in a native function counts
-/// toward the script that runs after it.
+/// from Rust, whose instruction is unknown, has `?` for its line. While a
+/// sampler runs the loop polls at every call and loop back-edge (the
+/// interrupt checks stay at their interval), so a sample lands at the first
+/// of them after the flag is set and the counts follow time at that grain;
+/// time in a native function counts toward the script that runs after it.
 #[derive(Debug, Default)]
 pub struct Sampler {
     pub(crate) flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) counts: crate::heap::hash::FxHashMap<String, u64>,
+    /// Polls until the next interrupt check.
+    pub(crate) until_check: u32,
 }
 
 /// Most frames a sample keeps, innermost first.

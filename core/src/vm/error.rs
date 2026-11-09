@@ -628,22 +628,33 @@ pub(crate) fn poll_interrupts_entering(cx: &mut Cx<'_>, entering: &super::Frame)
 }
 
 fn poll_sampled(cx: &mut Cx<'_>, pc: Option<u32>, entering: Option<&super::Frame>) -> Result<(), Throw> {
-    if cx
-        .host
-        .sampler
-        .as_ref()
-        .is_some_and(|sampler| sampler.flag.swap(false, std::sync::atomic::Ordering::Relaxed))
-    {
-        let key = sample_key(cx, pc, entering);
-        if let Some(sampler) = cx.host.sampler.as_mut() {
-            *sampler.counts.entry(key).or_default() += 1;
+    use std::sync::atomic::Ordering;
+    // With a sampler the loop polls at every call and back-edge, so a sample lands at the first one after the flag is
+    // set; the interrupt checks below still run every INTERRUPT_INTERVAL of them.
+    let sampling = cx.host.sampler.is_some();
+    if let Some(sampler) = cx.host.sampler.as_mut() {
+        cx.heap.vm.poll = 1;
+        let take = sampler.flag.load(Ordering::Relaxed) && sampler.flag.swap(false, Ordering::Relaxed);
+        sampler.until_check = sampler.until_check.saturating_sub(1);
+        let check = sampler.until_check == 0;
+        if check {
+            sampler.until_check = super::INTERRUPT_INTERVAL;
+        }
+        if take {
+            let key = sample_key(cx, pc, entering);
+            if let Some(sampler) = cx.host.sampler.as_mut() {
+                *sampler.counts.entry(key).or_default() += 1;
+            }
+        }
+        if !check && !cx.heap.vm.interrupted {
+            return Ok(());
         }
     }
     let pending = cx.heap.vm.interrupted
-        || cx.host.interrupt.load(std::sync::atomic::Ordering::Relaxed)
+        || cx.host.interrupt.load(Ordering::Relaxed)
         || cx.host.hooks.interrupt();
     if !pending {
-        cx.heap.vm.poll = super::INTERRUPT_INTERVAL;
+        cx.heap.vm.poll = if sampling { 1 } else { super::INTERRUPT_INTERVAL };
         return Ok(());
     }
     Err(interrupt(cx))

@@ -398,6 +398,7 @@ impl<'a> NativeCx<'a> {
                 self.host.sampler = Some(Box::new(crate::vm::Sampler {
                     flag,
                     counts: Default::default(),
+                    until_check: crate::vm::INTERRUPT_INTERVAL,
                 }));
             }
         }

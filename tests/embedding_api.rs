@@ -1441,6 +1441,19 @@ fn a_sampler_counts_the_running_stacks_by_function_and_line() {
 }
 
 #[test]
+fn a_thread_interrupts_an_endless_loop_while_a_sampler_runs() {
+    let (runtime, context) = runtime();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    runtime.start_sampling(flag).unwrap();
+    let started = std::time::Instant::now();
+    let thread = interrupt_later(&runtime, std::time::Duration::from_millis(50));
+    assert_eq!(context.eval("while (true) {}"), Err(RuntimeError::Interrupted));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    thread.join().unwrap();
+    runtime.interrupt_handle().clear();
+}
+
+#[test]
 fn a_thread_interrupts_an_endless_loop() {
     let (runtime, context) = runtime();
     let started = std::time::Instant::now();
