@@ -677,6 +677,13 @@ impl Runtime {
         Ok(self.enter()?.core.memory_report())
     }
 
+    /// What the runtime's atoms are: builtin, named by static or dynamic
+    /// code, object keys only, or other (the shared-atoms probe,
+    /// `docs/shared-atoms.md`).
+    pub fn atom_census(&self) -> Result<oxide_core::AtomCensus, RuntimeError> {
+        Ok(self.enter()?.core.atom_census())
+    }
+
     /// When the collector runs: on heap growth (the default) or only at the
     /// cap and on [`Runtime::run_gc`].
     pub fn set_gc_policy(&self, policy: GcPolicy) -> Result<(), RuntimeError> {

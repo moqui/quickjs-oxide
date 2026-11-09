@@ -637,6 +637,36 @@ fn a_collection_gives_back_the_caches_of_units_that_went() {
     assert_eq!(context.eval("keep({ y: 1, x: 5 })").unwrap(), Value::Int(6));
 }
 
+/// The shared-atoms probe classes every live atom once: a fresh runtime's
+/// are its builtins'; code and a host's keys add theirs.
+#[test]
+fn the_atom_census_classes_each_atom_once() {
+    let (runtime, context) = runtime();
+    let fresh = runtime.atom_census().unwrap();
+    assert_eq!(fresh.total, fresh.builtin);
+    context
+        .eval(
+            "var census = (0, eval)('(function (o) { return o.censusKey + o.length; })'); \
+             var made = JSON.parse('{\"hostKey1\": 1, \"hostKey2\": 2}'); census(made);",
+        )
+        .unwrap();
+    let busy = runtime.atom_census().unwrap();
+    assert_eq!(
+        busy.total,
+        busy.builtin
+            + busy.image_code
+            + busy.static_code
+            + busy.dynamic_code
+            + busy.constants
+            + busy.object_keys
+            + busy.other,
+        "{busy}"
+    );
+    assert!(busy.static_code >= 2, "census, made: {busy}");
+    assert!(busy.dynamic_code >= 1, "censusKey: {busy}");
+    assert!(busy.object_keys >= 2, "hostKey1, hostKey2: {busy}");
+}
+
 #[test]
 fn symbol_rope_description_survives_collection_without_other_string_roots() {
     let (runtime, context) = runtime();

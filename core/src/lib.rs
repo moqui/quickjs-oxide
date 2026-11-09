@@ -27,7 +27,7 @@ pub use heap::object::ObjectKind;
 pub use heap::report::MemoryReport;
 pub use heap::{AtomMode, BytecodeTemplate, Heap, HeapError};
 pub use image::{CodeImage, EncodeError, LoadError};
-pub use runtime::{Intrinsic, Realm, Runtime, RuntimeOptions, ThrownSummary};
+pub use runtime::{AtomCensus, Intrinsic, Realm, Runtime, RuntimeOptions, ThrownSummary};
 pub use shape::PropertyFlags;
 pub use value::{
     BigIntId, BytecodeId, Kind, ObjectId, ScopeId, ShapeId, StringId, SymbolId, ValidityCellId,

@@ -93,5 +93,46 @@ week, saves the 513 atoms of each runtime's floor. Phase 2 is the part that reac
 Risks:
 - **Every string read.** Each string read gains a branch: the interpreter's property paths and the string builtins.
   Measure it with the Sweep's instruction gate.
-- **Dynamic atoms.** How many of a busy worker's atoms are image atoms, and how many are dynamic (host map keys), is
-  not measured yet. Count them before phase 2: only image atoms are shared.
+- **Dynamic atoms.** Only image atoms are shared. The counts below show they are most of a runtime's atoms.
+
+## The counts
+
+`Runtime::atom_census` (core) and `api::core::Runtime::atom_census` count a runtime's live atoms by class, each atom
+in the first class that holds it:
+
+1. builtin: the text is one of a fresh runtime's atoms;
+2. image code: a key, name or atom of a unit loaded from a code image (its body is shared);
+3. static code: the same for the other units in the runtime's code store, the code it compiled itself;
+4. dynamic code: the same for the heap's run-time units;
+5. constants: a string literal among a live function's constants;
+6. object keys: a key of a live shape, the host's map keys among them;
+7. other: held only as a value, or by nothing until the next collection.
+
+With `QJS_ATOM_CENSUS` set, each memory report prints the census to stderr, so an embedder's runs can be counted with
+no change on its side. `the_atom_census_classes_each_atom_once` in `tests/embedding_api.rs` tests it.
+
+The counts below are from mr-moqui Round 50's `js_speed` on this branch (fork 5a601429). Each cell is atoms, with the
+UTF-16 units of their text in parentheses.
+
+| Runtime | Atoms | Builtin | Image code | Static code | Dynamic code | Constants | Object keys | Other |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| main thread, after the expression rows | 2022 | 512 | 0 | 940 | 0 | 170 | 206 | 194 |
+| main thread, after every row (scripts, actions, services, templates, screens) | 4188 (54k) | 512 (4.6k) | 75 (0.4k) | 1361 (14.3k) | 394 (3.8k) | 1418 (26.1k) | 269 (3.4k) | 159 (1.5k) |
+| a new thread, after its first script and screen | 3081 (35k) | 512 (4.6k) | 533 (4.6k) | 862 (9.8k) | 0 | 797 (12.0k) | 222 (2.8k) | 155 (1.5k) |
+
+moqui-core's `many_distinct_units_and_texts_keep_the_heap_bounded` runs 1600 screen units, each with 80 distinct
+string literals, and 2000 texts. After its collection: 59,749 atoms (1.23M units). Of these, 57,881 are constants
+(1.21M units), 938 static code, 512 builtin, 221 object keys and 197 other.
+
+What the counts say:
+- **Code atoms are most of a runtime's atoms.** Builtin and code atoms (image, static, dynamic and constants) are 90%
+  of the main thread's and 88% of a new thread's. The host's keys and the rest are 10 to 12%: about 400 atoms. A
+  screen's string literals can dwarf everything else.
+- **A new thread compiles much of its code itself.** Its 862 static-code atoms are its own compiles: the start's evals,
+  the helpers and the shims. mr-moqui's C4 (the start through the code images) would make them image atoms.
+- **The main thread is the one that compiles.** Its 1361 static-code atoms and its constants are what the other
+  threads load as images.
+- **Constants have to be shared too.** An image's string literals are atoms, interned at load (`CodeImage::atoms`), and
+  they are the largest class whenever code carries text. Phase 2 must share them with the keys.
+- **The 11k atoms of R49's busiest worker are not reproduced here.** By these classes, about 90% of them should be
+  code atoms. Confirm that with `QJS_ATOM_CENSUS` on an mr-mantle run before phase 2.
