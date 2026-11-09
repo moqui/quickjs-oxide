@@ -18,7 +18,8 @@ use super::image::CodeImage;
 use super::promise::PromiseCapability;
 use super::property::{
     AccessorValue, CompleteOrdinaryPropertyDescriptor, DataRef, DescriptorField, InitValue, Key,
-    OrdinaryPropertyDescriptor, OwnData, OwnDataRef, PropertyKey, TextRef, WellKnownSymbol,
+    OrdinaryPropertyDescriptor, OwnData, OwnDataRef, OwnTextRef, PropertyKey, TextRef,
+    WellKnownSymbol,
 };
 use super::runtime::{Preloaded, PromiseSnapshot, PromiseState, Shared, slot};
 use super::value::{CallableRef, ObjectRef, Slot, SymbolRef, Value};
@@ -974,58 +975,157 @@ impl View<'_> {
         prototype: Option<&ObjectRef>,
         visit: &mut dyn FnMut(OwnDataRef<'_>) -> bool,
     ) -> JsResult<Option<bool>> {
-        let id = self.object(object)?;
-        if self.core.object_kind(id) != oxide_core::ObjectKind::Ordinary {
+        let Some(entries) = self.plain_entries(object, prototype)? else {
             return Ok(None);
-        }
-        let expected = prototype.map(|p| self.object(p)).transpose()?;
-        let result = self.core.get_prototype_of(id);
-        if self.complete_with(result)? != expected {
-            return Ok(None);
-        }
-        let result = self.core.own_property_keys(id);
-        let keys = self.complete_with(result)?;
-        for key in keys {
-            let result = self.core.get_own_property(id, key);
-            let Some(descriptor) = self.complete_with(result)? else {
-                continue;
-            };
-            if descriptor.is_accessor() {
-                return Ok(None);
-            }
-            let enumerable = descriptor.enumerable.unwrap_or(false);
-            let value = descriptor.value.unwrap_or(oxide_core::Value::UNDEFINED);
-            let key = self.lift_key(key)?;
-            let shown = if self.core.is_callable(value) {
-                visit(OwnDataRef {
-                    key: &key,
-                    enumerable,
-                    value: DataRef::Callable,
-                })
-            } else if value.as_string().is_some() {
-                let text = match self.core.string_repr(value) {
-                    Some(StringRepr::OneByte(bytes)) => TextRef::Latin1(bytes),
-                    Some(StringRepr::TwoByte(units)) => TextRef::Utf16(units),
-                    None => TextRef::Latin1(&[]),
+        };
+        let result = (|| {
+            for &(key, value, enumerable) in &entries {
+                let key = self.lift_key(key)?;
+                let value = match self.data_ref(value)? {
+                    Some(value) => value,
+                    None => DataRef::Text(self.text_ref(value)),
                 };
-                visit(OwnDataRef {
+                if !visit(OwnDataRef {
                     key: &key,
                     enumerable,
-                    value: DataRef::Text(text),
-                })
-            } else {
-                let value = self.lift(value)?;
-                visit(OwnDataRef {
-                    key: &key,
-                    enumerable,
-                    value: DataRef::Value(value),
-                })
-            };
-            if !shown {
-                return Ok(Some(false));
+                    value,
+                }) {
+                    return Ok(Some(false));
+                }
             }
+            Ok(Some(true))
+        })();
+        self.give_back_entries(entries);
+        result
+    }
+
+    /// [`Self::visit_plain_own_data`] with each key shown as its text,
+    /// borrowed from the heap: no key is lifted. `None` also when the object
+    /// has a symbol-keyed property, which has no text.
+    pub(crate) fn visit_plain_own_text(
+        &mut self,
+        object: &ObjectRef,
+        prototype: Option<&ObjectRef>,
+        visit: &mut dyn FnMut(OwnTextRef<'_>) -> bool,
+    ) -> JsResult<Option<bool>> {
+        let Some(entries) = self.plain_entries(object, prototype)? else {
+            return Ok(None);
+        };
+        if entries
+            .iter()
+            .any(|(key, _, _)| matches!(key.kind(), oxide_core::heap::atom::KeyKind::Symbol(_)))
+        {
+            self.give_back_entries(entries);
+            return Ok(None);
         }
-        Ok(Some(true))
+        let result = (|| {
+            for &(key, value, enumerable) in &entries {
+                let lifted = self.data_ref_owned(value)?;
+                let oxide_core::heap::atom::KeyKind::String(name) = key.kind() else {
+                    continue;
+                };
+                let key = self.text_ref(oxide_core::Value::string(name));
+                let value = match lifted {
+                    Some(value) => value,
+                    None => DataRef::Text(self.text_ref(value)),
+                };
+                if !visit(OwnTextRef {
+                    key,
+                    enumerable,
+                    value,
+                }) {
+                    return Ok(Some(false));
+                }
+            }
+            Ok(Some(true))
+        })();
+        self.give_back_entries(entries);
+        result
+    }
+
+    /// An Array's elements, `0` to its `length`, shown to `visit` one at a
+    /// time as [`Self::visit_plain_own_data`] shows values: a string
+    /// borrowed from the heap, a callable marked, the rest lifted. `None`
+    /// unless `object` is an Array in its dense form with no hole below its
+    /// length; `Some(false)` when `visit` stopped. Runs no code.
+    pub(crate) fn visit_dense_array(
+        &mut self,
+        object: &ObjectRef,
+        visit: &mut dyn FnMut(DataRef<'_>) -> bool,
+    ) -> JsResult<Option<bool>> {
+        let id = self.object(object)?;
+        let mut elements = std::mem::take(&mut *self.shared.dense_elements.borrow_mut());
+        elements.clear();
+        if !self.core.dense_array_elements(id, &mut elements) {
+            *self.shared.dense_elements.borrow_mut() = elements;
+            return Ok(None);
+        }
+        let result = (|| {
+            for &value in &elements {
+                let value = match self.data_ref_owned(value)? {
+                    Some(value) => value,
+                    None => DataRef::Text(self.text_ref(value)),
+                };
+                if !visit(value) {
+                    return Ok(Some(false));
+                }
+            }
+            Ok(Some(true))
+        })();
+        elements.clear();
+        *self.shared.dense_elements.borrow_mut() = elements;
+        result
+    }
+
+    /// The entries of a plain object inheriting from `prototype`, read from
+    /// its shape into the kept buffer; `None` (the buffer kept) otherwise.
+    fn plain_entries(
+        &mut self,
+        object: &ObjectRef,
+        prototype: Option<&ObjectRef>,
+    ) -> JsResult<Option<Vec<(oxide_core::PropertyKey, oxide_core::Value, bool)>>> {
+        let id = self.object(object)?;
+        let expected = prototype.map(|p| self.object(p)).transpose()?;
+        let mut entries = std::mem::take(&mut *self.shared.plain_entries.borrow_mut());
+        entries.clear();
+        if !self.core.plain_data_entries(id, expected, &mut entries) {
+            *self.shared.plain_entries.borrow_mut() = entries;
+            return Ok(None);
+        }
+        Ok(Some(entries))
+    }
+
+    fn give_back_entries(
+        &self,
+        mut entries: Vec<(oxide_core::PropertyKey, oxide_core::Value, bool)>,
+    ) {
+        entries.clear();
+        *self.shared.plain_entries.borrow_mut() = entries;
+    }
+
+    /// A shown value that is not a string: a callable marked, the rest
+    /// lifted; `None` for a string, which [`Self::text_ref`] borrows.
+    fn data_ref_owned(&mut self, value: oxide_core::Value) -> JsResult<Option<DataRef<'static>>> {
+        if value.as_string().is_some() {
+            return Ok(None);
+        }
+        if self.core.is_callable(value) {
+            return Ok(Some(DataRef::Callable));
+        }
+        Ok(Some(DataRef::Value(self.lift(value)?)))
+    }
+
+    fn data_ref(&mut self, value: oxide_core::Value) -> JsResult<Option<DataRef<'static>>> {
+        self.data_ref_owned(value)
+    }
+
+    /// The text of a string value, borrowed from the heap.
+    fn text_ref(&self, value: oxide_core::Value) -> TextRef<'_> {
+        match self.core.string_repr(value) {
+            Some(StringRepr::OneByte(bytes)) => TextRef::Latin1(bytes),
+            Some(StringRepr::TwoByte(units)) => TextRef::Utf16(units),
+            None => TextRef::Latin1(&[]),
+        }
     }
 
     /// The elements of an Array, `0` to its `length`: `None` unless `object`
@@ -1737,6 +1837,14 @@ js_ops! {
     /// is not a plain object, `Some(false)` when `visit` stopped. Runs no
     /// code.
     fn visit_plain_own_data(&mut self, object: &ObjectRef, prototype: Option<&ObjectRef>, visit: &mut dyn FnMut(OwnDataRef<'_>) -> bool) -> JsResult<Option<bool>>;
+    /// [`Js::visit_plain_own_data`] with each key's text borrowed from the
+    /// heap, no key lifted; `None` also for an object with a symbol key.
+    fn visit_plain_own_text(&mut self, object: &ObjectRef, prototype: Option<&ObjectRef>, visit: &mut dyn FnMut(OwnTextRef<'_>) -> bool) -> JsResult<Option<bool>>;
+    /// An Array's elements shown to `visit` one at a time, strings borrowed
+    /// and callables marked with no handle; `None` unless it is an Array in
+    /// its dense form with no hole, `Some(false)` when `visit` stopped.
+    /// Runs no code.
+    fn visit_dense_array(&mut self, object: &ObjectRef, visit: &mut dyn FnMut(DataRef<'_>) -> bool) -> JsResult<Option<bool>>;
 
     // ---- conversions and printing ----
 

@@ -280,6 +280,15 @@ pub struct OwnDataRef<'a> {
     pub value: DataRef<'a>,
 }
 
+/// An own data property [`Js::visit_plain_own_text`](super::Js::visit_plain_own_text)
+/// shows: its key's text and its string value borrowed from the heap.
+#[derive(Debug)]
+pub struct OwnTextRef<'a> {
+    pub key: TextRef<'a>,
+    pub enumerable: bool,
+    pub value: DataRef<'a>,
+}
+
 /// An own data property of a plain object, as [`Js::plain_own_data`](super::Js::plain_own_data) reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnData {

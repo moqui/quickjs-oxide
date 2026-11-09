@@ -31,7 +31,8 @@ pub use ops::{Js, JsResult};
 pub use promise::PromiseCapability;
 pub use property::{
     AccessorValue, CompleteOrdinaryPropertyDescriptor, DataRef, DescriptorField, InitValue,
-    OrdinaryPropertyDescriptor, OwnData, OwnDataRef, PropertyKey, TextRef, WellKnownSymbol,
+    OrdinaryPropertyDescriptor, OwnData, OwnDataRef, OwnTextRef, PropertyKey, TextRef,
+    WellKnownSymbol,
 };
 pub use runtime::{
     GcPolicy, GcStats, InterruptHandle, PendingJobOutcome, PromiseSnapshot, PromiseState, Runtime,

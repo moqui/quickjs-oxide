@@ -705,6 +705,97 @@ impl Heap {
             .any(|value| !value.is_empty())
     }
 
+    /// The own data properties of a plain object: an ordinary object with
+    /// no element, inheriting from `prototype`, whose every own property is
+    /// a data property named by an atom that is no array index (or by a
+    /// symbol). Appends `(key, value, enumerable)` to `out` in
+    /// `[[OwnPropertyKeys]]` order, the strings and then the symbols, read
+    /// from the shape and the slots with no list of keys. `false` (and
+    /// `out` as it was) when `object` is not such an object.
+    pub fn plain_data_entries(
+        &self,
+        object: ObjectId,
+        prototype: Option<ObjectId>,
+        out: &mut Vec<(PropertyKey, Value, bool)>,
+    ) -> bool {
+        use crate::shape::PropertyFlags;
+        let header = self.objects.get(object.0);
+        if header.kind != ObjectKind::Ordinary
+            || self.prototype_of(object) != prototype
+            || self.has_elements(object)
+        {
+            return false;
+        }
+        let start = out.len();
+        let record = self.shapes.get(header.shape.0);
+        let mut symbols = false;
+        let mut take = |out: &mut Vec<_>, key: PropertyKey, flags: PropertyFlags, slot: u32| {
+            if flags.has(PropertyFlags::ACCESSOR) || flags.has(PropertyFlags::AUTOINIT) {
+                return false;
+            }
+            match key.kind() {
+                atom::KeyKind::String(id) if self.string(id).array_index() == object::NONE => {}
+                atom::KeyKind::Symbol(_) => symbols = true,
+                _ => return false,
+            }
+            out.push((
+                key,
+                self.get_slot(object, slot),
+                flags.has(PropertyFlags::ENUMERABLE),
+            ));
+            true
+        };
+        let complete = if let Some(dictionary) = &record.dictionary {
+            dictionary
+                .entries()
+                .all(|entry| take(out, entry.key, entry.flags, entry.slot))
+        } else {
+            let mut current = record;
+            let mut complete = true;
+            while current.count > 0 {
+                if !take(out, current.key, current.flags, current.slot) {
+                    complete = false;
+                    break;
+                }
+                current = self
+                    .shapes
+                    .get(current.parent.expect("non-root shape has a parent").0);
+            }
+            out[start..].reverse();
+            complete
+        };
+        if !complete {
+            out.truncate(start);
+            return false;
+        }
+        if symbols {
+            // `[[OwnPropertyKeys]]` lists the strings before the symbols.
+            out[start..].sort_by_key(|(key, _, _)| matches!(key.kind(), atom::KeyKind::Symbol(_)));
+        }
+        true
+    }
+
+    /// The elements of an `Array` in its dense form, `0` to its length,
+    /// appended to `out`: `false` (and `out` as it was) when it is not an
+    /// Array, is sparse, or has a hole below its length.
+    pub fn dense_array_elements(&self, object: ObjectId, out: &mut Vec<Value>) -> bool {
+        let header = self.objects.get(object.0);
+        if header.kind != ObjectKind::Array || header.has(object::flags::SPARSE) {
+            return false;
+        }
+        let length = header.payload;
+        let elements = header.elements();
+        if elements.len < length {
+            return false;
+        }
+        let values = &self.values.slice(elements)[..length as usize];
+        if values.iter().any(|value| value.is_empty()) {
+            return false;
+        }
+        out.extend_from_slice(values);
+        true
+    }
+
     pub fn get_element(&self, object: ObjectId, index: u32) -> Value {
         let header = self.objects.get(object.0);
         let elements = header.elements();

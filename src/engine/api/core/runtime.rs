@@ -90,6 +90,11 @@ pub(crate) struct Shared {
     pub(crate) key_texts: RefCell<KeyTexts>,
     /// The core keys of the embedder's string keys, by the string's identity.
     pub(crate) key_atoms: RefCell<KeyAtoms>,
+    /// A plain object's entries and an Array's elements while a visit shows
+    /// them ([`super::ops`]'s plain-object and dense-array visits), kept for
+    /// the next.
+    pub(crate) plain_entries: RefCell<Vec<(oxide_core::PropertyKey, oxide_core::Value, bool)>>,
+    pub(crate) dense_elements: RefCell<Vec<oxide_core::Value>>,
 }
 
 /// The core key a [`PropertyKey`](super::PropertyKey)'s string interned
@@ -427,6 +432,8 @@ impl Runtime {
                 spares: RefCell::new(Vec::new()),
                 key_texts: RefCell::new(KeyTexts::default()),
                 key_atoms: RefCell::new(KeyAtoms::default()),
+                plain_entries: RefCell::default(),
+                dense_elements: RefCell::default(),
                 turns: Cell::new(0),
             }),
         }
@@ -958,6 +965,27 @@ impl Runtime {
         self.engine()?
             .view()
             .visit_plain_own_data(object, prototype, visit)
+    }
+
+    /// [`Js::visit_plain_own_text`](super::Js::visit_plain_own_text).
+    pub fn visit_plain_own_text(
+        &self,
+        object: &ObjectRef,
+        prototype: Option<&ObjectRef>,
+        visit: &mut dyn FnMut(super::OwnTextRef<'_>) -> bool,
+    ) -> Result<Option<bool>, RuntimeError> {
+        self.engine()?
+            .view()
+            .visit_plain_own_text(object, prototype, visit)
+    }
+
+    /// [`Js::visit_dense_array`](super::Js::visit_dense_array).
+    pub fn visit_dense_array(
+        &self,
+        object: &ObjectRef,
+        visit: &mut dyn FnMut(super::DataRef<'_>) -> bool,
+    ) -> Result<Option<bool>, RuntimeError> {
+        self.engine()?.view().visit_dense_array(object, visit)
     }
 
     /// [`Js::dense_array_values`](super::Js::dense_array_values).
