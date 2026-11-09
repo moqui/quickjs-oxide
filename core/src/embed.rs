@@ -388,6 +388,37 @@ impl<'a> NativeCx<'a> {
         std::sync::Arc::clone(&self.host.interrupt)
     }
 
+    /// Starts the sampling profiler ([`crate::vm::Sampler`]): a poll that
+    /// finds `flag` set counts the running stack. Started again, it keeps the
+    /// counts and takes the new flag.
+    pub fn start_sampling(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        match self.host.sampler.as_mut() {
+            Some(sampler) => sampler.flag = flag,
+            None => {
+                self.host.sampler = Some(Box::new(crate::vm::Sampler {
+                    flag,
+                    counts: Default::default(),
+                    until_check: crate::vm::INTERRUPT_INTERVAL,
+                }));
+            }
+        }
+    }
+
+    /// The samples counted since the last take, by folded stack; the
+    /// profiler keeps running.
+    pub fn take_samples(&mut self) -> Vec<(String, u64)> {
+        self.host
+            .sampler
+            .as_mut()
+            .map(|sampler| sampler.counts.drain().collect())
+            .unwrap_or_default()
+    }
+
+    /// Stops the sampling profiler and drops its counts.
+    pub fn stop_sampling(&mut self) {
+        self.host.sampler = None;
+    }
+
     /// Whether an interrupt is unwinding (the last throw was one).
     pub fn is_interrupted(&self) -> bool {
         self.heap.vm.interrupted

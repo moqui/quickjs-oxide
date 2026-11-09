@@ -299,6 +299,56 @@ pub(crate) fn add_stack_at(
     Ok(())
 }
 
+/// The running stack as a sample counts it: `name:line` frames, innermost
+/// first, joined by `;`. `entering` is a frame about to be pushed, counted
+/// at its first instruction; the frame below it is placed where it returns to.
+fn sample_key(cx: &Cx<'_>, innermost_pc: Option<u32>, entering: Option<&super::Frame>) -> String {
+    let vm = &cx.heap.vm;
+    let len = vm.frames.len();
+    let mut key = String::new();
+    let returns_to = |frame: &super::Frame| {
+        (frame.flags & frame_flags::ENTRY == 0 && frame.return_pc > 0).then(|| frame.return_pc - 1)
+    };
+    if let Some(frame) = entering {
+        sample_frame(cx, &mut key, frame, Some(0));
+    }
+    for index in (0..len).rev().take(super::SAMPLE_FRAMES) {
+        let frame = &vm.frames[index];
+        let pc = if index + 1 == len {
+            match entering {
+                Some(entering) => returns_to(entering),
+                None => innermost_pc,
+            }
+        } else {
+            returns_to(&vm.frames[index + 1])
+        };
+        sample_frame(cx, &mut key, frame, pc);
+    }
+    key
+}
+
+/// One frame of a sample: its function's name as a backtrace gives it, and
+/// the line of `pc`.
+fn sample_frame(cx: &Cx<'_>, key: &mut String, frame: &super::Frame, pc: Option<u32>) {
+    let unit = cx.unit(frame.unit);
+    if !key.is_empty() {
+        key.push(';');
+    }
+    let names = Names::key(cx.realm.names.name);
+    let name = if cx.heap.lookup_own(frame.function, names).is_none() && !debug_name(&unit).is_empty() {
+        debug_name(&unit).to_owned()
+    } else {
+        native_name(cx, frame.function)
+    };
+    key.push_str(if name.is_empty() { "<anonymous>" } else { &name });
+    match pc.and_then(|pc| unit.debug.position(pc)) {
+        Some((line, _)) => {
+            let _ = write!(key, ":{line}");
+        }
+        None => key.push_str(":?"),
+    }
+}
+
 fn debug_name(unit: &crate::bytecode::CodeUnit) -> &str {
     &unit.debug.name
 }
@@ -560,14 +610,51 @@ pub(crate) fn stack_overflow(cx: &mut Cx<'_>) -> Throw {
 /// flag, then its hook. An interrupt sets `vm.interrupted`, which makes the
 /// throw uncatchable, and polls again at every later back-edge and call so
 /// any JavaScript a native runs on the way out stops too.
+///
+/// This is the poll at a back-edge, whose instruction `pc` is the innermost
+/// frame's position for a sample ([`super::Sampler`]).
 #[cold]
 #[inline(never)]
-pub(crate) fn poll_interrupts(cx: &mut Cx<'_>) -> Result<(), Throw> {
+pub(crate) fn poll_interrupts_at(cx: &mut Cx<'_>, pc: Option<u32>) -> Result<(), Throw> {
+    poll_sampled(cx, pc, None)
+}
+
+/// [`poll_interrupts_at`] as `entering` is about to be pushed: a sample counts
+/// it at its start, and its caller where `entering` returns to.
+#[cold]
+#[inline(never)]
+pub(crate) fn poll_interrupts_entering(cx: &mut Cx<'_>, entering: &super::Frame) -> Result<(), Throw> {
+    poll_sampled(cx, None, Some(entering))
+}
+
+fn poll_sampled(cx: &mut Cx<'_>, pc: Option<u32>, entering: Option<&super::Frame>) -> Result<(), Throw> {
+    use std::sync::atomic::Ordering;
+    // With a sampler the loop polls at every call and back-edge, so a sample lands at the first one after the flag is
+    // set; the interrupt checks below still run every INTERRUPT_INTERVAL of them.
+    let sampling = cx.host.sampler.is_some();
+    if let Some(sampler) = cx.host.sampler.as_mut() {
+        cx.heap.vm.poll = 1;
+        let take = sampler.flag.load(Ordering::Relaxed) && sampler.flag.swap(false, Ordering::Relaxed);
+        sampler.until_check = sampler.until_check.saturating_sub(1);
+        let check = sampler.until_check == 0;
+        if check {
+            sampler.until_check = super::INTERRUPT_INTERVAL;
+        }
+        if take {
+            let key = sample_key(cx, pc, entering);
+            if let Some(sampler) = cx.host.sampler.as_mut() {
+                *sampler.counts.entry(key).or_default() += 1;
+            }
+        }
+        if !check && !cx.heap.vm.interrupted {
+            return Ok(());
+        }
+    }
     let pending = cx.heap.vm.interrupted
-        || cx.host.interrupt.load(std::sync::atomic::Ordering::Relaxed)
+        || cx.host.interrupt.load(Ordering::Relaxed)
         || cx.host.hooks.interrupt();
     if !pending {
-        cx.heap.vm.poll = super::INTERRUPT_INTERVAL;
+        cx.heap.vm.poll = if sampling { 1 } else { super::INTERRUPT_INTERVAL };
         return Ok(());
     }
     Err(interrupt(cx))
