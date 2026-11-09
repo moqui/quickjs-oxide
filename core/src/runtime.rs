@@ -914,6 +914,42 @@ impl Runtime {
         })
     }
 
+    /// Declares `texts` as keys the embedder uses in every runtime (its host
+    /// objects' members, its model's names): each becomes a shared atom of
+    /// the process ([`crate::heap::shared`]), while the table has room, and
+    /// this runtime uses it. A text this runtime already has an atom of its
+    /// own for keeps that atom. Returns how many of the texts are shared
+    /// atoms in this runtime. Keys made from run-time data are not declared
+    /// and stay the runtime's own.
+    pub fn share_keys<'t>(
+        &mut self,
+        texts: impl IntoIterator<Item = &'t str>,
+    ) -> Result<usize, HeapError> {
+        let sharing = self.set_share_atoms(true);
+        let mut shared = 0;
+        let result = (|| {
+            for text in texts {
+                let key = self.heap.property_key(text)?;
+                if let crate::heap::atom::KeyKind::String(id) = key.kind()
+                    && crate::heap::shared::is_shared(id.0)
+                {
+                    shared += 1;
+                }
+            }
+            Ok(shared)
+        })();
+        self.set_share_atoms(sharing);
+        result
+    }
+
+    /// While set, every new atom is a shared atom of the process, as while
+    /// the runtime is created: for an embedder's start, whose keys and code
+    /// are the same in every runtime. Returns the setting before. An
+    /// embedder that sets it clears it before it handles run-time data.
+    pub fn set_share_atoms(&mut self, share: bool) -> bool {
+        std::mem::replace(&mut self.heap.share_atoms, share)
+    }
+
     /// What every part of the runtime holds, read without a collection. Its
     /// reserved total equals [`Heap::bytes`].
     pub fn memory_report(&self) -> crate::heap::report::MemoryReport {

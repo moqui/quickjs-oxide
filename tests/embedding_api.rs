@@ -669,6 +669,61 @@ fn the_atom_census_classes_each_atom_once() {
     assert!(busy.object_keys >= 2, "hostKey1, hostKey2: {busy}");
 }
 
+/// Keys made from run-time data (a parsed map's keys, a host's map keys)
+/// are the runtime's own atoms and never enter the process's shared table;
+/// keys the embedder declares are shared.
+#[test]
+fn runtime_map_keys_stay_out_of_the_shared_table() {
+    let (runtime, context) = runtime();
+    let before = runtime.atom_census().unwrap();
+    // Declared: shared, in this runtime and for the process.
+    assert_eq!(
+        runtime
+            .share_keys(["declaredKeyAlpha", "declaredKeyBeta", "12"])
+            .unwrap(),
+        2
+    );
+    let declared = runtime.atom_census().unwrap();
+    assert_eq!(declared.shared, before.shared + 2);
+    // A parsed map's keys, a host's map keys, a computed key.
+    context
+        .eval(
+            "var parsed = JSON.parse('{\"mapKeyFromJson7f3a\": 1, \"mapKeyFromJson9c1d\": 2}'); \
+             var computed = {}; computed['mapKeyComputed' + 41] = 1;",
+        )
+        .unwrap();
+    let object = context.new_object().unwrap();
+    for name in ["hostMapKey5e2b", "hostMapKey8d4f"] {
+        let key = runtime.intern_property_key(name).unwrap();
+        context.set_property(&object, &key, Value::Int(1)).unwrap();
+    }
+    let global = context.global_object().unwrap();
+    let held = runtime.intern_property_key("hostMapHolder").unwrap();
+    context
+        .set_property(&global, &held, Value::Object(object))
+        .unwrap();
+    // Keys a declared-key scope did not cover stay the runtime's own, and
+    // the declared ones are found again as shared.
+    let after = runtime.atom_census().unwrap();
+    assert_eq!(after.shared, declared.shared, "{after}");
+    assert!(after.total >= declared.total + 6, "{after}");
+    assert_eq!(
+        runtime.share_keys(["declaredKeyAlpha"]).unwrap(),
+        1,
+        "a declared key stays shared"
+    );
+    // A scope that shares every new atom: the embedder's start.
+    let scoped = runtime
+        .sharing_atoms(|| {
+            runtime
+                .intern_property_key("startScopedKey3a9e")
+                .and_then(|key| context.set_property(&global, &key, Value::Int(3)))
+        })
+        .unwrap();
+    assert!(scoped.is_ok());
+    assert_eq!(runtime.atom_census().unwrap().shared, after.shared + 1);
+}
+
 #[test]
 fn symbol_rope_description_survives_collection_without_other_string_roots() {
     let (runtime, context) = runtime();

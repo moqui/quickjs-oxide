@@ -684,6 +684,50 @@ impl Runtime {
         Ok(self.enter()?.core.atom_census())
     }
 
+    /// Declares `texts` as keys the embedder uses in every runtime of the
+    /// process (its host objects' members, its model's names): each becomes
+    /// a shared atom, while the process's table has room, so the code
+    /// images that name them share their key tables. A text this runtime
+    /// already has an atom of its own for keeps it. Returns how many of the
+    /// texts are shared atoms here. Keys made from run-time data (a
+    /// request's map keys) must not be declared: shared atoms are never
+    /// freed.
+    pub fn share_keys<'t>(
+        &self,
+        texts: impl IntoIterator<Item = &'t str>,
+    ) -> Result<usize, RuntimeError> {
+        Ok(self.enter()?.core.share_keys(texts)?)
+    }
+
+    /// Sets whether every new atom of this runtime is a shared atom of the
+    /// process, as while a runtime is created ([`Runtime::sharing_atoms`]
+    /// for a scope); returns the setting before. For the embedder's start,
+    /// whose keys and code are the same in every runtime: clear it before
+    /// the runtime handles run-time data.
+    pub fn set_share_atoms(&self, share: bool) -> Result<bool, RuntimeError> {
+        Ok(self.enter()?.core.set_share_atoms(share))
+    }
+
+    /// Runs `f` with every new atom of this runtime a shared atom of the
+    /// process, as while a runtime is created: for the embedder's start,
+    /// whose host objects, keys and start code are the same in every
+    /// runtime. Not for anything that handles run-time data.
+    pub fn sharing_atoms<R>(&self, f: impl FnOnce() -> R) -> Result<R, RuntimeError> {
+        struct Reset<'r>(&'r Runtime, bool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut entry) = self.0.enter() {
+                    entry.core.set_share_atoms(self.1);
+                }
+            }
+        }
+        let before = self.enter()?.core.set_share_atoms(true);
+        let reset = Reset(self, before);
+        let result = f();
+        drop(reset);
+        Ok(result)
+    }
+
     /// When the collector runs: on heap growth (the default) or only at the
     /// cap and on [`Runtime::run_gc`].
     pub fn set_gc_policy(&self, policy: GcPolicy) -> Result<(), RuntimeError> {
