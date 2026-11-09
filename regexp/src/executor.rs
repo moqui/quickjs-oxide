@@ -1052,6 +1052,10 @@ where
                     }
                 });
                 if let Some((start, end)) = participating {
+                    // The compare reads the capture's length of input: a
+                    // long capture is work the attempt's bound does not
+                    // count.
+                    poller.step_by(u32::try_from(end - start).unwrap_or(u32::MAX))?;
                     let Some(position) = match_back_reference(
                         input,
                         start,
@@ -1077,6 +1081,10 @@ where
                     }
                 });
                 if let Some((start, end)) = participating {
+                    // The compare reads the capture's length of input: a
+                    // long capture is work the attempt's bound does not
+                    // count.
+                    poller.step_by(u32::try_from(end - start).unwrap_or(u32::MAX))?;
                     let Some(position) = match_backward_back_reference(
                         input,
                         start,
@@ -2161,6 +2169,37 @@ mod tests {
         // A loop with no minimum before the end can match anywhere.
         assert_eq!(first(r"\d*"), None);
         assert_eq!(first(r"a*b*"), None);
+    }
+
+    /// A back-reference's compare counts its capture's length toward the
+    /// next poll, forward and backward, so a long capture compared once is
+    /// polled as the loop that made it is.
+    #[test]
+    fn a_long_back_reference_is_polled() {
+        let input = units(&"a".repeat(200_000));
+        let polls = |pattern: &str| {
+            let program = compile(pattern, "");
+            let mut polls = 0;
+            execute_with_interrupt(&program, &input, 0, || {
+                polls += 1;
+                false
+            })
+            .unwrap();
+            polls
+        };
+        let alone = polls("(a{50000})");
+        assert!(polls(r"(a{50000})\1") > alone, "forward");
+        assert!(polls(r"(a{50000})(?<=\1)") > alone, "backward");
+        // An interrupt raised at that poll stops the search.
+        let program = compile(r"(a{50000})\1", "");
+        let mut polls = 0;
+        assert_eq!(
+            execute_with_interrupt(&program, &input, 0, || {
+                polls += 1;
+                polls > alone
+            }),
+            Err(ExecError::Interrupted)
+        );
     }
 
     #[test]
