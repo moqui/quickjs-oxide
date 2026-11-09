@@ -551,22 +551,15 @@ impl NativeCx<'_> {
     /// The property key of the string `units` (an array index when it is
     /// one's canonical form).
     pub fn key_from_units(&mut self, units: &[u16]) -> Result<PropertyKey, HeapError> {
-        let sharing = std::mem::replace(&mut self.heap.share_atoms, true);
-        let key = self.heap.property_key_units(units);
-        self.heap.share_atoms = sharing;
-        key
+        self.heap.property_key_units(units)
     }
 
     /// The key of the Latin-1 string `bytes`: no allocation when its atom
-    /// exists. An embedder's keys (its host objects' members, the fields of
-    /// its maps) are the same texts in every runtime: a new one is a shared
-    /// atom, while the process's table has room, so the units of the code
-    /// images that name it share their key tables.
+    /// exists. A new atom is the runtime's own, collected as any atom is,
+    /// unless the embedder declared the text a shared key
+    /// ([`crate::Runtime::share_keys`], [`crate::Runtime::set_share_atoms`]).
     pub fn key_from_latin1(&mut self, bytes: &[u8]) -> Result<PropertyKey, HeapError> {
-        let sharing = std::mem::replace(&mut self.heap.share_atoms, true);
-        let key = self.heap.property_key_latin1(bytes);
-        self.heap.share_atoms = sharing;
-        key
+        self.heap.property_key_latin1(bytes)
     }
 
     /// The key of a symbol value; `None` for any other value.

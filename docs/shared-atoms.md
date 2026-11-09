@@ -1,7 +1,8 @@
 # Shared atoms: a design
 
-Status: phases 1 (the builtin atoms), 2 (the image atoms) and 3 (shared key tables, with the embedder's keys shared)
-are implemented (`core/src/heap/shared.rs`, `Compiler::load_image`, `image::Loader::keys`, `NativeCx::key_from_*`). The change to the threading model below was accepted. The results are at the
+Status: phases 1 (the builtin atoms), 2 (the image atoms) and 3 (shared key tables, with the embedder's
+declared keys shared) are implemented (`core/src/heap/shared.rs`, `Compiler::load_image`, `image::Loader::keys`,
+`Runtime::share_keys`). The change to the threading model below was accepted. The results are at the
 end ("Results").
 
 ## Why
@@ -170,9 +171,14 @@ matches, so it allocates no table, not even the validator's provisional one. A r
 of the texts builds its own table.
 
 Sharing the image keys alone shared 27% of the workers' key entries. The units name the host's keys, which each worker
-had interned before its first image load. So the embedder's keys (`NativeCx::key_from_latin1`, `key_from_units`) are
-shared atoms too, while the table has room: they are the same texts in every runtime.
+had interned before its first image load. Shared atoms are never freed, so the embedder declares the keys that are the
+same in every runtime, and keys made from run-time data stay each runtime's own:
 
-With both, mr-mantle's service workers hold 128,844 of 419,528 key entries in tables of their own (406,593 of 406,593
-before). js_speed's engine start makes 6,421 allocations, against 7,775 before (quickjs-oxide-bench
-`rounds/r51/shared-key-tables`).
+- `Runtime::share_keys(texts)` declares texts as shared keys (mr-moqui: the entity model's names, once a process);
+- `Runtime::set_share_atoms` and `sharing_atoms` make every new atom shared while set (mr-moqui: its start, from the
+  runtime's creation to the host's last install).
+
+mr-mantle's service workers then hold 18,933 of 417,420 key entries in tables of their own (406,593 of 406,593 before
+phase 3). The process's table ends at 34,525 atoms (5.7 MB); it starts at 11.6k (the start and the model) and grows
+only with the images loaded. js_speed's engine start makes 6,166 allocations, against 7,775 before phase 3
+(quickjs-oxide-bench `rounds/r51/shared-key-tables`, `rounds/r51/declared-keys`).
