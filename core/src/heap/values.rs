@@ -139,7 +139,9 @@ pub fn next_class_len(len: u32) -> u32 {
 
 pub struct ValueHeap {
     values: Vec<Value>,
-    free: [Vec<u32>; CLASSES],
+    /// The free ranges' starts by class. Boxed: 1.5 KB of the heap's 4.2,
+    /// which a lend of the engine to a host call would otherwise copy.
+    free: Box<[Vec<u32>; CLASSES]>,
     /// Bit `k` is set while list `k` may hold a range: set by every push,
     /// cleared when a split finds the list empty.
     listed: u64,
@@ -163,7 +165,7 @@ impl ValueHeap {
     pub fn new() -> Self {
         ValueHeap {
             values: Vec::new(),
-            free: std::array::from_fn(|_| Vec::new()),
+            free: Box::new(std::array::from_fn(|_| Vec::new())),
             listed: 0,
             runs: Vec::new(),
             current: (0, 0),
