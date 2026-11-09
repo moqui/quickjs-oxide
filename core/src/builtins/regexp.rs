@@ -419,6 +419,9 @@ pub(super) fn record_flag_cache(cx: &mut Cx<'_>) -> Result<(), HeapError> {
             .expect("a RegExp protocol method");
         symbol_slots[index] = (symbol, slot);
     }
+    cx.realm
+        .regexp_flags_shape
+        .set(Some(cx.heap.shape_of(prototype)));
     cx.realm.regexp_flags.set(Some(RegExpFlagCache {
         shape: cx.heap.shape_of(prototype),
         slots,
@@ -429,6 +432,64 @@ pub(super) fn record_flag_cache(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         symbol_slots,
     }));
     Ok(())
+}
+
+/// Makes `%RegExp%`'s flag cache hold for the prototype's shape now, when
+/// it can ([`recorded_again`]): before a fast path compares the shape.
+#[inline]
+fn refresh_flag_cache(cx: &Cx<'_>) {
+    if let Some(shape) = cx.realm.regexp_flags_shape.get() {
+        let prototype = cx.realm.intrinsic(Intrinsic::RegExpPrototype);
+        if cx.heap.shape_of(prototype) != shape {
+            recorded_again(cx);
+        }
+    }
+}
+
+/// The flag cache recorded again for `%RegExp.prototype%`'s shape now
+/// (a freeze, a property added since): when the eight flag properties are
+/// still accessors whose getters are the intrinsic ones, `exec` is still a
+/// data property and the five protocol methods are still data properties.
+/// Their slots move with the shape, and the fast paths compare the values
+/// (the getters, `exec`) as before. `None`, and the cache left as it was,
+/// when one of them is no longer so: the fast paths then take the generic
+/// path.
+#[cold]
+#[inline(never)]
+fn recorded_again(cx: &Cx<'_>) -> Option<RegExpFlagCache> {
+    let cache = cx.realm.regexp_flags.get()?;
+    let heap = &*cx.heap;
+    let prototype = cx.realm.intrinsic(Intrinsic::RegExpPrototype);
+    let shape = heap.shape_of(prototype);
+    let mut slots = cache.slots;
+    for ((slot, key), getter) in slots.iter_mut().zip(cache.keys).zip(cache.getters) {
+        let (found, flags) = heap.lookup_own(prototype, key)?;
+        if !flags.has(PropertyFlags::ACCESSOR)
+            || heap.get_slot(prototype, found) != Value::object(getter)
+        {
+            return None;
+        }
+        *slot = found;
+    }
+    let data = |key: crate::PropertyKey| match heap.lookup_own(prototype, key) {
+        Some((slot, flags)) if !flags.has(PropertyFlags::ACCESSOR) => Some(slot),
+        _ => None,
+    };
+    let exec_slot = data(Names::key(cx.realm.names.exec))?;
+    let mut symbol_slots = cache.symbol_slots;
+    for (symbol, slot) in &mut symbol_slots {
+        *slot = data(WellKnown::key(*symbol))?;
+    }
+    let cache = RegExpFlagCache {
+        shape,
+        slots,
+        exec_slot,
+        symbol_slots,
+        ..cache
+    };
+    cx.realm.regexp_flags.set(Some(cache));
+    cx.realm.regexp_flags_shape.set(Some(shape));
+    Some(cache)
 }
 
 /// The flags of a `%RegExp%` instance whose flag accessors no one changed
@@ -458,6 +519,7 @@ pub(super) fn flags(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
     let Some(object) = this.as_object() else {
         return Err(error::type_error(cx, "not an object"));
     };
+    refresh_flag_cache(cx);
     let cache = cx.realm.regexp_flags.get().expect("the flag cache");
     let mut text = Vec::new();
     if let Some(flags) = pristine_flags(cx, object, &cache) {
@@ -810,6 +872,7 @@ fn builtin_exec(cx: &mut Cx<'_>, object: ObjectId, string: StringId) -> Result<V
 
 /// Whether `object`'s `exec` is the intrinsic one.
 fn intrinsic_exec(cx: &mut Cx<'_>, object: ObjectId) -> Result<bool, Throw> {
+    refresh_flag_cache(cx);
     // An unmodified instance over an unmodified prototype: one slot read.
     if let Some(cache) = cx.realm.regexp_flags.get() {
         let heap = &*cx.heap;
@@ -1224,6 +1287,7 @@ pub(super) fn symbol_replace(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, T
 /// result arrays are fresh, ordinary and unobservable, and the protocol
 /// methods may work from the matcher's captures directly.
 fn pristine_exec_flags(cx: &mut Cx<'_>, object: ObjectId) -> Result<Option<RegExpFlags>, Throw> {
+    refresh_flag_cache(cx);
     let Some(cache) = cx.realm.regexp_flags.get() else {
         return Ok(None);
     };
@@ -1233,6 +1297,11 @@ fn pristine_exec_flags(cx: &mut Cx<'_>, object: ObjectId) -> Result<Option<RegEx
     let program = cx.heap.header(object).payload;
     if cx.heap.regexps.program(program).group_names().is_some() || !intrinsic_exec(cx, object)? {
         return Ok(None);
+    }
+    #[cfg(any(feature = "ic-stats", debug_assertions))]
+    {
+        let calls = &cx.heap.regexps.pristine_calls;
+        calls.set(calls.get() + 1);
     }
     Ok(Some(flags))
 }
@@ -1434,6 +1503,7 @@ pub(super) fn symbol_split(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Thr
     let unicode = has(&flags, b'u') || has(&flags, b'v');
     // A non-sticky original searches for the next match where the sticky
     // splitter would try each position.
+    refresh_flag_cache(cx);
     let searcher = match cx.realm.regexp_flags.get() {
         Some(cache) if !has(&flags, b'y') && pristine_flags(cx, object, &cache).is_some() => {
             Some(cx.heap.header(object).payload)
@@ -1600,6 +1670,7 @@ pub(crate) fn delegate(
     }
     // An unmodified instance over an unmodified prototype: the method is
     // the prototype's slot.
+    refresh_flag_cache(cx);
     let cached = cx.realm.regexp_flags.get().and_then(|cache| {
         let object = argument.as_object()?;
         let heap = &*cx.heap;

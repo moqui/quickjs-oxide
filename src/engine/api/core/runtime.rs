@@ -809,6 +809,12 @@ impl Runtime {
         ))
     }
 
+    /// How many calls of the RegExp protocol methods took the pristine path,
+    /// when the build counts (`ic-stats` or a debug build).
+    pub fn regexp_pristine_calls(&self) -> Result<Option<u64>, RuntimeError> {
+        Ok(self.enter()?.core.regexp_pristine_calls())
+    }
+
     /// The inline-cache report (`--ic-stats`), when the build counts.
     pub fn ic_report(&self, worst: usize) -> Result<Option<String>, RuntimeError> {
         Ok(self.enter()?.core.ic_report(worst))

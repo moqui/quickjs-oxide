@@ -724,6 +724,72 @@ fn runtime_map_keys_stay_out_of_the_shared_table() {
     assert_eq!(runtime.atom_census().unwrap().shared, after.shared + 1);
 }
 
+/// A frozen `RegExp.prototype` whose methods and flag getters are still
+/// the intrinsics keeps the pristine replace (the sandbox's lockdown); a
+/// replaced `exec`, a replaced flag getter or a flag made a data property
+/// holding the getter takes the generic path, which observes them.
+#[test]
+fn a_frozen_regexp_prototype_stays_pristine_until_a_method_changes() {
+    let calls = |runtime: &Runtime| runtime.regexp_pristine_calls().unwrap().unwrap();
+    let text = |context: &Context, source: &str| match context.eval(source) {
+        Ok(Value::String(text)) => text.to_utf8_lossy(),
+        Ok(Value::Bool(flag)) => flag.to_string(),
+        other => format!("{other:?}"),
+    };
+    let escape =
+        "'a<b>&c'.replace(/[&<>]/g, (c) => c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;')";
+
+    let (runtime, context) = self::runtime();
+    let before = calls(&runtime);
+    assert_eq!(text(&context, escape), "a&lt;b&gt;&amp;c");
+    let pristine = calls(&runtime);
+    assert!(pristine > before);
+    context.eval("Object.freeze(RegExp.prototype)").unwrap();
+    assert_eq!(text(&context, escape), "a&lt;b&gt;&amp;c");
+    assert!(
+        calls(&runtime) > pristine,
+        "a frozen prototype is still pristine"
+    );
+
+    // `exec` replaced after the shape changed: observed.
+    let (runtime, context) = self::runtime();
+    context
+        .eval(
+            "RegExp.prototype.extra = 1; var seen = 0; var exec = RegExp.prototype.exec; \
+             RegExp.prototype.exec = function (s) { seen++; return exec.call(this, s); };",
+        )
+        .unwrap();
+    let before = calls(&runtime);
+    assert_eq!(text(&context, escape), "a&lt;b&gt;&amp;c");
+    assert_eq!(calls(&runtime), before);
+    assert_eq!(text(&context, "seen > 0"), "true");
+
+    // A flag getter replaced: observed.
+    let (runtime, context) = self::runtime();
+    context
+        .eval(
+            "var reads = 0; var global = Object.getOwnPropertyDescriptor(RegExp.prototype, 'global').get; \
+             Object.defineProperty(RegExp.prototype, 'global', { get() { reads++; return global.call(this); } });",
+        )
+        .unwrap();
+    let before = calls(&runtime);
+    assert_eq!(text(&context, escape), "a&lt;b&gt;&amp;c");
+    assert_eq!(calls(&runtime), before);
+    assert_eq!(text(&context, "reads > 0"), "true");
+
+    // A flag made a data property holding its own getter: not pristine.
+    let (runtime, context) = self::runtime();
+    context
+        .eval(
+            "var g = Object.getOwnPropertyDescriptor(RegExp.prototype, 'global').get; \
+             Object.defineProperty(RegExp.prototype, 'global', { value: g });",
+        )
+        .unwrap();
+    let before = calls(&runtime);
+    context.eval(escape).unwrap();
+    assert_eq!(calls(&runtime), before);
+}
+
 #[test]
 fn symbol_rope_description_survives_collection_without_other_string_roots() {
     let (runtime, context) = runtime();
