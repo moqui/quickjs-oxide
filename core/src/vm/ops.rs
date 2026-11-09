@@ -612,11 +612,11 @@ pub(crate) fn to_property_key(cx: &mut Cx<'_>, value: Value) -> Result<PropertyK
         Kind::String => {
             let id = value.as_string().unwrap();
             let record = cx.heap.string(id);
-            if record.is_atom {
-                return Ok(if record.array_index == NONE {
+            if record.is_atom() {
+                return Ok(if record.array_index() == NONE {
                     PropertyKey::atom(id)
                 } else {
-                    PropertyKey::index(record.array_index).unwrap_or(PropertyKey::atom(id))
+                    PropertyKey::index(record.array_index()).unwrap_or(PropertyKey::atom(id))
                 });
             }
             let units = units(cx.heap, id);

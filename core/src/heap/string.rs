@@ -218,6 +218,176 @@ impl StringRecord {
     }
 }
 
+/// A string record of a runtime's arena or a shared atom
+/// ([`super::shared`]), as [`Strings::get`] finds it.
+#[derive(Clone, Copy)]
+pub enum StrRef<'a> {
+    Local(&'a StringRecord),
+    Shared(&'static super::shared::SharedAtom),
+}
+
+impl<'a> StrRef<'a> {
+    /// The units. A rope reached through [`super::Heap::string`] is flat.
+    #[inline]
+    pub fn repr(self) -> &'a StringRepr {
+        match self {
+            StrRef::Local(record) => record.repr(),
+            StrRef::Shared(atom) => atom.repr(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn flat(self) -> Option<&'a StringRepr> {
+        match self {
+            StrRef::Local(record) => record.flat(),
+            StrRef::Shared(atom) => Some(atom.repr()),
+        }
+    }
+
+    #[inline]
+    pub fn len(self) -> usize {
+        match self {
+            StrRef::Local(record) => record.len(),
+            StrRef::Shared(atom) => atom.repr().len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn is_one_byte(self) -> bool {
+        match self {
+            StrRef::Local(record) => record.is_one_byte(),
+            StrRef::Shared(atom) => matches!(atom.repr(), StringRepr::OneByte(_)),
+        }
+    }
+
+    #[inline]
+    pub fn hash(self) -> u32 {
+        match self {
+            StrRef::Local(record) => record.hash(),
+            StrRef::Shared(atom) => atom.hash(),
+        }
+    }
+
+    #[inline]
+    pub fn is_atom(self) -> bool {
+        match self {
+            StrRef::Local(record) => record.is_atom,
+            StrRef::Shared(_) => true,
+        }
+    }
+
+    /// For an atom spelling an array index too large for an immediate
+    /// `PropertyKey`: that index, else [`NONE`].
+    #[inline]
+    pub fn array_index(self) -> u32 {
+        match self {
+            StrRef::Local(record) => record.array_index,
+            StrRef::Shared(atom) => atom.array_index(),
+        }
+    }
+}
+
+/// A shared atom's record.
+#[inline(always)]
+fn shared_ref(index: u32) -> StrRef<'static> {
+    StrRef::Shared(super::shared::get(index))
+}
+
+/// A runtime's string arena, which also answers for the shared atoms' ids
+/// ([`super::shared::SHARED_BASE`] and above): a shared atom is always live
+/// and marked, and never in the arena.
+#[derive(Default)]
+pub struct Strings {
+    arena: super::arena::Arena<StringRecord>,
+}
+
+impl Strings {
+    #[inline(always)]
+    pub fn get(&self, index: u32) -> StrRef<'_> {
+        if super::shared::is_shared(index) {
+            return shared_ref(index);
+        }
+        StrRef::Local(self.arena.get(index))
+    }
+
+    /// The length of string `index`.
+    #[inline(always)]
+    pub fn len_of(&self, index: u32) -> usize {
+        if super::shared::is_shared(index) {
+            return shared_ref(index).len();
+        }
+        self.arena.get(index).len()
+    }
+
+    /// Whether every unit of string `index` fits in a byte.
+    #[inline(always)]
+    pub fn is_one_byte(&self, index: u32) -> bool {
+        if super::shared::is_shared(index) {
+            return shared_ref(index).is_one_byte();
+        }
+        self.arena.get(index).is_one_byte()
+    }
+
+    /// A record of the arena: not a shared atom.
+    #[inline]
+    #[track_caller]
+    pub fn local(&self, index: u32) -> &StringRecord {
+        debug_assert!(!super::shared::is_shared(index), "a shared atom");
+        self.arena.get(index)
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn get_mut(&mut self, index: u32) -> &mut StringRecord {
+        debug_assert!(!super::shared::is_shared(index), "a shared atom");
+        self.arena.get_mut(index)
+    }
+
+    /// Marks a record; a shared atom needs none (`false`, never fresh).
+    #[inline(always)]
+    pub fn mark(&mut self, index: u32) -> bool {
+        !super::shared::is_shared(index) && self.arena.mark(index)
+    }
+
+    #[inline(always)]
+    pub fn is_marked(&self, index: u32) -> bool {
+        super::shared::is_shared(index) || self.arena.is_marked(index)
+    }
+
+    #[inline(always)]
+    pub fn is_live(&self, index: u32) -> bool {
+        super::shared::is_shared(index) || self.arena.is_live(index)
+    }
+
+    /// The arena itself: the runtime's own strings.
+    #[inline(always)]
+    pub fn arena(&self) -> &super::arena::Arena<StringRecord> {
+        &self.arena
+    }
+
+    #[inline(always)]
+    pub fn arena_mut(&mut self) -> &mut super::arena::Arena<StringRecord> {
+        &mut self.arena
+    }
+
+    /// Allocates a record, below the shared atoms' ids (the heap's cap ends
+    /// a runtime long before).
+    #[inline(always)]
+    pub fn alloc(&mut self, record: StringRecord, room: &mut super::gc::Room) -> u32 {
+        let index = self.arena.alloc(record, room);
+        assert!(
+            !super::shared::is_shared(index),
+            "the string arena reached the shared atoms' ids"
+        );
+        index
+    }
+}
+
 impl Record for StringRecord {
     fn vacant() -> Self {
         StringRecord::new(StringRepr::OneByte(Box::new([])))

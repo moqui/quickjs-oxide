@@ -400,7 +400,7 @@ impl Encoder<'_> {
             Kind::String => {
                 let id = value.as_string().expect("a string");
                 let record = self.heap.string(id);
-                if record.is_atom {
+                if record.is_atom() {
                     Constant::Atom(self.atom(id))
                 } else {
                     Constant::String(record.repr().clone())
@@ -448,7 +448,7 @@ impl Encoder<'_> {
         let mut atom_of = |value: Value| -> Result<u32, EncodeError> {
             let id = value
                 .as_string()
-                .filter(|&id| heap.string(id).is_atom)
+                .filter(|&id| heap.string(id).is_atom())
                 .ok_or(EncodeError::Constant("object"))?;
             Ok(self.atom(id))
         };

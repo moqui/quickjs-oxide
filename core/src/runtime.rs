@@ -375,6 +375,9 @@ impl Runtime {
         heap.vm.limit = options.stack_limit;
         heap.vm.native_budget = options.native_stack_budget;
         heap.vm.native_depth = options.native_depth_limit;
+        // The realm's names and the builtins' properties are the process's
+        // shared atoms: the first runtime adds them, the others find them.
+        heap.share_atoms = true;
         let root = |heap: &mut Heap, object: ObjectId| {
             heap.add_fixed_root(Value::object(object));
             object
@@ -466,6 +469,7 @@ impl Runtime {
         // The heap pinned every atom so far: the realm's names and the
         // builtins' properties. From here atoms live as long as their holders.
         runtime.heap.set_atom_mode(crate::heap::AtomMode::Weak);
+        runtime.heap.share_atoms = false;
         runtime.heap.shrink_to_fit();
         Ok(runtime)
     }
@@ -913,6 +917,11 @@ impl Runtime {
     /// What every part of the runtime holds, read without a collection. Its
     /// reserved total equals [`Heap::bytes`].
     pub fn memory_report(&self) -> crate::heap::report::MemoryReport {
+        // The shared-atoms probe: `QJS_ATOM_CENSUS` set prints each report's
+        // census (`docs/shared-atoms.md`).
+        if std::env::var_os("QJS_ATOM_CENSUS").is_some() {
+            eprintln!("atom census: {}", self.atom_census());
+        }
         let mut report = self.heap.report();
         let code = &mut report.code;
         code.static_units = self.code.len();
@@ -946,5 +955,179 @@ impl Runtime {
 
     pub fn release(&mut self, handle: Handle) {
         self.native_cx().release(handle);
+    }
+}
+
+/// What a runtime's atoms are, for the shared-atoms design
+/// (`docs/shared-atoms.md`): each live atom counted once, in the first of
+/// these classes it falls in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AtomCensus {
+    /// Live atoms.
+    pub total: usize,
+    /// Of them, the process's shared atoms the runtime uses.
+    pub shared: usize,
+    /// Atoms whose text a fresh runtime of this build has: the realm's names
+    /// and the builtins' properties.
+    pub builtin: usize,
+    /// Atoms a unit loaded from a code image names (a key, its name, or one
+    /// of its atoms): a static unit whose body the image shares.
+    pub image_code: usize,
+    /// Atoms another static unit names: code compiled into the runtime's
+    /// code store.
+    pub static_code: usize,
+    /// Atoms a dynamic unit (code compiled at run time) names.
+    pub dynamic_code: usize,
+    /// Atoms among a live function's constants and nothing above: string
+    /// literals.
+    pub constants: usize,
+    /// Atoms that key a live shape and no code names: keys made at run time,
+    /// the host's map keys among them.
+    pub object_keys: usize,
+    /// The rest: atoms held only as values, or by nothing until the next
+    /// collection.
+    pub other: usize,
+    /// The units of each class's texts, in the same order.
+    pub units: [usize; 8],
+}
+
+impl std::fmt::Display for AtomCensus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [
+            total,
+            builtin,
+            image_code,
+            static_code,
+            dynamic_code,
+            constants,
+            object_keys,
+            other,
+        ] = self.units;
+        write!(
+            f,
+            "atoms {} ({total} units), {} shared: builtin {} ({builtin}), image code {} ({image_code}), \
+             static code {} ({static_code}), dynamic code {} ({dynamic_code}), \
+             constants {} ({constants}), object keys {} ({object_keys}), other {} ({other})",
+            self.total,
+            self.shared,
+            self.builtin,
+            self.image_code,
+            self.static_code,
+            self.dynamic_code,
+            self.constants,
+            self.object_keys,
+            self.other
+        )
+    }
+}
+
+std::thread_local! {
+    /// The atom texts of a fresh runtime, made once a thread.
+    static BUILTIN_TEXTS: std::cell::OnceCell<crate::heap::hash::FxHashSet<Vec<u16>>> =
+        const { std::cell::OnceCell::new() };
+}
+
+impl Runtime {
+    /// Classifies the live atoms ([`AtomCensus`]). A probe: it walks every
+    /// string, unit and shape.
+    pub fn atom_census(&self) -> AtomCensus {
+        use crate::heap::hash::FxHashSet;
+        fn atom_texts(runtime: &Runtime) -> FxHashSet<Vec<u16>> {
+            let heap = &runtime.heap;
+            heap.atoms
+                .ids()
+                .map(|id| heap.strings.get(id.0).repr().units().collect())
+                .collect()
+        }
+        // A thread being torn down has no slot left: no builtin texts then.
+        let builtin = BUILTIN_TEXTS
+            .try_with(|texts| {
+                texts
+                    .get_or_init(|| {
+                        Runtime::new(crate::HeapLimits::default())
+                            .map(|fresh| atom_texts(&fresh))
+                            .unwrap_or_default()
+                    })
+                    .clone()
+            })
+            .unwrap_or_default();
+        let mut image_code = FxHashSet::default();
+        let mut static_code = FxHashSet::default();
+        let mut dynamic_code = FxHashSet::default();
+        let name = |set: &mut FxHashSet<u32>, unit: &crate::bytecode::CodeUnit| {
+            for key in unit.keys.iter() {
+                if let crate::heap::atom::KeyKind::String(id) = key.kind() {
+                    set.insert(id.0);
+                }
+            }
+            set.extend(unit.name_atom.map(|id| id.0));
+            set.extend(unit.atoms.iter().map(|id| id.0));
+        };
+        for (_, unit) in self.code.units() {
+            if unit.owns_shared() {
+                name(&mut static_code, unit);
+            } else {
+                name(&mut image_code, unit);
+            }
+        }
+        for unit in self.heap.code.live_units() {
+            name(&mut dynamic_code, unit);
+        }
+        let bytecodes = &self.heap.payloads.bytecode;
+        let constants = bytecodes
+            .live_indices()
+            .flat_map(|index| {
+                self.heap
+                    .bytecode_constants(crate::value::BytecodeId(index))
+                    .iter()
+                    .filter_map(|value| value.as_string().map(|id| id.0))
+            })
+            .collect::<FxHashSet<u32>>();
+        let shapes = &self.heap.shapes;
+        let object_keys = shapes
+            .live_indices()
+            .filter_map(|index| {
+                let shape = shapes.get(index);
+                match (shape.count > 0).then(|| shape.key.kind()) {
+                    Some(crate::heap::atom::KeyKind::String(id)) => Some(id.0),
+                    _ => None,
+                }
+            })
+            .collect::<FxHashSet<u32>>();
+        let mut census = AtomCensus::default();
+        let strings = &self.heap.strings;
+        for id in self.heap.atoms.ids() {
+            let index = id.0;
+            let record = strings.get(index);
+            census.shared += usize::from(crate::heap::shared::is_shared(index));
+            let units = record.len();
+            let text: Vec<u16> = record.repr().units().collect();
+            let class = if builtin.contains(&text) {
+                census.builtin += 1;
+                1
+            } else if image_code.contains(&index) {
+                census.image_code += 1;
+                2
+            } else if static_code.contains(&index) {
+                census.static_code += 1;
+                3
+            } else if dynamic_code.contains(&index) {
+                census.dynamic_code += 1;
+                4
+            } else if constants.contains(&index) {
+                census.constants += 1;
+                5
+            } else if object_keys.contains(&index) {
+                census.object_keys += 1;
+                6
+            } else {
+                census.other += 1;
+                7
+            };
+            census.total += 1;
+            census.units[0] += units;
+            census.units[class] += units;
+        }
+        census
     }
 }

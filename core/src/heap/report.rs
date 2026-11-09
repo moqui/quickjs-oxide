@@ -169,7 +169,7 @@ impl Heap {
         MemoryReport {
             objects: ArenaReport::of(&self.objects),
             shapes: ArenaReport::of(&self.shapes),
-            strings: ArenaReport::of(&self.strings),
+            strings: ArenaReport::of(self.strings.arena()),
             symbols: ArenaReport::of(&self.symbols),
             bigints: ArenaReport::of(&self.bigints),
             cells: ArenaReport::of(&self.cells),

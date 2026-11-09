@@ -25,7 +25,7 @@ fn interning_is_by_content() {
 
     let plain = heap.alloc_string("length").unwrap();
     assert_ne!(plain, ascii);
-    assert!(!heap.string(plain).is_atom && heap.string(ascii).is_atom);
+    assert!(!heap.string(plain).is_atom() && heap.string(ascii).is_atom());
     assert_eq!(heap.intern_string(plain).unwrap(), ascii);
     assert_eq!(heap.intern_string(ascii).unwrap(), ascii);
     assert_eq!(heap.atom_table().len(), 5);
@@ -93,7 +93,7 @@ fn index_keys_stay_out_of_the_atom_table() {
         unreachable!()
     };
     assert_eq!(
-        heap.string(large).array_index,
+        heap.string(large).array_index(),
         1 << 31,
         "large indices still order as indices"
     );
@@ -199,7 +199,7 @@ fn unit_strings_are_atoms_kept_by_the_table() {
     let mut heap = Heap::default();
     heap.set_atom_mode(AtomMode::Weak);
     let a = heap.unit_string(u16::from(b'a')).unwrap();
-    assert!(heap.string(a).is_atom);
+    assert!(heap.string(a).is_atom());
     assert_eq!(heap.intern("a").unwrap(), a);
     let e_acute = heap.unit_string(0xE9).unwrap();
     assert_eq!(heap.intern("\u{e9}").unwrap(), e_acute);
@@ -214,4 +214,35 @@ fn unit_strings_are_atoms_kept_by_the_table() {
     assert_eq!(heap.unit_string(0xE9).unwrap(), e_acute);
     assert_eq!(heap.string_text(e_acute), "\u{e9}");
     assert_eq!(heap.intern("a").unwrap(), a);
+}
+
+/// Runtimes made on several threads at once share their builtin names: the
+/// same atom for a name in each, from the process's table.
+#[test]
+fn runtimes_on_threads_share_the_builtin_names() {
+    let names = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut runtime =
+                        oxide_core::Runtime::new(oxide_core::HeapLimits::default()).unwrap();
+                    let heap = runtime.heap_mut();
+                    ["length", "prototype", "toString", "fromCharCode"]
+                        .map(|name| heap.intern(name).unwrap())
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for other in &names[1..] {
+        assert_eq!(other, &names[0]);
+    }
+    assert!(
+        names[0]
+            .iter()
+            .all(|id| id.index() >= oxide_core::heap::shared::SHARED_BASE)
+    );
 }

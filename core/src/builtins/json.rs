@@ -365,7 +365,7 @@ impl<'a> Parser<'a> {
                 // enumerable, configurable data property either way. The
                 // value is on the root stack.
                 match key.kind() {
-                    KeyKind::String(name) if cx.heap.string(name).array_index == NONE => {
+                    KeyKind::String(name) if cx.heap.string(name).array_index() == NONE => {
                         match cx.heap.lookup_own(object, key) {
                             Some((slot, _)) => cx.heap.set_slot(object, slot, value),
                             None => cx
@@ -1395,7 +1395,7 @@ fn make_plan(heap: &Heap, shape: ShapeId, to_json: PropertyKey) -> Option<Rc<Pla
             KeyKind::Index(_) => return None,
             KeyKind::String(name) => name,
         };
-        if heap.string(name).array_index != NONE {
+        if heap.string(name).array_index() != NONE {
             return None;
         }
         if flags.has(PropertyFlags::ACCESSOR) || flags.has(PropertyFlags::AUTOINIT) {
