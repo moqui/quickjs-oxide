@@ -2548,6 +2548,146 @@ fn a_plain_objects_properties_are_shown_with_strings_borrowed() {
     }
 }
 
+/// The shape walk: the text keys borrowed, the order of `[[OwnPropertyKeys]]`
+/// (a symbol after the strings), a dictionary-mode object in its order,
+/// and `None` where an element, an accessor, a symbol (for the text visit)
+/// or another prototype is met.
+#[test]
+fn a_plain_objects_text_keys_and_an_arrays_elements_are_shown_in_place() {
+    use quickjs_oxide::engine::api::core::DataRef;
+    let (runtime, context) = runtime();
+    let object_of = |source: &str| match context.eval(source).unwrap() {
+        Value::Object(object) => object,
+        other => panic!("not an object: {other:?}"),
+    };
+    let shown = |value: DataRef<'_>| match value {
+        DataRef::Text(text) => format!("'{}'", text.to_string_lossy()),
+        DataRef::Callable => "callable".to_string(),
+        DataRef::Value(Value::Object(_)) => "object".to_string(),
+        DataRef::Value(value) => format!("{value:?}"),
+    };
+    let object = object_of("({name: 'caf\\u00e9', qty: 2, f() {}, o: {}, '\\u2603': null})");
+    let prototype = runtime.get_prototype_of(&object).unwrap();
+    let mut seen = Vec::new();
+    let all = runtime
+        .visit_plain_own_text(&object, prototype.as_ref(), &mut |property| {
+            seen.push(format!(
+                "{}={}{}",
+                property.key.to_string_lossy(),
+                shown(property.value),
+                if property.enumerable { "" } else { " hidden" }
+            ));
+            true
+        })
+        .unwrap();
+    assert_eq!(all, Some(true));
+    assert_eq!(
+        seen,
+        [
+            "name='café'",
+            "qty=Int(2)",
+            "f=callable",
+            "o=object",
+            "☃=Null"
+        ]
+    );
+    // Deleted and added again: a dictionary-mode object, in its order.
+    let edited = object_of(
+        "var e = {a: 1, b: 2, c: 3}; delete e.b; e.d = 4; Object.defineProperty(e, 'h', {value: 5}); e",
+    );
+    let mut keys = Vec::new();
+    runtime
+        .visit_plain_own_text(&edited, prototype.as_ref(), &mut |property| {
+            keys.push(format!(
+                "{}{}",
+                property.key.to_string_lossy(),
+                property.enumerable
+            ));
+            true
+        })
+        .unwrap();
+    assert_eq!(keys, ["atrue", "ctrue", "dtrue", "hfalse"]);
+    // The key-lifting visit keeps a symbol, after the strings.
+    let symbolic = object_of("({a: 1, [Symbol('s')]: 2, b: 3})");
+    let mut order = Vec::new();
+    assert_eq!(
+        runtime
+            .visit_plain_own_data(&symbolic, prototype.as_ref(), &mut |property| {
+                order.push(match property.key.to_js_string() {
+                    Some(name) => name.to_utf8_lossy(),
+                    None => "symbol".to_string(),
+                });
+                true
+            })
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(order, ["a", "b", "symbol"]);
+    for source in [
+        "({a: 1, [Symbol('s')]: 2})",
+        "({0: 'x', a: 1})",
+        "({get a() { return 1 }})",
+        "[1]",
+        "Object.create(null)",
+        "({4294967294: 1})",
+    ] {
+        assert_eq!(
+            runtime
+                .visit_plain_own_text(&object_of(source), prototype.as_ref(), &mut |_| true)
+                .unwrap(),
+            None,
+            "{source}"
+        );
+    }
+    // An array's elements, strings borrowed, with no list of values.
+    let mut elements = Vec::new();
+    assert_eq!(
+        runtime
+            .visit_dense_array(
+                &object_of("[1, 'x\\u2603', {}, () => 1, null, 2.5]"),
+                &mut |value| {
+                    elements.push(shown(value));
+                    true
+                }
+            )
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        elements,
+        ["Int(1)", "'x☃'", "object", "callable", "Null", "Float(2.5)"]
+    );
+    let mut count = 0;
+    assert_eq!(
+        runtime
+            .visit_dense_array(&object_of("[1, 2, 3]"), &mut |_| {
+                count += 1;
+                count < 2
+            })
+            .unwrap(),
+        Some(false)
+    );
+    for source in [
+        "[1, , 3]",
+        "({0: 1, length: 1})",
+        "var s = []; s[100000] = 1; s",
+    ] {
+        assert_eq!(
+            runtime
+                .visit_dense_array(&object_of(source), &mut |_| true)
+                .unwrap(),
+            None,
+            "{source}"
+        );
+    }
+    assert_eq!(
+        runtime
+            .visit_dense_array(&object_of("[]"), &mut |_| true)
+            .unwrap(),
+        Some(true)
+    );
+}
+
 #[test]
 fn nested_plain_objects_and_arrays_are_made_in_one_step() {
     use quickjs_oxide::engine::api::core::{InitValue, PropertyKey};

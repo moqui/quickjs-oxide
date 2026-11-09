@@ -714,6 +714,26 @@ impl NativeCx<'_> {
         self.heap.object_kind(object)
     }
 
+    /// A plain object's own data properties, `(key, value, enumerable)` in
+    /// `[[OwnPropertyKeys]]` order, appended to `out` with no list of keys
+    /// and no descriptor ([`Heap::plain_data_entries`]); `false` when it is
+    /// not a plain object inheriting from `prototype`. Runs no code.
+    pub fn plain_data_entries(
+        &self,
+        object: ObjectId,
+        prototype: Option<ObjectId>,
+        out: &mut Vec<(PropertyKey, Value, bool)>,
+    ) -> bool {
+        self.heap.plain_data_entries(object, prototype, out)
+    }
+
+    /// An Array's elements in its dense form, `0` to its length, appended to
+    /// `out` ([`Heap::dense_array_elements`]); `false` for a hole, a sparse
+    /// Array or anything else. Runs no code.
+    pub fn dense_array_elements(&self, object: ObjectId, out: &mut Vec<Value>) -> bool {
+        self.heap.dense_array_elements(object, out)
+    }
+
     /// An ordinary object inheriting from `prototype` (`None` for null).
     pub fn new_object_with_prototype(
         &mut self,
