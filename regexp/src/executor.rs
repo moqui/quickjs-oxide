@@ -1559,9 +1559,9 @@ fn push_positive_set(instruction: &Instruction, out: &mut Vec<CharacterRange>) -
 #[inline]
 fn find_unit<T: Copy + Into<u16>>(units: &[T], unit: u16) -> Option<usize> {
     const LANES: usize = 16;
-    let mut chunks = units.chunks_exact(LANES);
+    let (chunks, remainder) = units.as_chunks::<LANES>();
     let mut base = 0;
-    for chunk in &mut chunks {
+    for chunk in chunks {
         if chunk.iter().fold(false, |found, &candidate| {
             found | (candidate.into() == unit)
         }) {
@@ -1572,8 +1572,7 @@ fn find_unit<T: Copy + Into<u16>>(units: &[T], unit: u16) -> Option<usize> {
         }
         base += LANES;
     }
-    chunks
-        .remainder()
+    remainder
         .iter()
         .position(|&candidate| candidate.into() == unit)
         .map(|offset| base + offset)
