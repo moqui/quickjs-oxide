@@ -1091,7 +1091,7 @@ mod tests {
         }
         // Exact ties between two shortest strings, as 192181864906432.125.
         values.push(f64::from_bits(0x42e5_d93a_7947_d804));
-        values.push(600_479_950_316_068.25);
+        values.push(f64::from_bits(0x4301_1111_1111_1122)); // 600479950316068.25
         values
     }
 

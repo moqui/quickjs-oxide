@@ -245,7 +245,7 @@ fn shortest(magnitude: f64) -> Decimal {
 /// round-trip and the even one is equally short.
 fn even_tie(magnitude: f64, decimal: &mut Decimal) {
     let last = decimal.digits[decimal.len - 1];
-    if (last - b'0') % 2 == 0 {
+    if (last - b'0').is_multiple_of(2) {
         return;
     }
     // The exponent of the digit past the last one.
