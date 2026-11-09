@@ -107,7 +107,7 @@ fn enter_frame(cx: &mut Cx<'_>, unit: &CodeUnit, frame: Frame) -> Result<(), Thr
     let poll = &mut cx.heap.vm.poll;
     *poll -= 1;
     if *poll == 0 {
-        error::poll_interrupts(cx)?;
+        error::poll_interrupts_entering(cx, &frame)?;
     }
     let base = frame.base as usize;
     let argc = frame.argc as usize;

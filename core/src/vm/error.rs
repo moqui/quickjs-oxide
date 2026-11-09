@@ -300,33 +300,53 @@ pub(crate) fn add_stack_at(
 }
 
 /// The running stack as a sample counts it: `name:line` frames, innermost
-/// first, joined by `;`.
-fn sample_key(cx: &Cx<'_>, innermost_pc: Option<u32>) -> String {
+/// first, joined by `;`. `entering` is a frame about to be pushed, counted
+/// at its first instruction; the frame below it is placed where it returns to.
+fn sample_key(cx: &Cx<'_>, innermost_pc: Option<u32>, entering: Option<&super::Frame>) -> String {
     let vm = &cx.heap.vm;
     let len = vm.frames.len();
     let mut key = String::new();
+    let returns_to = |frame: &super::Frame| {
+        (frame.flags & frame_flags::ENTRY == 0 && frame.return_pc > 0).then(|| frame.return_pc - 1)
+    };
+    if let Some(frame) = entering {
+        sample_frame(cx, &mut key, frame, Some(0));
+    }
     for index in (0..len).rev().take(super::SAMPLE_FRAMES) {
         let frame = &vm.frames[index];
-        let unit = cx.unit(frame.unit);
         let pc = if index + 1 == len {
-            innermost_pc
-        } else {
-            let above = &vm.frames[index + 1];
-            (above.flags & frame_flags::ENTRY == 0 && above.return_pc > 0).then(|| above.return_pc - 1)
-        };
-        if !key.is_empty() {
-            key.push(';');
-        }
-        let name = debug_name(&unit);
-        key.push_str(if name.is_empty() { "<anonymous>" } else { name });
-        match pc.and_then(|pc| unit.debug.position(pc)) {
-            Some((line, _)) => {
-                let _ = write!(key, ":{line}");
+            match entering {
+                Some(entering) => returns_to(entering),
+                None => innermost_pc,
             }
-            None => key.push_str(":?"),
-        }
+        } else {
+            returns_to(&vm.frames[index + 1])
+        };
+        sample_frame(cx, &mut key, frame, pc);
     }
     key
+}
+
+/// One frame of a sample: its function's name as a backtrace gives it, and
+/// the line of `pc`.
+fn sample_frame(cx: &Cx<'_>, key: &mut String, frame: &super::Frame, pc: Option<u32>) {
+    let unit = cx.unit(frame.unit);
+    if !key.is_empty() {
+        key.push(';');
+    }
+    let names = Names::key(cx.realm.names.name);
+    let name = if cx.heap.lookup_own(frame.function, names).is_none() && !debug_name(&unit).is_empty() {
+        debug_name(&unit).to_owned()
+    } else {
+        native_name(cx, frame.function)
+    };
+    key.push_str(if name.is_empty() { "<anonymous>" } else { &name });
+    match pc.and_then(|pc| unit.debug.position(pc)) {
+        Some((line, _)) => {
+            let _ = write!(key, ":{line}");
+        }
+        None => key.push_str(":?"),
+    }
 }
 
 fn debug_name(unit: &crate::bytecode::CodeUnit) -> &str {
@@ -590,24 +610,31 @@ pub(crate) fn stack_overflow(cx: &mut Cx<'_>) -> Throw {
 /// flag, then its hook. An interrupt sets `vm.interrupted`, which makes the
 /// throw uncatchable, and polls again at every later back-edge and call so
 /// any JavaScript a native runs on the way out stops too.
-#[cold]
-#[inline(never)]
-pub(crate) fn poll_interrupts(cx: &mut Cx<'_>) -> Result<(), Throw> {
-    poll_interrupts_at(cx, None)
-}
-
-/// [`poll_interrupts`] at a back-edge, whose instruction `pc` is the
-/// innermost frame's position for a sample ([`super::Sampler`]).
+///
+/// This is the poll at a back-edge, whose instruction `pc` is the innermost
+/// frame's position for a sample ([`super::Sampler`]).
 #[cold]
 #[inline(never)]
 pub(crate) fn poll_interrupts_at(cx: &mut Cx<'_>, pc: Option<u32>) -> Result<(), Throw> {
+    poll_sampled(cx, pc, None)
+}
+
+/// [`poll_interrupts_at`] as `entering` is about to be pushed: a sample counts
+/// it at its start, and its caller where `entering` returns to.
+#[cold]
+#[inline(never)]
+pub(crate) fn poll_interrupts_entering(cx: &mut Cx<'_>, entering: &super::Frame) -> Result<(), Throw> {
+    poll_sampled(cx, None, Some(entering))
+}
+
+fn poll_sampled(cx: &mut Cx<'_>, pc: Option<u32>, entering: Option<&super::Frame>) -> Result<(), Throw> {
     if cx
         .host
         .sampler
         .as_ref()
         .is_some_and(|sampler| sampler.flag.swap(false, std::sync::atomic::Ordering::Relaxed))
     {
-        let key = sample_key(cx, pc);
+        let key = sample_key(cx, pc, entering);
         if let Some(sampler) = cx.host.sampler.as_mut() {
             *sampler.counts.entry(key).or_default() += 1;
         }
