@@ -308,6 +308,9 @@ const WITH_OBJECT_LOCAL_NAME: &str = "<with>";
 // the same explicit metadata domain as `<ret>` rather than letting an unbound
 // ordinary local silently escape the scope-graph trust boundary.
 const FINALLY_EVAL_RET_LOCAL_NAME: &str = "<finally-ret>";
+// The dispose capability of a scope holding `using` declarations
+// (FORK-EXPLICIT-RESOURCE-MANAGEMENT-001), one unspellable local per scope.
+const DISPOSE_CAPABILITY_LOCAL_NAME: &str = "<dispose>";
 
 #[cfg(test)]
 mod tests;

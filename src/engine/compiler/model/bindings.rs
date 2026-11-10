@@ -6,7 +6,9 @@ use crate::engine::code::function::metadata::ClosureVariableKind;
 use crate::engine::compiler::lexer::Span;
 use crate::engine::compiler::module;
 use crate::engine::compiler::names::NameId;
-use crate::engine::compiler::{EVAL_RET_LOCAL_NAME, FINALLY_EVAL_RET_LOCAL_NAME};
+use crate::engine::compiler::{
+    DISPOSE_CAPABILITY_LOCAL_NAME, EVAL_RET_LOCAL_NAME, FINALLY_EVAL_RET_LOCAL_NAME,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::engine::compiler) struct BindingId(pub(in crate::engine::compiler) usize);
@@ -15,6 +17,8 @@ pub(in crate::engine::compiler) struct BindingId(pub(in crate::engine::compiler)
 pub(in crate::engine::compiler) enum SyntheticLocalKind {
     EvalCompletion,
     FinallySavedEvalCompletion,
+    /// The dispose capability of a scope holding `using` declarations.
+    DisposeCapability,
 }
 
 impl SyntheticLocalKind {
@@ -22,6 +26,7 @@ impl SyntheticLocalKind {
         match self {
             Self::EvalCompletion => EVAL_RET_LOCAL_NAME,
             Self::FinallySavedEvalCompletion => FINALLY_EVAL_RET_LOCAL_NAME,
+            Self::DisposeCapability => DISPOSE_CAPABILITY_LOCAL_NAME,
         }
     }
 }

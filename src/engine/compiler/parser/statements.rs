@@ -56,6 +56,8 @@ impl<'source> Parser<'source> {
                 StatementPosition::FunctionBody,
             )?;
         }
+        let body_scope = self.current_ir().context.current_scope;
+        self.close_dispose_region(body_scope)?;
 
         // QuickJS ends function bytecode with `return_undef`. It may
         // be unreachable after an explicit return, but keeps fallthrough
@@ -91,6 +93,28 @@ impl<'source> Parser<'source> {
                 StatementPosition::FunctionBody => self.parse_lexical_statement(),
                 StatementPosition::ProgramBody => self.parse_lexical_statement(),
                 StatementPosition::NestedList => self.parse_lexical_statement(),
+                StatementPosition::AnnexBIfArm
+                | StatementPosition::AnnexBLabelBody
+                | StatementPosition::Single => Err(self
+                    .syntax_here("lexical declarations can't appear in single-statement context")),
+            };
+        }
+
+        if let Some(is_async) = self.using_declaration_ahead(false)? {
+            return match position {
+                StatementPosition::ProgramBody
+                    if matches!(
+                        self.current_ir().kind,
+                        FunctionKind::Script | FunctionKind::Eval(_)
+                    ) =>
+                {
+                    Err(self.syntax_here(
+                        "using declarations are not allowed at the top level of a script",
+                    ))
+                }
+                StatementPosition::FunctionBody
+                | StatementPosition::ProgramBody
+                | StatementPosition::NestedList => self.parse_using_statement(is_async),
                 StatementPosition::AnnexBIfArm
                 | StatementPosition::AnnexBLabelBody
                 | StatementPosition::Single => Err(self
@@ -312,6 +336,7 @@ impl<'source> Parser<'source> {
         while !self.is_punctuator(Punctuator::RightBrace) {
             self.parse_statement_or_decl(completion, StatementPosition::NestedList)?;
         }
+        self.close_dispose_region(scope)?;
         self.advance()?;
         self.pop_scope(scope)
     }
@@ -514,6 +539,11 @@ impl<'source> Parser<'source> {
                     if head_weight.is_none() {
                         head_weight = Some(self.enter_recursion(ParserStackFrame::StatementHead)?);
                     }
+                    if self.using_declaration_ahead(false)?.is_some() {
+                        return Err(self.syntax_here(
+                            "using declarations are not allowed directly in a case clause",
+                        ));
+                    }
                     self.parse_statement_or_decl(completion, StatementPosition::NestedList)?;
                     self.require_stack_depth(switch_depth, "switch case body")?;
                 }
@@ -662,6 +692,9 @@ impl<'source> Parser<'source> {
                     return Err(self.syntax_here("unterminated catch block"));
                 }
                 self.parse_statement_or_decl(completion, StatementPosition::NestedList)?;
+            }
+            if let Some(catch_body_scope) = catch_body_scope {
+                self.close_dispose_region(catch_body_scope)?;
             }
             self.advance()?;
             self.require_stack_depth(entry_depth + 1, "catch block")?;
