@@ -269,6 +269,9 @@ fn performance_counts_fractions_of_a_millisecond_from_its_time_origin() {
     let value = context.eval(source).unwrap();
     let text = context.to_js_string(&value).unwrap().to_utf8_lossy();
     assert_eq!(text, "true false true true true fractional number true");
+}
+
+#[test]
 fn capture_stack_trace_and_the_limit_shape_a_backtrace() {
     let runtime = Runtime::new();
     let context = runtime.context();
