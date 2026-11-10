@@ -1419,8 +1419,9 @@ pub(crate) fn install_qjs_helpers(
 /// embedders: `now()` (fractional milliseconds on a monotonic clock) and
 /// `timeOrigin` (the epoch time, from the host's clock, at which `now()`
 /// reads 0), so `performance.timeOrigin + performance.now()` follows
-/// `Date.now()`. Writable, configurable and not enumerable, as a builtin;
-/// qjs's own helpers (`install_qjs_helpers`) keep QuickJS's `{now}`.
+/// `Date.now()`. The global is writable, enumerable and configurable, as
+/// a WebIDL global attribute and quickjs-ng's are; `now` is a builtin
+/// method. qjs's own helpers (`install_qjs_helpers`) keep QuickJS's `{now}`.
 pub(crate) fn install_performance(cx: &mut Cx<'_>) -> Result<(), HeapError> {
     let mark = cx.heap.roots().mark();
     let result = (|| {
@@ -1433,7 +1434,7 @@ pub(crate) fn install_performance(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         define(cx, performance, "now", Value::object(now), builtin)?;
         let origin = cx.host.hooks.now_ms() - agent::monotonic_ms();
         define(cx, performance, "timeOrigin", Value::number(origin), PropertyFlags::data(false, true, true))?;
-        define(cx, global, "performance", Value::object(performance), builtin)
+        define(cx, global, "performance", Value::object(performance), PropertyFlags::data(true, true, true))
     })();
     cx.heap.roots().truncate(mark);
     result
