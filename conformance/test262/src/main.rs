@@ -720,7 +720,9 @@ fn run_coordinator(options: &CoordinatorOptions) -> Result<bool, String> {
             false
         };
         let variants = metadata.variants(options.mode);
-        let skip = skip_reason(&relative, &metadata, &config);
+        let skip = skip_reason(&relative, &metadata, &config, |feature| {
+            oxide_profile.admits_fork_feature(feature)
+        });
         let mut missing_host = missing_host_capability_hints(
             &relative,
             &source,

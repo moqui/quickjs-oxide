@@ -1,0 +1,40 @@
+block: body b a
+returned
+return: r
+break/continue: i0 i1
+labelled break: labelled
+true a b body
+throws: b a
+only
+one throw: only
+TypeError
+not an object: first
+TypeError
+for-of: it x1 it x2 close
+for head: loop loop head
+TypeError
+generator: generator
+{"done":true}
+SuppressedError 1 2 message 3 [object Error]
+value
+true false
+true
+stack: adopted value deferred used
+ReferenceError
+[object DisposableStack] true
+SyntaxError: using x = null;
+SyntaxError: { using x; }
+ReferenceError: { using [x] = null; }
+SyntaxError: if (1) using x = null;
+SyntaxError: switch (0) { case 0: using x = null; }
+SyntaxError: for (using x in {}) {}
+SyntaxError: { using let = null; }
+identifier using: 9
+two statements: 1
+await using: body sync fallback sync async a
+for await using: it each 1 it each 2
+rejected
+true
+async stack: adopted 1 used deferred
+SuppressedError one two
+done

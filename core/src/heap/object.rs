@@ -333,6 +333,11 @@ pub enum InternalTag {
     /// An object the `Iterator` constructor made for a subclass: QuickJS's
     /// `JS_CLASS_ITERATOR`, which its printer names.
     Iterator,
+    /// A `using` scope's or a disposable stack's resources
+    /// (`builtins::disposable`).
+    DisposeCapability,
+    DisposableStack,
+    AsyncDisposableStack,
     /// An embedder's host object: its datum is `InternalData::HostData`, or
     /// `InternalData::HostExotic` for a host exotic object.
     HostData,

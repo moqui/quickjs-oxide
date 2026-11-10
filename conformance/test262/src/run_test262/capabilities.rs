@@ -6,11 +6,15 @@ const FEATURES_SECTION: &str = "features";
 const AUDITED_NEGATIVE_TESTS_SECTION: &str = "audited-negative-tests";
 const EXECUTION_SECTION: &str = "execution";
 const HOST_AGENT_TESTS_SECTION: &str = "host-agent-tests";
-const SECTION_ORDER: [&str; 4] = [
+/// Features pinned QuickJS's `test262.conf` skips that the fork implements
+/// (deviation ledger, `FORK-*`): admitted past the QuickJS skip and declared.
+const FORK_FEATURES_SECTION: &str = "fork-features";
+const SECTION_ORDER: [&str; 5] = [
     FEATURES_SECTION,
     AUDITED_NEGATIVE_TESTS_SECTION,
     EXECUTION_SECTION,
     HOST_AGENT_TESTS_SECTION,
+    FORK_FEATURES_SECTION,
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +28,7 @@ pub(super) struct OxideProfile {
     features: BTreeSet<String>,
     audited_negative_tests: BTreeSet<String>,
     host_agent_tests: BTreeSet<String>,
+    fork_features: BTreeSet<String>,
     async_execution: bool,
 }
 
@@ -115,6 +120,7 @@ impl OxideProfile {
                 0 => &mut profile.features,
                 1 => &mut profile.audited_negative_tests,
                 3 => &mut profile.host_agent_tests,
+                4 => &mut profile.fork_features,
                 _ => unreachable!("execution entries were handled above"),
             };
             if entries.contains(line) {
@@ -152,6 +158,11 @@ impl OxideProfile {
         self.async_execution
     }
 
+    /// Whether the fork admits `feature` although pinned QuickJS skips it.
+    pub(super) fn admits_fork_feature(&self, feature: &str) -> bool {
+        self.fork_features.contains(feature)
+    }
+
     pub(super) fn allows_agent_host(&self, path: &Path) -> bool {
         self.host_agent_tests.contains(&test_path(path))
     }
@@ -178,7 +189,10 @@ impl OxideProfile {
     ) -> Option<FailClosedClassification> {
         let unsupported = declared_features
             .iter()
-            .filter(|feature| !self.features.contains(feature.as_str()))
+            .filter(|feature| {
+                !self.features.contains(feature.as_str())
+                    && !self.fork_features.contains(feature.as_str())
+            })
             .cloned()
             .collect::<BTreeSet<_>>();
         if !unsupported.is_empty() {
@@ -247,7 +261,7 @@ mod tests {
 
     use super::{
         AUDITED_NEGATIVE_TESTS_SECTION, EXECUTION_SECTION, FEATURES_SECTION,
-        HOST_AGENT_TESTS_SECTION, OxideProfile, SECTION_ORDER,
+        FORK_FEATURES_SECTION, HOST_AGENT_TESTS_SECTION, OxideProfile, SECTION_ORDER,
     };
 
     const DATA_PROFILE: &str = "\
@@ -265,6 +279,9 @@ async=true
 [host-agent-tests]
 test/built-ins/Atomics/notify/notify-one.js
 test/built-ins/Atomics/wait/good-views.js
+
+[fork-features]
+explicit-resource-management
 ";
 
     fn parse_error(source: &str) -> String {
@@ -290,6 +307,17 @@ test/built-ins/Atomics/wait/good-views.js
             ]
         );
         assert!(profile.allows_agent_host(Path::new(r"test\built-ins\Atomics\wait\good-views.js")));
+        assert!(profile.admits_fork_feature("explicit-resource-management"));
+        assert!(!profile.admits_fork_feature("Atomics"));
+        assert!(
+            profile
+                .classify(
+                    Path::new("test/built-ins/DisposableStack/length.js"),
+                    &["explicit-resource-management".to_owned()],
+                    false,
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -330,6 +358,7 @@ test/built-ins/Atomics/wait/good-views.js
                 AUDITED_NEGATIVE_TESTS_SECTION,
                 EXECUTION_SECTION,
                 HOST_AGENT_TESTS_SECTION,
+                FORK_FEATURES_SECTION,
             ]
         );
     }

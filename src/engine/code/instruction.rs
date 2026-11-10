@@ -669,6 +669,23 @@ opcode_table! {
         /// Terminal TypeError used by `yield*` when the delegate has no `throw`
         /// method. A present `return` method has already been called for close.
         ThrowIteratorMissingThrow = (0, 0), CALL, ctrl Throw;
+        // Explicit resource management (FORK-EXPLICIT-RESOURCE-MANAGEMENT-001):
+        // a `using` scope's dispose capability.
+        /// Pushes a new dispose capability.
+        DisposeNew = (0, 1), ALLOC;
+        /// `value, capability -> value`: AddDisposableResource with the sync
+        /// or async hint.
+        DisposeAdd(is_async: bool) = (2, 1), CALL;
+        /// `error, capability ->`: records a throw completion.
+        DisposeRecordError = (2, 0), THROW_ALLOC;
+        /// `capability ->`: DisposeResources of sync resources, throwing the
+        /// completion when it is a throw.
+        DisposeSync = (1, 0), CALL;
+        /// `capability -> value, more`: DisposeResources up to its next
+        /// Await, whose operand is `value` when `more`.
+        DisposeStep = (1, 2), CALL;
+        /// `capability ->`: throws the completion when it is a throw.
+        DisposeFinish = (1, 0), THROW;
         /// QuickJS `OP_import`: consume the evaluated module specifier and import
         /// options in source order and replace them with the host-created Promise
         /// (`specifier, options -> promise`). The compiler keeps this opcode behind

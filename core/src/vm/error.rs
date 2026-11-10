@@ -21,10 +21,12 @@ pub enum ErrorKind {
     Internal,
     Uri,
     Aggregate,
+    /// `SuppressedError` (FORK-EXPLICIT-RESOURCE-MANAGEMENT-001).
+    Suppressed,
 }
 
 impl ErrorKind {
-    pub const ALL: [ErrorKind; 9] = [
+    pub const ALL: [ErrorKind; 10] = [
         ErrorKind::Error,
         ErrorKind::Eval,
         ErrorKind::Range,
@@ -34,6 +36,7 @@ impl ErrorKind {
         ErrorKind::Internal,
         ErrorKind::Uri,
         ErrorKind::Aggregate,
+        ErrorKind::Suppressed,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -47,6 +50,7 @@ impl ErrorKind {
             ErrorKind::Internal => "InternalError",
             ErrorKind::Uri => "URIError",
             ErrorKind::Aggregate => "AggregateError",
+            ErrorKind::Suppressed => "SuppressedError",
         }
     }
 
@@ -61,6 +65,7 @@ impl ErrorKind {
             ErrorKind::Internal => Intrinsic::InternalErrorPrototype,
             ErrorKind::Uri => Intrinsic::UriErrorPrototype,
             ErrorKind::Aggregate => Intrinsic::AggregateErrorPrototype,
+            ErrorKind::Suppressed => Intrinsic::SuppressedErrorPrototype,
         }
     }
 }
