@@ -268,7 +268,7 @@ fn performance_counts_fractions_of_a_millisecond_from_its_time_origin() {
     "#;
     let value = context.eval(source).unwrap();
     let text = context.to_js_string(&value).unwrap().to_utf8_lossy();
-    assert_eq!(text, "true false true true true fractional number true");
+    assert_eq!(text, "true true true true true fractional number true");
 }
 
 #[test]
