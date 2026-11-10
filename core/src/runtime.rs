@@ -55,6 +55,8 @@ intrinsics! {
     ThrowTypeError,
     Object,
     Function,
+    /// `%Error%`, whose `stackTraceLimit` each backtrace reads.
+    Error,
     Array,
     String,
     Number,
@@ -169,6 +171,7 @@ names! {
     file_name: "fileName",
     line_number: "lineNumber",
     column_number: "columnNumber",
+    stack_trace_limit: "stackTraceLimit",
     errors: "errors",
     value_of: "valueOf",
     to_string: "toString",

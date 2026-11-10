@@ -128,8 +128,29 @@ pub(crate) fn new_bare_error(cx: &mut Cx<'_>, kind: ErrorKind) -> Result<Value, 
     Ok(Value::object(object))
 }
 
-/// Most frames a backtrace lists.
-const BACKTRACE_FRAMES: usize = 64;
+/// Most frames a backtrace lists, and `Error.stackTraceLimit`'s first
+/// value.
+pub(crate) const BACKTRACE_FRAMES: usize = 64;
+
+/// The frames a backtrace lists: `Error.stackTraceLimit` as V8 reads it, a
+/// number's integer part (clamped to `0..=BACKTRACE_FRAMES`, a negative one
+/// 0), and none when it is not a number or not `%Error%`'s own data
+/// property.
+fn stack_trace_limit(cx: &Cx<'_>) -> usize {
+    let error = cx.realm.intrinsic(Intrinsic::Error);
+    let key = Names::key(cx.realm.names.stack_trace_limit);
+    let Some((slot, flags)) = cx.heap.lookup_own(error, key) else {
+        return 0;
+    };
+    if flags.has(PropertyFlags::ACCESSOR) {
+        return 0;
+    }
+    match cx.heap.get_slot(error, slot).as_f64() {
+        Some(limit) if limit >= BACKTRACE_FRAMES as f64 => BACKTRACE_FRAMES,
+        Some(limit) if limit > 0.0 => limit as usize,
+        _ => 0,
+    }
+}
 
 /// QuickJS's `build_backtrace`: the bytecode frames, innermost first, as
 /// `    at name (file:line:column)` lines in the own `stack` property of
@@ -187,15 +208,47 @@ pub(crate) fn add_stack_at(
             Value::int32(column as i32),
         )?;
     }
+    let line_index = u32::from(location.is_some());
+    let unpositioned = backtrace(cx, &mut text, skip_native, omit, line_index);
+    let text = cx.heap.alloc_string(&text)?;
+    let key = Names::key(cx.realm.names.stack);
+    cx.heap.add_property(
+        object,
+        key,
+        PropertyFlags::data(true, false, true),
+        Value::string(text),
+    )?;
+    cx.heap.vm.unpositioned = (!unpositioned.is_empty()).then_some((object, unpositioned));
+    Ok(())
+}
+
+/// The running frames' backtrace but the `omit` innermost, as
+/// [`add_stack`] writes it (`Error.captureStackTrace`'s `stack`).
+pub(crate) fn backtrace_text(cx: &mut Cx<'_>, skip_native: bool, omit: usize) -> String {
+    let mut text = String::new();
+    backtrace(cx, &mut text, skip_native, omit, 0);
+    text
+}
+
+/// [`add_stack_at`]'s lines of the frames, appended to `text` from line
+/// `line_index`; the frames whose position the loop's unwind fills in
+/// later, with their lines.
+fn backtrace(
+    cx: &mut Cx<'_>,
+    text: &mut String,
+    skip_native: bool,
+    omit: usize,
+    mut line_index: u32,
+) -> Vec<(u32, u32)> {
+    let limit = stack_trace_limit(cx);
     let vm = &cx.heap.vm;
     let len = vm.frames.len();
     let top = len.saturating_sub(omit);
-    let mut line_index = u32::from(location.is_some());
     let eval = Value::object(cx.realm.intrinsic(crate::Intrinsic::Eval));
     let mut sites = vm.natives.iter().rev().peekable();
     while sites.next_if(|site| site.depth as usize > top).is_some() {}
     let mut unpositioned = Vec::new();
-    for index in (0..top).rev().take(BACKTRACE_FRAMES) {
+    for index in (0..top).rev().take(limit) {
         let frame = &vm.frames[index];
         let unit = cx.unit(frame.unit);
         // The natives this frame called and which are still running (one
@@ -287,16 +340,7 @@ pub(crate) fn add_stack_at(
             }
         }
     }
-    let text = cx.heap.alloc_string(&text)?;
-    let key = Names::key(cx.realm.names.stack);
-    cx.heap.add_property(
-        object,
-        key,
-        PropertyFlags::data(true, false, true),
-        Value::string(text),
-    )?;
-    cx.heap.vm.unpositioned = (!unpositioned.is_empty()).then_some((object, unpositioned));
-    Ok(())
+    unpositioned
 }
 
 /// A sample asked while the native `callee` ran (the poll could not take

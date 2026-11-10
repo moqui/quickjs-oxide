@@ -416,6 +416,7 @@ natives! {
     AggregateErrorConstructor => error::aggregate_error, "AggregateError", 2, constructor;
     ErrorToString => error::to_string, "toString", 0;
     ErrorIsError => error::is_error, "isError", 1;
+    ErrorCaptureStackTrace => error::capture_stack_trace, "captureStackTrace", 2;
 
     PromiseConstructor => promise::constructor, "Promise", 1, constructor;
     PromiseResolveFunction => promise::resolve_function, "", 1;
