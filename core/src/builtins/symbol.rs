@@ -37,6 +37,9 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         "species",
         "unscopables",
         "asyncIterator",
+        // FORK-EXPLICIT-RESOURCE-MANAGEMENT-001.
+        "asyncDispose",
+        "dispose",
     ] {
         let id = all
             .iter()

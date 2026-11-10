@@ -48,6 +48,7 @@ intrinsics! {
     InternalErrorPrototype,
     UriErrorPrototype,
     AggregateErrorPrototype,
+    SuppressedErrorPrototype,
     /// A preallocated `InternalError: out of memory`, thrown when the heap
     /// cannot allocate the error itself.
     OutOfMemoryError,
@@ -126,6 +127,8 @@ intrinsics! {
     ArrayBuffer,
     /// `Array.prototype.values`, which is also `arguments[@@iterator]`.
     ArrayValues,
+    DisposableStackPrototype,
+    AsyncDisposableStackPrototype,
     /// The global lexical environment's dictionary.
     GlobalLexical,
 }
@@ -212,6 +215,8 @@ names! {
     reason: "reason",
     fulfilled: "fulfilled",
     rejected: "rejected",
+    error: "error",
+    suppressed: "suppressed",
 }
 
 impl Names {
@@ -263,6 +268,8 @@ well_known! {
     to_primitive: "Symbol.toPrimitive",
     to_string_tag: "Symbol.toStringTag",
     unscopables: "Symbol.unscopables",
+    async_dispose: "Symbol.asyncDispose",
+    dispose: "Symbol.dispose",
 }
 
 impl WellKnown {
