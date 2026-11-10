@@ -7,10 +7,10 @@ it in one loop with inline caches, over a NaN-boxed value heap and a
 mark-sweep collector.
 
 <!-- current-test262-metrics:start -->
-Within the Test262 scope that QuickJS 2026-06-04 runs, quickjs-oxide passes
-**81,441 of 83,562 variants (97.462%)**. QuickJS's `test262.conf`
-skips the other 18,475 of the 102,037 variants; across the full corpus the
-pass rate is 79.815%.
+Within the Test262 scope that QuickJS 2026-06-04 runs, with the fork's features, quickjs-oxide passes
+**82,359 of 84,503 variants (97.463%)**. QuickJS's `test262.conf`
+skips the other 17,534 of the 102,037 variants; across the full corpus the
+pass rate is 80.715%.
 <!-- current-test262-metrics:end -->
 
 - **Zero `unsafe`.** Every crate in the workspace sets

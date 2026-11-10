@@ -278,13 +278,13 @@ function currentTest262DocumentBlocks(metrics) {
   return new Map([
     [
       "docs/compatibility.md",
-      `- ${fullPasses} of the ${quickJsScope} Test262 variants in QuickJS 2026-06-04's scope pass (${metrics.quickJsScopePercent}%).\n` +
+      `- ${fullPasses} of the ${quickJsScope} Test262 variants in QuickJS 2026-06-04's scope, with the fork's features, pass (${metrics.quickJsScopePercent}%).\n` +
         `- ${formatInteger(metrics.eligibleFailures)} executed variants fail, and ` +
         `${formatInteger(metrics.quickJsScope - metrics.fullRunnable)} variants in that scope are not yet run.`,
     ],
     [
       "README.md",
-      `Within the Test262 scope that QuickJS 2026-06-04 runs, quickjs-oxide passes\n` +
+      `Within the Test262 scope that QuickJS 2026-06-04 runs, with the fork's features, quickjs-oxide passes\n` +
         `**${fullPasses} of ${quickJsScope} variants (${metrics.quickJsScopePercent}%)**. QuickJS's \`test262.conf\`\n` +
         `skips the other ${quickJsSkipped} of the ${fullVariants} variants; across the full corpus the\n` +
         `pass rate is ${metrics.fullPassPercent}%.`,
@@ -292,7 +292,7 @@ function currentTest262DocumentBlocks(metrics) {
     [
       "docs/status.md",
       `The authoritative Test262 vector has:\n\n` +
-        `- ${fullPasses} passes out of the ${quickJsScope} variants in QuickJS 2026-06-04's scope (${metrics.quickJsScopePercent}%)\n` +
+        `- ${fullPasses} passes out of the ${quickJsScope} variants in QuickJS 2026-06-04's scope, with the fork's features (${metrics.quickJsScopePercent}%)\n` +
         `- ${fullPasses} full-corpus passes out of ${fullVariants} variants (${metrics.fullPassPercent}%)\n` +
         `- ${fullEligible} eligible variants out of ${fullVariants} (${metrics.eligiblePercent}%)\n` +
         `- ${formatInteger(metrics.eligibleFailures)} failures and ${timeoutText} among the ${fullRunnable} eligible variants`,
@@ -301,14 +301,15 @@ function currentTest262DocumentBlocks(metrics) {
       "apps/web/docs/compatibility.md",
       "| Measure | Passes | Variants | Rate |\n" +
         "| --- | ---: | ---: | ---: |\n" +
-        `| In QuickJS 2026-06-04's scope | ${fullPasses} | ${quickJsScope} | ${metrics.quickJsScopePercent}% |\n` +
+        `| In QuickJS 2026-06-04's scope, with the fork's features | ${fullPasses} | ${quickJsScope} | ${metrics.quickJsScopePercent}% |\n` +
         `| Whole Test262 corpus | ${fullPasses} | ${fullVariants} | ${metrics.fullPassPercent}% |`,
     ],
     [
       "docs/test262.md",
       "Metrics are reported in this order:\n\n" +
         `1. **QuickJS-scope pass:** ${fullPasses} / ${quickJsScope} (${metrics.quickJsScopePercent}%). The denominator is\n` +
-        "   every variant the pinned QuickJS `test262.conf` runs; it excludes the\n" +
+        "   every variant the pinned QuickJS `test262.conf` runs, and those of the fork's\n" +
+        "   features (the profile's `[fork-features]`); it excludes the\n" +
         `   ${quickJsSkipped} \`skipped-*\` variants that QuickJS itself skips.\n` +
         `2. **Full pass:** ${fullPasses} / ${fullVariants} (${metrics.fullPassPercent}%). Every frozen Test262 variant is in\n` +
         "   the denominator.\n" +

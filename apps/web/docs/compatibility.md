@@ -9,8 +9,8 @@ Test262 runs at the commit the QuickJS 2026-06-04 release pins, with the release
 <!-- current-test262-metrics:start -->
 | Measure | Passes | Variants | Rate |
 | --- | ---: | ---: | ---: |
-| In QuickJS 2026-06-04's scope | 81,441 | 83,562 | 97.462% |
-| Whole Test262 corpus | 81,441 | 102,037 | 79.815% |
+| In QuickJS 2026-06-04's scope, with the fork's features | 82,359 | 84,503 | 97.463% |
+| Whole Test262 corpus | 82,359 | 102,037 | 80.715% |
 <!-- current-test262-metrics:end -->
 
 The whole corpus has 18,475 more variants than QuickJS's scope. They are the ones QuickJS's own configuration skips: ECMA-402 `Intl`, Temporal, ShadowRealm, decorators, explicit resource management, proper tail calls, `Atomics.waitAsync`, `Array.fromAsync` and other proposals outside the release.
