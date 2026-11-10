@@ -2515,6 +2515,9 @@ pub(super) fn run_at(cx: &mut Cx<'_>, start: usize) -> Result<Value, Throw> {
                 | Opcode::IterStartAsync
                 | Opcode::IterNextRaw
                 | Opcode::IterResult => super::iter::iter_op(cx, &frame, insn),
+                Opcode::Dispose => {
+                    crate::builtins::dispose_op(cx, frame.base as usize, insn)
+                }
                 Opcode::MakeClass
                 | Opcode::InstallFields
                 | Opcode::InitFields

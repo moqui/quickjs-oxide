@@ -18,6 +18,8 @@ mod buffer;
 mod case;
 mod collection;
 mod date;
+mod disposable;
+pub(crate) use disposable::dispose_op;
 mod error;
 mod function;
 mod generator;
@@ -75,6 +77,11 @@ impl Native {
                 | Native::AsyncFromSyncCloseRejected
                 | Native::ModuleAsyncRejected
                 | Native::ModuleImportRejected
+                | Native::DisposableStackAdoptCallback
+                | Native::DisposeAsyncFromSync
+                | Native::DisposeAsyncFulfilled
+                | Native::DisposeAsyncRejected
+                | Native::AsyncIteratorDisposeUnwrap
         )
     }
 }
@@ -416,6 +423,7 @@ natives! {
     AggregateErrorConstructor => error::aggregate_error, "AggregateError", 2, constructor;
     ErrorToString => error::to_string, "toString", 0;
     ErrorIsError => error::is_error, "isError", 1;
+    ErrorCaptureStackTrace => error::capture_stack_trace, "captureStackTrace", 2;
 
     PromiseConstructor => promise::constructor, "Promise", 1, constructor;
     PromiseResolveFunction => promise::resolve_function, "", 1;
@@ -719,6 +727,30 @@ natives! {
     Test262DetachArrayBuffer => test262::detach_array_buffer, "detachArrayBuffer", 1;
     Test262CodePointRange => test262::code_point_range, "codePointRange", 2;
 
+    // Explicit resource management (FORK-EXPLICIT-RESOURCE-MANAGEMENT-001).
+    SuppressedErrorConstructor => disposable::suppressed_error, "SuppressedError", 3, constructor;
+    DisposableStackConstructor => disposable::stack_constructor, "DisposableStack", 0, constructor;
+    DisposableStackAdopt => disposable::stack_adopt, "adopt", 2;
+    DisposableStackDefer => disposable::stack_defer, "defer", 1;
+    DisposableStackDispose => disposable::stack_dispose, "dispose", 0;
+    DisposableStackDisposed => disposable::stack_disposed, "disposed", 0;
+    DisposableStackMove => disposable::stack_move, "move", 0;
+    DisposableStackUse => disposable::stack_use, "use", 1;
+    DisposableStackAdoptCallback => disposable::adopt_callback, "", 0;
+    AsyncDisposableStackConstructor => disposable::async_stack_constructor, "AsyncDisposableStack", 0, constructor;
+    AsyncDisposableStackAdopt => disposable::async_stack_adopt, "adopt", 2;
+    AsyncDisposableStackDefer => disposable::async_stack_defer, "defer", 1;
+    AsyncDisposableStackDisposeAsync => disposable::async_stack_dispose_async, "disposeAsync", 0;
+    AsyncDisposableStackDisposed => disposable::async_stack_disposed, "disposed", 0;
+    AsyncDisposableStackMove => disposable::async_stack_move, "move", 0;
+    AsyncDisposableStackUse => disposable::async_stack_use, "use", 1;
+    DisposeAsyncFromSync => disposable::dispose_async_from_sync, "", 0;
+    DisposeAsyncFulfilled => disposable::dispose_async_fulfilled, "", 1;
+    DisposeAsyncRejected => disposable::dispose_async_rejected, "", 1;
+    IteratorPrototypeDispose => disposable::iterator_dispose, "[Symbol.dispose]", 0;
+    AsyncIteratorPrototypeAsyncDispose => disposable::async_iterator_async_dispose, "[Symbol.asyncDispose]", 0;
+    AsyncIteratorDisposeUnwrap => disposable::async_iterator_dispose_unwrap, "", 1;
+
     ConsoleLog => global::print, "log", 1;
     Load => crate::vm::compile::load, "load", 1;
     Read => crate::vm::compile::read, "read", 1;
@@ -755,6 +787,7 @@ impl Native {
             ErrorKind::Internal => Native::InternalErrorConstructor,
             ErrorKind::Uri => Native::UriErrorConstructor,
             ErrorKind::Aggregate => Native::AggregateErrorConstructor,
+            ErrorKind::Suppressed => Native::SuppressedErrorConstructor,
         }
     }
 }
@@ -1225,6 +1258,7 @@ fn install_rooted(cx: &mut Cx<'_>) -> Result<ObjectId, HeapError> {
     typed_array::install(cx)?;
     atomics::install(cx)?;
     error::install(cx)?;
+    disposable::install(cx)?;
     regexp::record_flag_cache(cx)?;
     to_string_tag(cx, global, "global")?;
     order_globals(cx, global)?;
@@ -1300,6 +1334,9 @@ const GLOBAL_ORDER: &[&str] = &[
     "Promise",
     "WeakRef",
     "FinalizationRegistry",
+    "SuppressedError",
+    "DisposableStack",
+    "AsyncDisposableStack",
 ];
 
 /// Puts the global object's properties in [`GLOBAL_ORDER`].
@@ -1410,6 +1447,31 @@ pub(crate) fn install_qjs_helpers(
         define(cx, global, "print", Value::object(print), all)?;
         let load_script = native_function(cx, Native::LoadScript)?;
         define(cx, global, "__loadScript", Value::object(load_script), all)
+    })();
+    cx.heap.roots().truncate(mark);
+    result
+}
+
+/// A `performance` global as the High Resolution Time standard has it, for
+/// embedders: `now()` (fractional milliseconds on a monotonic clock) and
+/// `timeOrigin` (the epoch time, from the host's clock, at which `now()`
+/// reads 0), so `performance.timeOrigin + performance.now()` follows
+/// `Date.now()`. The global is writable, enumerable and configurable, as
+/// a WebIDL global attribute and quickjs-ng's are; `now` is a builtin
+/// method. qjs's own helpers (`install_qjs_helpers`) keep QuickJS's `{now}`.
+pub(crate) fn install_performance(cx: &mut Cx<'_>) -> Result<(), HeapError> {
+    let mark = cx.heap.roots().mark();
+    let result = (|| {
+        let global = cx.realm.global();
+        let prototype = cx.realm.intrinsic(Intrinsic::ObjectPrototype);
+        let performance = plain_object(cx, Some(prototype), 2)?;
+        cx.heap.roots().push(Value::object(performance));
+        let builtin = PropertyFlags::data(true, false, true);
+        let now = native_function(cx, Native::PerformanceNow)?;
+        define(cx, performance, "now", Value::object(now), builtin)?;
+        let origin = cx.host.hooks.now_ms() - agent::monotonic_ms();
+        define(cx, performance, "timeOrigin", Value::number(origin), PropertyFlags::data(false, true, true))?;
+        define(cx, global, "performance", Value::object(performance), PropertyFlags::data(true, true, true))
     })();
     cx.heap.roots().truncate(mark);
     result

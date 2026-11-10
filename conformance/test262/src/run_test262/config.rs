@@ -159,6 +159,7 @@ pub(super) fn skip_reason(
     path: &Path,
     metadata: &Metadata,
     config: &SuiteConfig,
+    fork_feature: impl Fn(&str) -> bool,
 ) -> Option<(String, String)> {
     let path = path.to_string_lossy().replace('\\', "/");
     let quickjs_path = format!("test262/{path}");
@@ -182,6 +183,11 @@ pub(super) fn skip_reason(
         }
     }
     for feature in &metadata.features {
+        // A fork feature runs although pinned QuickJS skips it; the oxide
+        // profile's own classification still applies.
+        if fork_feature(feature) {
+            continue;
+        }
         if config.skipped_features.contains(feature) {
             return Some((
                 "skipped-feature".to_owned(),

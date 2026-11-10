@@ -10,20 +10,21 @@ pinned in [`compat/upstream.toml`](../compat/upstream.toml) and mirrored by
 <!-- current-test262-metrics:start -->
 Metrics are reported in this order:
 
-1. **QuickJS-scope pass:** 81,441 / 83,562 (97.462%). The denominator is
-   every variant the pinned QuickJS `test262.conf` runs; it excludes the
-   18,475 `skipped-*` variants that QuickJS itself skips.
-2. **Full pass:** 81,441 / 102,037 (79.815%). Every frozen Test262 variant is in
+1. **QuickJS-scope pass:** 82,359 / 84,503 (97.463%). The denominator is
+   every variant the pinned QuickJS `test262.conf` runs, and those of the fork's
+   features (the profile's `[fork-features]`); it excludes the
+   17,534 `skipped-*` variants that QuickJS itself skips.
+2. **Full pass:** 82,359 / 102,037 (80.715%). Every frozen Test262 variant is in
    the denominator.
-3. **Eligible coverage:** 83,354 / 102,037 (81.690%). This measures how much of
+3. **Eligible coverage:** 84,288 / 102,037 (82.605%). This measures how much of
    the full vector the current profile admits to execution.
-4. **Runnable pass quality:** 81,441 / 83,354 (97.705%). This diagnoses
+4. **Runnable pass quality:** 82,359 / 84,288 (97.711%). This diagnoses
    admitted behavior and complements the coverage metrics above.
 
 The frozen outcome summary is:
 
 ```text
-fail-async=16 fail-async-done-count=53 fail-parse=324 fail-runtime=1520 pass=81441 skipped-config-exclude=6700 skipped-feature=11775 unsupported-module=121 unsupported-negative-provenance=87
+fail-async=16 fail-async-done-count=53 fail-parse=324 fail-runtime=1536 pass=82359 skipped-config-exclude=6700 skipped-feature=10834 unsupported-module=128 unsupported-negative-provenance=87
 ```
 <!-- current-test262-metrics:end -->
 
@@ -96,7 +97,11 @@ Negative admissions are fail-closed: an expected failure counts only when its
 exact path is present in the audited-negative data. Every admitted path/variant
 belongs to exactly one diagnostic class. Exact contracts require the
 pinned-QuickJS phase, type, message, and `exact` or `absent` location policy. A
-frozen ledger identifies the 2,586 variants that check phase and type only.
+frozen ledger identifies the 2,706 variants that check phase and type only:
+2,586 legacy ones, and 120 negative tests of a fork feature
+(`fork-feature-phase-type-only`), whose tests pinned QuickJS skips, so it has
+no diagnostic to match; the runner refuses that reason for a test of no feature
+in the profile's `[fork-features]`.
 Schema-v5 receipts authenticate both data files and record expected/actual
 diagnostic fields. New negative admissions add exact contracts. The semantic
 rule registry is separately authenticated, and scheduled QuickJS differential CI

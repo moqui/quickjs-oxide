@@ -360,6 +360,15 @@ opcodes! {
     /// done flag to `c` (the record is open again unless done).
     IterResult: ABC,
 
+    // ---- explicit resource management (FORK-EXPLICIT-RESOURCE-MANAGEMENT-001) ----
+    /// A `using` scope's dispose capability, by the [`dispose`] kind in
+    /// `imm`: `a` = a new capability; add resource `a` to capability `b`
+    /// (sync or async hint); record the throw `a` in `b`; dispose `b`'s
+    /// sync resources and throw its completion; run `b` to its next await,
+    /// `a` = the value to await and `c` = whether there is one; throw `b`'s
+    /// completion, if a throw.
+    Dispose: ABC,
+
     // ---- classes ----
     /// `a` = the class constructor made from the closure in `b` with the
     /// parent in `a` (`c` 1 when it has a heritage) and `b` = its
@@ -543,4 +552,15 @@ impl Opcode {
                 | Opcode::ThrowInternal
         )
     }
+}
+
+/// [`Opcode::Dispose`]'s kinds, in `imm`.
+pub mod dispose {
+    pub const NEW: u32 = 0;
+    pub const ADD_SYNC: u32 = 1;
+    pub const ADD_ASYNC: u32 = 2;
+    pub const RECORD_ERROR: u32 = 3;
+    pub const DISPOSE_SYNC: u32 = 4;
+    pub const STEP: u32 = 5;
+    pub const FINISH: u32 = 6;
 }

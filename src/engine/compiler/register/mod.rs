@@ -36,6 +36,7 @@ use oxide_core::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use oxide_core::bytecode::builder::UnitLayout;
+use oxide_core::bytecode::opcode::dispose;
 use oxide_core::bytecode::{
     Capture, CodeBuilder, CodeUnit, CodeUnitId, Handler, Opcode, ValidateError, flags,
 };
@@ -2414,6 +2415,84 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             I::IteratorCheckObject => {
                 let value = self.operand(self.stack.len() - 1)?;
                 self.emit(|b| b.a(Opcode::IterCheckObject, value));
+            }
+            I::DisposeNew => {
+                let dst = self.result_register()?;
+                let at = self.emit(|b| {
+                    b.raw(oxide_core::Insn::new(
+                        Opcode::Dispose,
+                        dst,
+                        dst,
+                        dst,
+                        dispose::NEW,
+                    ))
+                });
+                self.push_result(at)?;
+            }
+            I::DisposeAdd(is_async) => {
+                let (_, [capability]) = self.pop_operands::<1>()?;
+                let value = self.operand(self.stack.len() - 1)?;
+                let kind = if is_async {
+                    dispose::ADD_ASYNC
+                } else {
+                    dispose::ADD_SYNC
+                };
+                self.emit(|b| {
+                    b.raw(oxide_core::Insn::new(
+                        Opcode::Dispose,
+                        value,
+                        capability,
+                        capability,
+                        kind,
+                    ))
+                });
+            }
+            I::DisposeRecordError => {
+                let (_, [error, capability]) = self.pop_operands::<2>()?;
+                self.emit(|b| {
+                    b.raw(oxide_core::Insn::new(
+                        Opcode::Dispose,
+                        error,
+                        capability,
+                        capability,
+                        dispose::RECORD_ERROR,
+                    ))
+                });
+            }
+            I::DisposeSync | I::DisposeFinish => {
+                let kind = if matches!(instruction, I::DisposeSync) {
+                    dispose::DISPOSE_SYNC
+                } else {
+                    dispose::FINISH
+                };
+                let (_, [capability]) = self.pop_operands::<1>()?;
+                self.emit(|b| {
+                    b.raw(oxide_core::Insn::new(
+                        Opcode::Dispose,
+                        capability,
+                        capability,
+                        capability,
+                        kind,
+                    ))
+                });
+            }
+            I::DisposeStep => {
+                let top = self.stack.len();
+                let capability = self.operand(top - 1)?;
+                // The value to await and whether there is one.
+                let dst = self.temps_window(top - 1, 2, 0)?;
+                self.emit(|b| {
+                    b.raw(oxide_core::Insn::new(
+                        Opcode::Dispose,
+                        dst,
+                        capability,
+                        dst + 1,
+                        dispose::STEP,
+                    ))
+                });
+                self.temps_written(dst, top - 1, 0..2)?;
+                self.stack[top - 1] = Entry::Canon;
+                self.push_canon(1);
             }
             I::ThrowIteratorMissingThrow => {
                 let message = self.static_key("iterator does not have a throw method")?;

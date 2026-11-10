@@ -25,6 +25,25 @@ pub(in crate::engine::compiler) struct FunctionParseContext {
     /// YieldExpression is disabled while generator formal initializers parse
     /// and becomes active only after the InitialYield boundary is installed.
     pub(in crate::engine::compiler) in_function_body: bool,
+    /// Open `using` scopes, innermost last (`parser/disposal.rs`).
+    pub(in crate::engine::compiler) dispose_regions: Vec<DisposeRegion>,
+}
+
+/// A scope holding `using` declarations: from its first declaration to its
+/// exit, a catch region whose finally subroutine disposes the resources
+/// (FORK-EXPLICIT-RESOURCE-MANAGEMENT-001).
+#[derive(Debug)]
+pub(in crate::engine::compiler) struct DisposeRegion {
+    /// The scope whose exit disposes.
+    pub(in crate::engine::compiler) scope: ScopeId,
+    /// The synthetic local holding the dispose capability.
+    pub(in crate::engine::compiler) local: u16,
+    /// The region's `Catch`, once emitted.
+    pub(in crate::engine::compiler) catch_jump: Option<usize>,
+    /// The stack depth outside the catch marker.
+    pub(in crate::engine::compiler) entry_depth: usize,
+    /// Whether an `await using` declaration added to it.
+    pub(in crate::engine::compiler) is_async: bool,
 }
 
 impl FunctionParseContext {
@@ -37,6 +56,7 @@ impl FunctionParseContext {
             stack_depth: 0,
             current_scope: body_scope,
             in_function_body: false,
+            dispose_regions: Vec::new(),
         }
     }
 }

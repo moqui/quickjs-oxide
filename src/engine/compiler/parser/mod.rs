@@ -5,6 +5,7 @@ mod calls;
 pub(super) mod context;
 mod control;
 mod declarations;
+mod disposal;
 pub(super) mod diagnostics;
 pub(super) mod entry;
 mod expressions;

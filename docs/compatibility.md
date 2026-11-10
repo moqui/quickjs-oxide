@@ -19,15 +19,17 @@ oracle.
 - Test262 at the commit the release's `Makefile` pins, with the release's
   `tests/test262.patch` applied and its `test262.conf` selecting the scope.
 - The target matches the release's feature set. Features its `test262.conf`
-  skips (ECMA-402 `Intl`, Temporal, ShadowRealm, decorators, explicit resource
-  management, proper tail calls, `Atomics.waitAsync`, `Array.fromAsync` and the
-  other skipped proposals) lie outside the target, as they do for QuickJS.
+  skips (ECMA-402 `Intl`, Temporal, ShadowRealm, decorators, proper tail
+  calls, `Atomics.waitAsync`, `Array.fromAsync` and the other skipped
+  proposals) lie outside the target, as they do for QuickJS. The fork adds
+  explicit resource management (`using`, `DisposableStack`, …) to the target
+  ([`FORK-EXPLICIT-RESOURCE-MANAGEMENT-001`](deviations.md#fork-explicit-resource-management-001)).
 
 ## Language conformance
 
 <!-- current-test262-metrics:start -->
-- 81,441 of the 83,562 Test262 variants in QuickJS 2026-06-04's scope pass (97.462%).
-- 1,913 executed variants fail, and 208 variants in that scope are not yet run.
+- 82,359 of the 84,503 Test262 variants in QuickJS 2026-06-04's scope, with the fork's features, pass (97.463%).
+- 1,929 executed variants fail, and 215 variants in that scope are not yet run.
 <!-- current-test262-metrics:end -->
 
 Of the 1,913 failing variants, 1,870 fail by decision: they are in the

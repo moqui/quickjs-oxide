@@ -176,6 +176,12 @@ impl<'source> Parser<'source> {
         if !self.is_punctuator(Punctuator::Semicolon) {
             if self.lexical_declaration_ahead(true)? {
                 self.parse_lexical_declarations_with_in(InMode::Disallow)?;
+            } else if let Some(is_async) = self.using_declaration_ahead(false)? {
+                // The head's resources are disposed when the loop ends: the
+                // loop runs inside the For scope's dispose region.
+                self.with_in_mode(InMode::Disallow, |parser| {
+                    parser.parse_using_declarations(is_async)
+                })?;
             } else if matches!(self.current().kind, TokenKind::Keyword(Keyword::Var)) {
                 self.advance()?;
                 self.parse_var_declarations_with_in(InMode::Disallow)?;
@@ -183,13 +189,19 @@ impl<'source> Parser<'source> {
                 self.parse_expression_no_in()?;
                 self.emit_instruction(Instruction::Drop)?;
             }
-            self.require_stack_depth(entry_depth, "for initializer")?;
+            self.require_stack_depth(
+                entry_depth + usize::from(self.has_dispose_region(scope)),
+                "for initializer",
+            )?;
             // Detach any initializer capture before the first test while the
             // initialized value remains in the local slot for the iteration.
             self.emit_scope_closures(scope, outer_scope)?;
         }
         self.expect_punctuator(Punctuator::Semicolon)?;
 
+        // A `using` head's catch marker stays below the loop.
+        let outer_depth = entry_depth;
+        let entry_depth = entry_depth + usize::from(self.has_dispose_region(scope));
         self.push_loop_control(entry_depth, label_name);
         let test_target = if self.is_punctuator(Punctuator::Semicolon) {
             None
@@ -275,6 +287,8 @@ impl<'source> Parser<'source> {
         for jump in control.break_jumps {
             self.patch_jump(jump, break_target)?;
         }
+        self.close_dispose_region(scope)?;
+        self.require_stack_depth(outer_depth, "for statement")?;
         self.finish_control_statement();
         self.pop_scope(scope)?;
         Ok(())
@@ -322,6 +336,12 @@ impl<'source> Parser<'source> {
         self.require_stack_depth(entry_depth + retained_slots, "for-in/of assignment target")?;
         if iteration_hint == ForIterationKind::Of {
             self.pop_for_of_assignment_fragment_control(entry_depth)?;
+        }
+        // A `using` head: each iteration's catch marker, from the binding
+        // through the body.
+        let disposes = self.pending_for_of_dispose_region(scope);
+        if disposes {
+            self.enter_for_of_dispose_region()?;
         }
         let body_jump = self.emit_instruction(Instruction::Goto(u32::MAX))?;
 
@@ -417,7 +437,7 @@ impl<'source> Parser<'source> {
 
         let body_target = self.current_ir().ops.len();
         self.patch_jump(body_jump, body_target)?;
-        self.current_ir_mut().context.stack_depth = record_depth;
+        self.current_ir_mut().context.stack_depth = record_depth + usize::from(disposes);
         match iteration_kind {
             ForIterationKind::In => {
                 self.push_for_in_control(entry_depth, label_name, outer_scope)?;
@@ -426,10 +446,16 @@ impl<'source> Parser<'source> {
                 self.push_for_of_control(entry_depth, label_name, outer_scope)?;
             }
         }
+        if disposes {
+            self.push_for_of_dispose_control()?;
+        }
         // The full for-in/of head is consumed; charge at the body token.
         let weight = self.enter_recursion(ParserStackFrame::StatementHead)?;
         self.parse_statement_or_decl(completion, StatementPosition::Single)?;
         self.leave_recursion(weight);
+        if disposes {
+            self.close_dispose_region(scope)?;
+        }
         self.require_stack_depth(record_depth, "for-in/of body")?;
         self.emit_scope_closures(scope, outer_scope)?;
 
@@ -502,6 +528,17 @@ impl<'source> Parser<'source> {
             return self.parse_for_object_assignment_pattern(iteration_kind);
         }
 
+        if let Some(is_async) = self.using_declaration_ahead(true)? {
+            if iteration_kind == ForIterationKind::In {
+                return Err(self.syntax_here("using declarations are not allowed in for-in"));
+            }
+            self.parse_for_of_using_binding(is_async)?;
+            return Ok(ForAssignmentTargetInfo {
+                declaration: ForAssignmentDeclaration::Lexical,
+                var_initializer: None,
+                is_destructuring: false,
+            });
+        }
         if self.lexical_declaration_ahead(true)? {
             let is_const = matches!(self.current().kind, TokenKind::Keyword(Keyword::Const));
             self.advance()?;

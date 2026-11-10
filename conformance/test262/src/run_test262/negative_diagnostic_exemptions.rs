@@ -10,6 +10,9 @@ use super::{TestMode, Variant, validate_relative_test_path};
 
 const HEADER: &str = "path\tvariant\tsource_sha256\tphase\ttype\treason";
 const LEGACY_REASON: &str = "legacy-r3eg-b-phase-type-only";
+/// A negative test of a feature the fork admits past pinned QuickJS's skip (the profile's `[fork-features]`): QuickJS
+/// has no diagnostic of its own to match, so only the phase and type are checked.
+const FORK_FEATURE_REASON: &str = "fork-feature-phase-type-only";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct NegativeDiagnosticExemption {
@@ -18,6 +21,7 @@ pub(super) struct NegativeDiagnosticExemption {
     source_sha256: String,
     phase: String,
     error_type: String,
+    fork_feature: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -100,7 +104,7 @@ impl NegativeDiagnosticExemptions {
                     "negative diagnostic exemptions line {line_number} has invalid error type"
                 ));
             }
-            if fields[5] != LEGACY_REASON {
+            if fields[5] != LEGACY_REASON && fields[5] != FORK_FEATURE_REASON {
                 return Err(format!(
                     "negative diagnostic exemptions line {line_number} has an unrecognized reason"
                 ));
@@ -129,6 +133,7 @@ impl NegativeDiagnosticExemptions {
                     source_sha256: fields[2].to_owned(),
                     phase: fields[3].to_owned(),
                     error_type: fields[4].to_owned(),
+                    fork_feature: fields[5] == FORK_FEATURE_REASON,
                 },
             );
         }
@@ -184,6 +189,13 @@ impl NegativeDiagnosticExemptions {
             .contains_key(&(path.to_string_lossy().replace('\\', "/"), variant))
     }
 
+    /// Whether the exemption of `path`'s `variant` is a fork feature's ([`FORK_FEATURE_REASON`]).
+    pub(super) fn is_fork_feature(&self, path: &Path, variant: Variant) -> bool {
+        self.entries
+            .get(&(path.to_string_lossy().replace('\\', "/"), variant))
+            .is_some_and(|exemption| exemption.fork_feature)
+    }
+
     pub(super) fn iter(&self) -> impl Iterator<Item = &NegativeDiagnosticExemption> {
         self.entries.values()
     }
@@ -235,6 +247,12 @@ mod tests {
             )
             .is_err()
         );
+        let fork = NegativeDiagnosticExemptions::parse(
+            &source.replace("legacy-r3eg-b-phase-type-only", "fork-feature-phase-type-only"),
+        )
+        .unwrap();
+        assert!(fork.is_fork_feature(std::path::Path::new("test/a.js"), crate::Variant::Sloppy));
+        assert!(!parsed.is_fork_feature(std::path::Path::new("test/a.js"), crate::Variant::Sloppy));
     }
 
     #[test]

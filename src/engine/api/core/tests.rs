@@ -44,7 +44,7 @@ fn run_api(source: &str) -> String {
 #[test]
 fn the_corpus_prints_through_the_api_what_the_driver_prints() {
     let programs = corpus();
-    assert_eq!(programs.len(), 49);
+    assert_eq!(programs.len(), 50);
     let mut failures = Vec::new();
     for (name, source) in programs {
         let expected = run_on_core(&source);
@@ -250,4 +250,54 @@ fn a_key_text_lasts_until_the_next_collection() {
     assert!(texts.get(1, 7).is_none());
     texts.put(1, 7, &JsString::from_static("reused"));
     assert_eq!(texts.get(1, 7).unwrap().to_utf8_lossy(), "reused");
+}
+
+#[test]
+fn performance_counts_fractions_of_a_millisecond_from_its_time_origin() {
+    let runtime = Runtime::new();
+    let context = runtime.context();
+    context.install_performance().unwrap();
+    let source = r#"
+        const d = Object.getOwnPropertyDescriptor(globalThis, "performance");
+        let a = performance.now(), b = a, spins = 0;
+        while (b === a && spins++ < 1e7) b = performance.now();
+        const drift = Math.abs(performance.timeOrigin + performance.now() - Date.now());
+        [d.writable, d.enumerable, d.configurable, b > a, b - a < 1,
+         Number.isInteger(a) && Number.isInteger(b) ? "whole" : "fractional",
+         typeof performance.timeOrigin, drift < 50].join(" ")
+    "#;
+    let value = context.eval(source).unwrap();
+    let text = context.to_js_string(&value).unwrap().to_utf8_lossy();
+    assert_eq!(text, "true true true true true fractional number true");
+}
+
+#[test]
+fn capture_stack_trace_and_the_limit_shape_a_backtrace() {
+    let runtime = Runtime::new();
+    let context = runtime.context();
+    let source = r#"
+        const lines = (stack) => stack.split("\n").filter(Boolean).map((line) => line.trim().split(" ")[1]);
+        function g(o) { Error.captureStackTrace(o, g); }
+        function h() { const o = {}; g(o); return o.stack; }
+        function k() { const o = {}; Error.captureStackTrace(o); return o.stack; }
+        function deep(n) { return n ? deep(n - 1) : new Error("d").stack.split("\n").length - 1; }
+        const out = [lines(h()).join(","), lines(k()).join(",")];
+        try { Error.captureStackTrace(1); } catch (error) { out.push(error.name); }
+        try { Error.captureStackTrace(Object.freeze({})); } catch (error) { out.push(error.name); }
+        const e = new Error("x"); Error.captureStackTrace(e); out.push(lines(e.stack).join(","));
+        const o = {}; Error.captureStackTrace(o, function idle() {}); out.push(JSON.stringify(o.stack));
+        const d = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
+        out.push([d.value, d.writable, d.enumerable, d.configurable].join(":"));
+        Error.stackTraceLimit = 3; out.push(deep(20));
+        Error.stackTraceLimit = 2.9; out.push(deep(20));
+        Error.stackTraceLimit = "x"; out.push(JSON.stringify(new Error("s").stack));
+        Error.stackTraceLimit = Infinity; out.push(deep(100));
+        out.join(" ")
+    "#;
+    let value = context.eval(source).unwrap();
+    let text = context.to_js_string(&value).unwrap().to_utf8_lossy();
+    assert_eq!(
+        text,
+        "h,<eval> k,<eval> TypeError TypeError <eval> \"\" 64:true:true:true 3 2 \"\" 64"
+    );
 }

@@ -196,6 +196,8 @@ impl<'source> Parser<'source> {
                 )?;
             }
         }
+        let body_scope = self.current_ir().context.current_scope;
+        self.close_dispose_region(body_scope)?;
         self.emit_instruction(Instruction::Undefined)?;
         self.emit_instruction(Instruction::Return)?;
         Ok(())

@@ -189,6 +189,7 @@ impl<'source> Parser<'source> {
         for synthetic in [
             crate::engine::compiler::EVAL_RET_LOCAL_NAME,
             crate::engine::compiler::FINALLY_EVAL_RET_LOCAL_NAME,
+            crate::engine::compiler::DISPOSE_CAPABILITY_LOCAL_NAME,
             crate::engine::compiler::EVAL_VARIABLE_OBJECT_LOCAL_NAME,
             crate::engine::compiler::ARG_EVAL_VARIABLE_OBJECT_LOCAL_NAME,
             crate::engine::compiler::WITH_OBJECT_LOCAL_NAME,

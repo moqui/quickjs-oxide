@@ -720,7 +720,9 @@ fn run_coordinator(options: &CoordinatorOptions) -> Result<bool, String> {
             false
         };
         let variants = metadata.variants(options.mode);
-        let skip = skip_reason(&relative, &metadata, &config);
+        let skip = skip_reason(&relative, &metadata, &config, |feature| {
+            oxide_profile.admits_fork_feature(feature)
+        });
         let mut missing_host = missing_host_capability_hints(
             &relative,
             &source,
@@ -902,6 +904,18 @@ fn validate_oxide_profile(
         for variant in metadata.variants(TestMode::Both) {
             let exact = diagnostics.get(relative, variant).is_some();
             let legacy = exemptions.contains(relative, variant);
+            if exemptions.is_fork_feature(relative, variant)
+                && !metadata
+                    .features
+                    .iter()
+                    .any(|feature| profile.admits_fork_feature(feature))
+            {
+                return Err(format!(
+                    "fork-feature exemption is not a test of a fork feature: {} {}",
+                    relative.display(),
+                    variant.name()
+                ));
+            }
             if exact == legacy {
                 let classification = if exact {
                     "both an exact contract and a legacy exemption"

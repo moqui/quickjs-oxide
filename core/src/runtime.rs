@@ -48,6 +48,7 @@ intrinsics! {
     InternalErrorPrototype,
     UriErrorPrototype,
     AggregateErrorPrototype,
+    SuppressedErrorPrototype,
     /// A preallocated `InternalError: out of memory`, thrown when the heap
     /// cannot allocate the error itself.
     OutOfMemoryError,
@@ -55,6 +56,8 @@ intrinsics! {
     ThrowTypeError,
     Object,
     Function,
+    /// `%Error%`, whose `stackTraceLimit` each backtrace reads.
+    Error,
     Array,
     String,
     Number,
@@ -126,6 +129,8 @@ intrinsics! {
     ArrayBuffer,
     /// `Array.prototype.values`, which is also `arguments[@@iterator]`.
     ArrayValues,
+    DisposableStackPrototype,
+    AsyncDisposableStackPrototype,
     /// The global lexical environment's dictionary.
     GlobalLexical,
 }
@@ -169,6 +174,7 @@ names! {
     file_name: "fileName",
     line_number: "lineNumber",
     column_number: "columnNumber",
+    stack_trace_limit: "stackTraceLimit",
     errors: "errors",
     value_of: "valueOf",
     to_string: "toString",
@@ -212,6 +218,8 @@ names! {
     reason: "reason",
     fulfilled: "fulfilled",
     rejected: "rejected",
+    error: "error",
+    suppressed: "suppressed",
 }
 
 impl Names {
@@ -263,6 +271,8 @@ well_known! {
     to_primitive: "Symbol.toPrimitive",
     to_string_tag: "Symbol.toStringTag",
     unscopables: "Symbol.unscopables",
+    async_dispose: "Symbol.asyncDispose",
+    dispose: "Symbol.dispose",
 }
 
 impl WellKnown {
@@ -579,6 +589,11 @@ impl Runtime {
     /// [`read_file`](crate::host::Host::read_file).
     pub fn install_std(&mut self) -> Result<(), HeapError> {
         self.native_cx().install_std()
+    }
+
+    /// Defines a standard `performance` global (`now`, `timeOrigin`).
+    pub fn install_performance(&mut self) -> Result<(), HeapError> {
+        self.native_cx().install_performance()
     }
 
     /// Defines `qjs`'s helpers as QuickJS's `js_std_add_helpers` does:
