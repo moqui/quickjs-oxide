@@ -445,6 +445,11 @@ impl<'a> NativeCx<'a> {
         self.installing(crate::builtins::install_std)
     }
 
+    /// [`Runtime::install_performance`].
+    pub fn install_performance(&mut self) -> Result<(), HeapError> {
+        self.installing(crate::builtins::install_performance)
+    }
+
     /// [`Runtime::install_qjs_helpers`].
     pub fn install_qjs_helpers(&mut self, script_args: Option<&[String]>) -> Result<(), HeapError> {
         self.installing(|cx| crate::builtins::install_qjs_helpers(cx, script_args))

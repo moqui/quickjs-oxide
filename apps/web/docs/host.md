@@ -72,6 +72,8 @@ A new runtime's global object has the ECMAScript built-ins and nothing that does
 
 `QjsHelpers::default()` installs the first group without `scriptArgs`, `load` or `read`.
 
+`Context::install_performance` defines `performance` alone, as the High Resolution Time standard has it, for an embedder that does not want the rest. `performance.now()` returns fractional milliseconds on a monotonic clock, and `performance.timeOrigin` is the epoch time, from `Host::now_ms`, at which `now()` read 0. It is a builtin: writable, configurable, and not enumerable. Install one or the other; both define `performance`.
+
 `load` and `read` get their text from `Host::read_file`. A host that serves files from memory, an archive or a sandboxed directory overrides it. When `read_file` returns `None`, `load` throws a `ReferenceError` and `read` throws an `Error`.
 
 <!-- include: examples/host_services.rs#read-file -->

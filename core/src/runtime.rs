@@ -581,6 +581,11 @@ impl Runtime {
         self.native_cx().install_std()
     }
 
+    /// Defines a standard `performance` global (`now`, `timeOrigin`).
+    pub fn install_performance(&mut self) -> Result<(), HeapError> {
+        self.native_cx().install_performance()
+    }
+
     /// Defines `qjs`'s helpers as QuickJS's `js_std_add_helpers` does:
     /// `console`, `scriptArgs` when given, `print`.
     pub fn install_qjs_helpers(&mut self, script_args: Option<&[String]>) -> Result<(), HeapError> {

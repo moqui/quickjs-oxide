@@ -1484,6 +1484,11 @@ impl View<'_> {
 
     // ---- hosts ----
 
+    pub(crate) fn install_performance(&mut self) -> JsResult<()> {
+        self.core.install_performance()?;
+        Ok(())
+    }
+
     pub(crate) fn install_qjs_helpers(&mut self, helpers: &QjsHelpers) -> JsResult<()> {
         self.core
             .install_qjs_helpers(helpers.script_args.as_deref())?;
@@ -1931,6 +1936,10 @@ js_ops! {
     /// qjs's `print` and `console.log`, `scriptArgs`, and under `std` its
     /// `load` and `read`.
     fn install_qjs_helpers(&mut self, helpers: &QjsHelpers) -> JsResult<()>;
+    /// A `performance` global as the High Resolution Time standard has it:
+    /// `now()` in fractional milliseconds on a monotonic clock and
+    /// `timeOrigin`, the host clock's epoch time at which `now()` reads 0.
+    fn install_performance(&mut self) -> JsResult<()>;
 
     // ---- host functions and host objects ----
 

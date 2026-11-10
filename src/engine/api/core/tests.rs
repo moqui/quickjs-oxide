@@ -251,3 +251,22 @@ fn a_key_text_lasts_until_the_next_collection() {
     texts.put(1, 7, &JsString::from_static("reused"));
     assert_eq!(texts.get(1, 7).unwrap().to_utf8_lossy(), "reused");
 }
+
+#[test]
+fn performance_counts_fractions_of_a_millisecond_from_its_time_origin() {
+    let runtime = Runtime::new();
+    let context = runtime.context();
+    context.install_performance().unwrap();
+    let source = r#"
+        const d = Object.getOwnPropertyDescriptor(globalThis, "performance");
+        let a = performance.now(), b = a, spins = 0;
+        while (b === a && spins++ < 1e7) b = performance.now();
+        const drift = Math.abs(performance.timeOrigin + performance.now() - Date.now());
+        [d.writable, d.enumerable, d.configurable, b > a, b - a < 1,
+         Number.isInteger(a) && Number.isInteger(b) ? "whole" : "fractional",
+         typeof performance.timeOrigin, drift < 50].join(" ")
+    "#;
+    let value = context.eval(source).unwrap();
+    let text = context.to_js_string(&value).unwrap().to_utf8_lossy();
+    assert_eq!(text, "true false true true true fractional number true");
+}

@@ -1415,6 +1415,30 @@ pub(crate) fn install_qjs_helpers(
     result
 }
 
+/// A `performance` global as the High Resolution Time standard has it, for
+/// embedders: `now()` (fractional milliseconds on a monotonic clock) and
+/// `timeOrigin` (the epoch time, from the host's clock, at which `now()`
+/// reads 0), so `performance.timeOrigin + performance.now()` follows
+/// `Date.now()`. Writable, configurable and not enumerable, as a builtin;
+/// qjs's own helpers (`install_qjs_helpers`) keep QuickJS's `{now}`.
+pub(crate) fn install_performance(cx: &mut Cx<'_>) -> Result<(), HeapError> {
+    let mark = cx.heap.roots().mark();
+    let result = (|| {
+        let global = cx.realm.global();
+        let prototype = cx.realm.intrinsic(Intrinsic::ObjectPrototype);
+        let performance = plain_object(cx, Some(prototype), 2)?;
+        cx.heap.roots().push(Value::object(performance));
+        let builtin = PropertyFlags::data(true, false, true);
+        let now = native_function(cx, Native::PerformanceNow)?;
+        define(cx, performance, "now", Value::object(now), builtin)?;
+        let origin = cx.host.hooks.now_ms() - agent::monotonic_ms();
+        define(cx, performance, "timeOrigin", Value::number(origin), PropertyFlags::data(false, true, true))?;
+        define(cx, global, "performance", Value::object(performance), builtin)
+    })();
+    cx.heap.roots().truncate(mark);
+    result
+}
+
 /// A typed array's length, or a `TypeError` when it is out of bounds.
 pub(crate) fn typed_array_length_or_throw(cx: &mut Cx<'_>, object: ObjectId) -> Result<u64, Throw> {
     match crate::vm::typed::length(cx.heap, object) {
