@@ -23,7 +23,17 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
             cx.heap.set_prototype(constructor, Some(error))?;
         } else {
             error_constructor = Some(constructor);
-            methods(cx, constructor, &[Native::ErrorIsError])?;
+            cx.set_intrinsic(crate::Intrinsic::Error, constructor);
+            methods(cx, constructor, &[Native::ErrorIsError, Native::ErrorCaptureStackTrace])?;
+            // V8's `Error.stackTraceLimit`, a plain data property each
+            // backtrace reads; it starts at the most frames a backtrace
+            // lists, so a stack is QuickJS's until a script sets it.
+            cx.heap.add_property(
+                constructor,
+                Names::key(names.stack_trace_limit),
+                PropertyFlags::data(true, true, true),
+                Value::int32(vm_error::BACKTRACE_FRAMES as i32),
+            )?;
             // QuickJS's `js_error_proto_funcs`: `toString`, `name`,
             // `message`.
             methods(cx, prototype, &[Native::ErrorToString])?;
@@ -147,6 +157,37 @@ pub(super) fn to_string(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw>
         return Err(vm_error::type_error(cx, "not an object"));
     };
     ops::error_text(cx, object)
+}
+
+/// V8's `Error.captureStackTrace(object, constructorOpt)`, as quickjs-ng
+/// has it: a `TypeError` for a non-object, else `object`'s own `stack`
+/// (writable, configurable, not enumerable) is the running frames'
+/// backtrace, without `captureStackTrace` itself, and with a function
+/// `constructorOpt` without that function's innermost frame and the frames
+/// it called (none when it is not running).
+pub(super) fn capture_stack_trace(cx: &mut Cx<'_>, site: CallSite) -> Result<Value, Throw> {
+    let target = site.arg(cx, 0);
+    let Some(object) = target.as_object() else {
+        return Err(vm_error::type_error(cx, "not an object"));
+    };
+    let filter = site.arg(cx, 1);
+    let frames = cx.heap.vm.frames.len();
+    let omit = match filter.as_object() {
+        Some(function) => cx.heap.vm.frames
+            .iter()
+            .rposition(|frame| frame.function == function)
+            .map_or(frames, |index| frames - index),
+        None => 0,
+    };
+    let text = vm_error::backtrace_text(cx, true, omit);
+    let text = cx
+        .heap
+        .alloc_string(&text)
+        .map_err(|error| vm_error::heap_error(cx, error))?;
+    let key = Names::key(cx.realm.names.stack);
+    let descriptor = internal::Descriptor::data(Value::string(text), true, false, true);
+    internal::define_property_or_throw(cx, object, key, &descriptor)?;
+    Ok(Value::UNDEFINED)
 }
 
 /// `Error.isError(value)`: whether it is an error object (a proxy is not).
