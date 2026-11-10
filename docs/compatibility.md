@@ -19,9 +19,11 @@ oracle.
 - Test262 at the commit the release's `Makefile` pins, with the release's
   `tests/test262.patch` applied and its `test262.conf` selecting the scope.
 - The target matches the release's feature set. Features its `test262.conf`
-  skips (ECMA-402 `Intl`, Temporal, ShadowRealm, decorators, explicit resource
-  management, proper tail calls, `Atomics.waitAsync`, `Array.fromAsync` and the
-  other skipped proposals) lie outside the target, as they do for QuickJS.
+  skips (ECMA-402 `Intl`, Temporal, ShadowRealm, decorators, proper tail
+  calls, `Atomics.waitAsync`, `Array.fromAsync` and the other skipped
+  proposals) lie outside the target, as they do for QuickJS. The fork adds
+  explicit resource management (`using`, `DisposableStack`, …) to the target
+  ([`FORK-EXPLICIT-RESOURCE-MANAGEMENT-001`](deviations.md#fork-explicit-resource-management-001)).
 
 ## Language conformance
 

@@ -226,6 +226,62 @@ cargo run --quiet --locked --bin qjs -- -e 'try{Function("for (x => 0 in 1;;) br
 
 Pinned QuickJS prints `accepted`; Rust prints `SyntaxError`.
 
+## Fork additions
+
+The moqui/quickjs-oxide fork adds what scripts written for other engines
+expect where pinned QuickJS has nothing: a de facto API, or a standard feature
+that pinned QuickJS's `test262.conf` skips. Each one adds behavior and changes
+none of QuickJS's own. The only change a QuickJS script can see is the new
+property names.
+
+### FORK-EXPLICIT-RESOURCE-MANAGEMENT-001
+
+- Status: fork addition (2026-11-09).
+- Surface: ECMAScript explicit resource management (ES2026; Test262 feature
+  `explicit-resource-management`, which pinned QuickJS's `test262.conf`
+  skips): `using` and `await using` declarations, `Symbol.dispose`,
+  `Symbol.asyncDispose`, `SuppressedError`, `DisposableStack`,
+  `AsyncDisposableStack`, `%IteratorPrototype%[Symbol.dispose]` and
+  `%AsyncIteratorPrototype%[Symbol.asyncDispose]`. Pinned QuickJS has none of
+  them; it rejects the declarations with `SyntaxError: expecting ';'`.
+- Required behavior:
+  - The specification's: `using` and `await using` in blocks, function and
+    static-block bodies, module bodies, `for` heads and `for-of` heads (each
+    iteration disposes its own binding before the iterator closes); a
+    declaration is an early `SyntaxError` at the top level of a script or
+    eval code, directly in a `case` or `default` clause, in a
+    single-statement position, in a `for-in` head, with a binding pattern or
+    without an initializer. `using` followed by a line break, `using [` and
+    `for (using of …` keep their old meanings.
+  - Resources are disposed in reverse order on every exit of their scope;
+    a throw from a disposal joins the completion as a `SuppressedError`
+    (`error` the new throw, `suppressed` the previous one). `await using`
+    awaits each disposal in turn, and once for a `null` or `undefined`
+    resource.
+  - Error messages are short, lowercase and in QuickJS's style; the stack
+    objects' `ReferenceError` once disposed is `stack is already disposed`.
+- Mechanism: a scope's first declaration opens a catch region over the rest
+  of the scope whose finally subroutine disposes the resources, the shape of
+  `try … finally`, so `break`, `continue`, `return` and a generator's
+  `return()` dispose as they run a `finally`. The resources live in a hidden
+  dispose capability per scope (one `Dispose` register instruction).
+- Not taken: realms (`TARGET-REALMS-001`): the `proto-from-ctor-realm` and
+  `cross-realm` variants of the feature fail by that decision.
+- Test262: the oxide profile's `[fork-features]` admits
+  `explicit-resource-management` past the QuickJS skip.
+
+Minimal probe:
+
+```js
+{
+  using a = { [Symbol.dispose]() { print("a disposed"); } };
+  print("body");
+}
+```
+
+The probe prints `body` then `a disposed`. Pinned QuickJS throws
+`SyntaxError: expecting ';'`.
+
 ## QuickJS specification departures
 
 Where pinned QuickJS departs from a clause of ECMA-262, quickjs-oxide follows
