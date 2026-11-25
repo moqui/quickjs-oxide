@@ -1872,6 +1872,7 @@ impl CodeBuilder {
         self.compile_expression(expression, false)?;
         self.emit(Instruction::SaveEnd { capture: 0 });
         self.emit(Instruction::Match);
+        mark_possessive_repeats(&mut self.instructions);
         let register_count =
             u8::try_from(self.max_registers).map_err(|_| CompileError::too_many_registers(0))?;
         Ok((self.instructions, register_count))
@@ -2177,6 +2178,7 @@ impl CodeBuilder {
                 minimum: quantifier.minimum,
                 maximum: quantifier.maximum,
                 greedy: quantifier.greedy,
+                possessive: false,
             })));
             return Ok(());
         }
@@ -2758,6 +2760,139 @@ fn is_low_surrogate(value: u32) -> bool {
 
 fn combine_surrogates(high: u32, low: u32) -> u32 {
     0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)
+}
+
+/// Marks a greedy class repeat possessive when the instruction that reads
+/// after it (past captures and forward jumps) reads a set disjoint from the
+/// repeat's, or the pattern ends there, or the input's end must follow: a
+/// character the repeat gave back would be one of its own, which that
+/// follower rejects, so backtracking into the repeat never finds a match.
+fn mark_possessive_repeats(instructions: &mut [Instruction]) {
+    for pc in 0..instructions.len() {
+        let Instruction::ClassRepeat(repeat) = &instructions[pc] else {
+            continue;
+        };
+        if !repeat.greedy {
+            continue;
+        }
+        let Some(own) = repeat_set(repeat) else {
+            continue;
+        };
+        if follow_is_disjoint(instructions, pc + 1, &own)
+            && let Instruction::ClassRepeat(repeat) = &mut instructions[pc]
+        {
+            repeat.possessive = true;
+        }
+    }
+}
+
+fn follow_is_disjoint(instructions: &[Instruction], mut pc: usize, own: &[CharacterRange]) -> bool {
+    // Bounded: forward jumps only, and a few steps.
+    for _ in 0..16 {
+        let Some(instruction) = instructions.get(pc) else {
+            return false;
+        };
+        match instruction {
+            Instruction::SaveStart { .. } | Instruction::SaveEnd { .. } => pc += 1,
+            Instruction::Jump { target } if *target > pc => pc = *target,
+            Instruction::Match => return true,
+            // The input's end: a repeat that gave a character back is not
+            // there.
+            Instruction::LineEnd { multiline: false } => return true,
+            Instruction::ClassRepeat(follow) if follow.minimum > 0 => {
+                return repeat_set(follow).is_some_and(|follow| ranges_disjoint(own, &follow));
+            }
+            _ => {
+                return character_set(instruction)
+                    .is_some_and(|follow| ranges_disjoint(own, &follow));
+            }
+        }
+    }
+    false
+}
+
+/// The characters a class repeat reads, sorted; `None` for a
+/// case-insensitive one, whose set is not compared.
+fn repeat_set(repeat: &super::ClassRepeat) -> Option<Vec<CharacterRange>> {
+    if repeat.ignore_case {
+        return None;
+    }
+    let ranges = normalize_ranges(repeat.ranges.to_vec());
+    Some(if repeat.inverted {
+        complement_ranges(&ranges, 0x10_ffff)
+    } else {
+        ranges
+    })
+}
+
+/// The characters a one-character instruction reads, sorted; `None` for any
+/// other instruction or a case-insensitive one.
+fn character_set(instruction: &Instruction) -> Option<Vec<CharacterRange>> {
+    const ALL: CharacterRange = CharacterRange::new(0, 0x10_ffff);
+    let set = match instruction {
+        Instruction::Char {
+            value,
+            ignore_case: false,
+        } => vec![CharacterRange::new(*value, *value)],
+        Instruction::Any => vec![ALL],
+        Instruction::Dot => complement_ranges(
+            &[
+                CharacterRange::new(0x0a, 0x0a),
+                CharacterRange::new(0x0d, 0x0d),
+                CharacterRange::new(0x2028, 0x2029),
+            ],
+            0x10_ffff,
+        ),
+        Instruction::Space { inverted } => {
+            let space = [
+                CharacterRange::new(0x09, 0x0d),
+                CharacterRange::new(0x20, 0x20),
+                CharacterRange::new(0xa0, 0xa0),
+                CharacterRange::new(0x1680, 0x1680),
+                CharacterRange::new(0x2000, 0x200a),
+                CharacterRange::new(0x2028, 0x2029),
+                CharacterRange::new(0x202f, 0x202f),
+                CharacterRange::new(0x205f, 0x205f),
+                CharacterRange::new(0x3000, 0x3000),
+                CharacterRange::new(0xfeff, 0xfeff),
+            ];
+            if *inverted {
+                complement_ranges(&space, 0x10_ffff)
+            } else {
+                space.to_vec()
+            }
+        }
+        Instruction::Range {
+            ranges,
+            inverted,
+            ignore_case: false,
+        } => {
+            let ranges = normalize_ranges(ranges.to_vec());
+            if *inverted {
+                complement_ranges(&ranges, 0x10_ffff)
+            } else {
+                ranges
+            }
+        }
+        _ => return None,
+    };
+    Some(set)
+}
+
+/// Whether two sorted sets share no character.
+fn ranges_disjoint(left: &[CharacterRange], right: &[CharacterRange]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() && j < right.len() {
+        let (a, b) = (left[i], right[j]);
+        if a.end < b.start {
+            i += 1;
+        } else if b.end < a.start {
+            j += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

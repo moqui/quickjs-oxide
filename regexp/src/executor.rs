@@ -1348,7 +1348,9 @@ where
                         state.position = next;
                         optional += 1;
                     }
-                    if state.position != minimum_position {
+                    // A possessive repeat's continuation rejects every
+                    // character it would give back.
+                    if state.position != minimum_position && !repeat.possessive {
                         state.push_repeat(state.pc, previous, minimum_position, true)?;
                     }
                 } else if remaining != 0 {
@@ -1994,6 +1996,20 @@ mod tests {
             "[\\uD800-\\uDFFF]+a",
             "[😀a]+b",
             "[😀a]+?b",
+            // Possessive where the follower is disjoint, and the near misses.
+            "[ab]+x",
+            "[ab]*x",
+            "[ab]+$",
+            "[ab]+(x)",
+            "[ab]+[^ab]",
+            "[^x]+x",
+            "[ab]+\\s",
+            "[ab]+.",
+            "[ab]+[xa]",
+            "[ab]+(?:x|a)",
+            "[ab]+[x\\n]{1,2}",
+            "[ab]+[ab]?x",
+            "([ab]+)x\\1",
         ] {
             for flags in ["", "u", "y", "i", "iu", "m", "v"] {
                 let optimized = compile(pattern, flags);
@@ -2043,6 +2059,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A greedy class repeat is possessive only where what reads after it
+    /// cannot read one of its characters.
+    #[test]
+    fn possessive_repeats_are_those_whose_follower_rejects_their_characters() {
+        let possessive = |pattern: &str, flags: &str| {
+            compile(pattern, flags)
+                .instructions()
+                .iter()
+                .find_map(|instruction| match instruction {
+                    Instruction::ClassRepeat(repeat) => Some(repeat.possessive),
+                    _ => None,
+                })
+                .expect("a class repeat")
+        };
+        for pattern in [
+            r"\d*:",
+            "[ab]+x",
+            "[ab]+$",
+            "[ab]+(x)",
+            "[ab]+[^ab]",
+            "[ab]+",
+            r"\w+\s",
+        ] {
+            assert!(possessive(pattern, ""), "{pattern}");
+        }
+        for pattern in [
+            "[ab]+?x",
+            "[ab]+[xa]",
+            "[ab]+(?:x|a)",
+            "[ab]+[ab]?x",
+            "[ab]+.",
+            "[ab]+$",
+        ] {
+            let flags = if pattern.ends_with('$') { "m" } else { "" };
+            assert!(!possessive(pattern, flags), "{pattern}/{flags}");
+        }
+        // A case-insensitive set is not compared.
+        assert!(!possessive("[ab]+x", "i"));
     }
 
     #[test]

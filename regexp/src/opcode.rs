@@ -25,6 +25,10 @@ pub struct ClassRepeat {
     pub(crate) minimum: u32,
     pub(crate) maximum: Option<u32>,
     pub(crate) greedy: bool,
+    /// A greedy repeat whose continuation cannot read a character of its
+    /// set: a character given back would be rejected at once, so it keeps
+    /// no backtrack frame. Set by the compiler's last pass.
+    pub(crate) possessive: bool,
 }
 
 impl CharacterRange {
