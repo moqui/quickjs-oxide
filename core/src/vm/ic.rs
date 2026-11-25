@@ -412,6 +412,9 @@ impl IcStore {
             self.entries.copy_within(from..from + count, to);
             self.entries[from..from + count].fill(IcEntry::EMPTY);
             self.kinds.copy_within(from..from + count, to);
+            // A polymorphic site's row goes with it; the old place keeps
+            // none, so a unit reserved there later starts monomorphic.
+            self.move_rows(from, to, count);
             #[cfg(any(feature = "ic-stats", debug_assertions))]
             {
                 self.stats.site_misses.copy_within(from..from + count, to);
@@ -419,6 +422,19 @@ impl IcStore {
             }
             unit.ic_base.set(start);
             self.free_range(old, count as u32);
+        }
+    }
+
+    /// Moves the row links of sites `from .. from + count` to `to ..`
+    /// (`to < from`), leaving the old sites without one.
+    fn move_rows(&mut self, from: usize, to: usize, count: usize) {
+        if self.poly_sites.len() <= from {
+            return;
+        }
+        let end = (from + count).min(self.poly_sites.len());
+        for index in from..end {
+            let row = core::mem::replace(&mut self.poly_sites[index], NONE);
+            self.poly_sites[to + index - from] = row;
         }
     }
 
@@ -434,6 +450,9 @@ impl IcStore {
             self.free.pop();
             self.entries.truncate(start as usize);
             self.kinds.truncate(start as usize);
+            // Free sites hold no row: only the links past the end go.
+            self.poly_sites
+                .truncate((start as usize).min(self.poly_sites.len()));
             #[cfg(any(feature = "ic-stats", debug_assertions))]
             self.stats.site_misses.truncate(start as usize);
         }
@@ -459,6 +478,7 @@ impl IcStore {
         shrink(&mut self.poly);
         shrink(&mut self.poly_kinds);
         shrink(&mut self.poly_free);
+        shrink(&mut self.poly_sites);
         #[cfg(any(feature = "ic-stats", debug_assertions))]
         shrink(&mut self.stats.site_misses);
     }
@@ -898,5 +918,39 @@ mod tests {
         assert!(store.record(0, fill(5)));
         assert_eq!(store.poly_sites[0], 0, "the row is reused");
         assert_eq!(store.poly.len(), 1);
+    }
+
+    /// A polymorphic site that compaction moves keeps its row, and its old
+    /// place keeps none: a unit reserved there later starts monomorphic,
+    /// with no other unit's shapes.
+    #[test]
+    fn compaction_moves_a_polymorphic_sites_row() {
+        let mut store = IcStore::default();
+        let gone = reserve(&mut store, COMPACT_MIN as u32 + 100);
+        let kept = reserve(&mut store, 2);
+        let old = kept.ic_base.get() as usize;
+        let fill = |shape: u32| IcEntry {
+            w0: shape,
+            w1: NONE,
+            w2: 0,
+            w3: STATIC_CELL.index(),
+        };
+        assert!(store.record(old, fill(1)));
+        assert!(store.record(old, fill(2)));
+        let row = *store.poly_row(old).expect("a polymorphic site");
+        store.release(&gone);
+        store.compact([&kept]);
+        assert_eq!(kept.ic_base.get(), 0);
+        assert_eq!(store.poly_row(0), Some(&row));
+        assert!(store.poly_row(old).is_none());
+        store.verify_free();
+        let next = reserve(&mut store, 2);
+        assert_eq!(next.ic_base.get(), 2);
+        assert!(store.poly_row(2).is_none());
+        store.release(&next);
+        store.trim();
+        assert_eq!(store.len(), 2);
+        assert!(store.poly_sites.len() <= 2);
+        assert_eq!(store.poly_row(0), Some(&row));
     }
 }
