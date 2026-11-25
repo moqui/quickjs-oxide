@@ -868,6 +868,8 @@ struct Lowerer<'a, 'c> {
     /// temporary, for retargeting into a local.
     last_dest: Option<(u32, u32)>,
     checked: FxHashSet<u32>,
+    literal_field_slots: FxHashMap<usize, u32>,
+    literal_finishes: FxHashMap<usize, u32>,
     /// Depth of temporaries used above the stack (TDZ checks of captures).
     max_scratch: u32,
     pool: Vec<CoreValue>,
@@ -978,6 +980,8 @@ impl<'a, 'c> Lowerer<'a, 'c> {
             pc: 0,
             last_dest: None,
             checked: FxHashSet::default(),
+            literal_field_slots: FxHashMap::default(),
+            literal_finishes: FxHashMap::default(),
             max_scratch: 0,
             pool: Vec::new(),
             pool_index: vec![NO_SLOT; function.constants().len()],
@@ -1847,9 +1851,20 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 self.push_result(at)?;
             }
             I::Object => {
-                let slots = self.literal_slots(pc);
+                let literal = self.plain_literal(pc)?;
                 let dst = self.result_register()?;
-                let at = self.emit(|b| b.a_count(Opcode::NewObject, dst, slots));
+                let at = match literal {
+                    Some((count, _)) => {
+                        self.emit(|b| b.a_count(Opcode::NewObjectLit, dst, u32::from(count)))
+                    }
+                    None => {
+                        let slots = self.literal_slots(pc);
+                        self.emit(|b| b.a_count(Opcode::NewObject, dst, slots))
+                    }
+                };
+                if let Some((_, last)) = literal {
+                    self.literal_finishes.insert(last, at);
+                }
                 self.push_result(at)?;
             }
             I::ArrayFrom(count) => {
@@ -1859,6 +1874,24 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                     .len()
                     .checked_sub(count)
                     .ok_or_else(|| LowerError::Internal("symbolic stack underflow".into()))?;
+                if count >= 2
+                    && self.stack[base..]
+                        .iter()
+                        .all(|entry| self.constant_value(*entry).is_some())
+                {
+                    let first = self.pool.len() as u32;
+                    self.pool.reserve(count);
+                    for depth in base..self.stack.len() {
+                        let value = self.constant_value(self.stack[depth]).expect("a constant");
+                        self.pool.push(value);
+                    }
+                    self.stack.truncate(base);
+                    let dst = self.result_register()?;
+                    let at =
+                        self.emit(|b| b.a_const_range(Opcode::NewArrayK, dst, first, count as u16));
+                    self.push_result(at)?;
+                    return Ok(1);
+                }
                 if count > 0 && self.spilled(base + count - 1) {
                     return self.array_from_slots(base).map(|()| 1);
                 }
@@ -1959,6 +1992,9 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let (_, [object, key]) = self.pop_operands::<2>()?;
                 let dst = self.result_register()?;
                 let at = self.emit(|b| b.abc(Opcode::GetElem, dst, object, key));
+                if self.fusible(pc) {
+                    self.builder.hint_increment_element();
+                }
                 self.push_result(at)?;
             }
             I::GetArrayEl2 => {
@@ -1994,7 +2030,22 @@ impl<'a, 'c> Lowerer<'a, 'c> {
                 let key = self.name_key(name)?;
                 let (_, [value]) = self.pop_operands::<1>()?;
                 let object = self.operand(self.stack.len() - 1)?;
-                self.emit(|b| b.ab_key(Opcode::DefineField, object, value, key));
+                if let Some(&slot) = self.literal_field_slots.get(&pc) {
+                    self.emit(|b| {
+                        b.raw(oxide_core::Insn::new(
+                            Opcode::InitField,
+                            object,
+                            value,
+                            slot as u8,
+                            key.raw(),
+                        ))
+                    });
+                    if let Some(&creator) = self.literal_finishes.get(&pc) {
+                        self.emit(|b| b.a_int(Opcode::FinishObjectLit, object, creator as i32));
+                    }
+                } else {
+                    self.emit(|b| b.ab_key(Opcode::DefineField, object, value, key));
+                }
             }
             I::DefineArrayEl => {
                 let (_, [value]) = self.pop_operands::<1>()?;
@@ -3416,6 +3467,83 @@ impl<'a, 'c> Lowerer<'a, 'c> {
     }
 
     // ---- allocation forms ----
+
+    fn constant_value(&self, entry: Entry) -> Option<CoreValue> {
+        Some(match entry {
+            Entry::Int(value) => CoreValue::int32(value),
+            Entry::Undefined => CoreValue::UNDEFINED,
+            Entry::Null => CoreValue::NULL,
+            Entry::Bool(value) => CoreValue::bool(value),
+            Entry::Const(index) if self.pool[index as usize].as_object().is_none() => {
+                self.pool[index as usize]
+            }
+            _ => return None,
+        })
+    }
+
+    /// Only a straight-line run of static, unique data definitions may
+    /// initialize slots directly. Nested value evaluation may call JS, but
+    /// nothing can observe the literal before its definitions complete.
+    fn plain_literal(&mut self, pc: usize) -> Result<Option<(u8, usize)>, LowerError> {
+        let Some(base) = self.analysis.depth[pc] else {
+            return Ok(None);
+        };
+        let mut fields = Vec::new();
+        for next in pc + 1..self.code.len() {
+            let Some(depth) = self.analysis.depth[next] else {
+                return Ok(None);
+            };
+            if depth <= base {
+                break;
+            }
+            if self.analysis.label[next] {
+                return Ok(None);
+            }
+            let insn = &self.code[next];
+            if depth == base + 2
+                && let Instruction::DefineField(name) = *insn
+            {
+                fields.push((next, name));
+                if fields.len() > 16 {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let (popped, _) = insn.stack_effect();
+            if popped as u32 >= depth - base {
+                if matches!(
+                    insn,
+                    Instruction::DefineFieldComputed
+                        | Instruction::DefineMethod { .. }
+                        | Instruction::DefineMethodComputed { .. }
+                        | Instruction::SetProto
+                        | Instruction::CopyDataProperties
+                        | Instruction::CopyDataPropertiesExcluded { .. }
+                ) {
+                    return Ok(None);
+                }
+                break;
+            }
+        }
+        if fields.len() < 2 {
+            return Ok(None);
+        }
+        let mut keys = Vec::with_capacity(fields.len());
+        for &(_, name) in &fields {
+            let key = self.name_key(name)?;
+            let oxide_core::heap::atom::KeyKind::String(atom) = key.kind() else {
+                return Ok(None);
+            };
+            if keys.contains(&atom) {
+                return Ok(None);
+            }
+            keys.push(atom);
+        }
+        for (slot, &(at, _)) in fields.iter().enumerate() {
+            self.literal_field_slots.insert(at, slot as u32);
+        }
+        Ok(Some((fields.len() as u8, fields.last().unwrap().0)))
+    }
 
     /// The `DefineField`s that fill the object literal created at `pc`: the
     /// slot count `NewObject` reserves.

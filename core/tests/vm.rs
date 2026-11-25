@@ -3,7 +3,7 @@
 //! Passes under `--features gc-stress`.
 
 use oxide_core::bytecode::builder::UnitLayout;
-use oxide_core::bytecode::{CodeBuilder, CodeUnitId, Opcode, flags};
+use oxide_core::bytecode::{CodeBuilder, CodeUnitId, Handler, Opcode, flags};
 use oxide_core::heap::gc::HeapLimits;
 use oxide_core::{ErrorKind, PropertyKey, Runtime, Value};
 
@@ -220,6 +220,186 @@ fn tail_call_to_a_native() {
     });
     assert_eq!(run(&mut runtime, root), Ok(Value::UNDEFINED));
     assert_eq!(runtime.take_output(), "9\n");
+}
+
+#[test]
+fn a_native_tail_return_restores_roots_before_writing_a_high_destination() {
+    let mut runtime = runtime();
+    let math = key(&mut runtime, "Math");
+    let abs = key(&mut runtime, "abs");
+    let child = publish(
+        &mut runtime,
+        UnitLayout {
+            register_count: 5,
+            parameter_count: 1,
+            flags: flags::STRICT,
+            ..UnitLayout::default()
+        },
+        |b| {
+            // Under gc-stress this collection lowers stale_from while the
+            // caller's high temporaries lie above the callee's root range.
+            b.a_count(Opcode::NewObject, 2, 1);
+            b.a_key(Opcode::GetGlobal, 2, math);
+            b.ab_key(Opcode::GetField, 3, 2, abs);
+            b.ab(Opcode::Mov, 4, 1);
+            b.call(Opcode::TailCallMethod, 0, 2, 1);
+        },
+    );
+    let mut root_layout = layout(64);
+    root_layout.children = vec![child];
+    let root = publish(&mut runtime, root_layout, |b| {
+        b.a_child(Opcode::MakeClosure, 1, 0);
+        b.a_int(Opcode::LoadInt, 2, -7);
+        b.call(Opcode::Call, 63, 1, 1);
+        b.a(Opcode::Return, 63);
+    });
+    assert_eq!(run(&mut runtime, root), Ok(Value::int32(7)));
+    assert_eq!(runtime.vm_stack().depth(), 0);
+}
+
+#[test]
+fn catching_an_unwind_restores_roots_before_a_high_destination() {
+    let mut runtime = runtime();
+    let child = publish(&mut runtime, layout(3), |b| {
+        b.a_count(Opcode::NewObject, 2, 1);
+        b.a_int(Opcode::LoadInt, 1, 37);
+        b.a(Opcode::Throw, 1);
+    });
+    let mut root_layout = layout(64);
+    root_layout.children = vec![child];
+    let root = publish(&mut runtime, root_layout, |b| {
+        b.a_child(Opcode::MakeClosure, 1, 0);
+        b.call(Opcode::Call, 2, 1, 0);
+        b.a(Opcode::Return, 2);
+        b.a(Opcode::Return, 63);
+        b.handler(Handler {
+            start: 1,
+            end: 2,
+            target: 3,
+            register: 63,
+        });
+    });
+    assert_eq!(run(&mut runtime, root), Ok(Value::int32(37)));
+}
+
+#[test]
+fn a_method_callee_at_register_256_fits_the_reserved_window() {
+    let mut runtime = runtime();
+    let child = publish(&mut runtime, layout(2), |b| {
+        b.a_int(Opcode::LoadInt, 1, 41);
+        b.a(Opcode::Return, 1);
+    });
+    let mut root_layout = layout(257);
+    root_layout.children = vec![child];
+    let root = publish(&mut runtime, root_layout, |b| {
+        b.a_child(Opcode::MakeClosure, 1, 0);
+        b.a_wide(Opcode::StoreWide, 1, 256);
+        b.a(Opcode::LoadUndefined, 255);
+        b.call(Opcode::CallMethod, 1, 255, 0);
+        b.a(Opcode::Return, 1);
+    });
+    assert_eq!(run(&mut runtime, root), Ok(Value::int32(41)));
+}
+
+#[test]
+fn frameless_calls_still_poll_interrupts_without_loop_backedges() {
+    struct Stop;
+    impl oxide_core::host::Host for Stop {
+        fn interrupt(&mut self) -> bool {
+            true
+        }
+    }
+    let mut runtime = runtime();
+    runtime.set_host(Box::new(Stop));
+    let child = publish(&mut runtime, layout(2), |b| {
+        b.a_int(Opcode::LoadInt, 1, 7);
+        b.a(Opcode::Return, 1);
+    });
+    let mut root_layout = layout(4);
+    root_layout.children = vec![child];
+    let root = publish(&mut runtime, root_layout, |b| {
+        b.a_child(Opcode::MakeClosure, 1, 0);
+        for _ in 0..1100 {
+            b.ab(Opcode::Mov, 2, 1);
+            b.call(Opcode::Call, 2, 2, 0);
+        }
+        b.a(Opcode::Return, 2);
+    });
+    let thrown = run(&mut runtime, root).unwrap_err();
+    assert_eq!(
+        runtime.display(thrown.0).unwrap(),
+        "InternalError: interrupted"
+    );
+}
+
+#[test]
+fn a_planned_constant_call_keeps_the_stack_limit_check() {
+    let mut runtime = runtime();
+    runtime.set_stack_limit(4096);
+    let child = publish(&mut runtime, layout(5000), |b| {
+        b.a_int(Opcode::LoadInt, 1, 7);
+        b.a(Opcode::Return, 1);
+    });
+    let mut root_layout = layout(3);
+    root_layout.children = vec![child];
+    let root = publish(&mut runtime, root_layout, |b| {
+        b.a_child(Opcode::MakeClosure, 1, 0);
+        b.call(Opcode::Call, 1, 1, 0);
+        b.a(Opcode::Return, 1);
+    });
+    let thrown = run(&mut runtime, root).unwrap_err();
+    assert_eq!(
+        runtime.display(thrown.0).unwrap(),
+        "InternalError: stack overflow"
+    );
+}
+
+#[test]
+fn a_delegated_read_checks_the_live_callees_stack_capacity() {
+    let mut runtime = runtime();
+    runtime.set_stack_limit(4096);
+    let inner = runtime.heap_mut().property_key_pinned("inner").unwrap();
+    let method = runtime.heap_mut().property_key_pinned("method").unwrap();
+    let small = publish(&mut runtime, layout(1), |b| {
+        b.a(Opcode::Return, 0);
+    });
+    let large = publish(&mut runtime, layout(5000), |b| {
+        b.a(Opcode::Return, 0);
+    });
+    let forward = publish(&mut runtime, layout(3), |b| {
+        b.ab_key(Opcode::GetField, 1, 0, inner);
+        b.ab_key(Opcode::GetField, 2, 1, method);
+        b.call(Opcode::CallMethod, 1, 1, 0);
+        b.a(Opcode::Return, 1);
+    });
+    let mut root_layout = layout(10);
+    root_layout.children = vec![small, large, forward];
+    let root = publish(&mut runtime, root_layout, |b| {
+        b.a_child(Opcode::MakeClosure, 1, 0);
+        b.a_child(Opcode::MakeClosure, 2, 1);
+        b.a_child(Opcode::MakeClosure, 3, 2);
+        b.a_count(Opcode::NewObject, 4, 0);
+        b.a_count(Opcode::NewObject, 5, 0);
+        b.ab_key(Opcode::SetField, 4, 1, method);
+        b.ab_key(Opcode::SetField, 5, 4, inner);
+        // Train the two reads, then complete the small delegate once.
+        for _ in 0..2 {
+            b.ab(Opcode::Mov, 6, 5);
+            b.ab(Opcode::Mov, 7, 3);
+            b.call(Opcode::CallMethod, 8, 6, 0);
+        }
+        // Same slots and shapes, but a new live method with a large window.
+        b.ab_key(Opcode::SetField, 4, 2, method);
+        b.ab(Opcode::Mov, 6, 5);
+        b.ab(Opcode::Mov, 7, 3);
+        b.call(Opcode::CallMethod, 8, 6, 0);
+        b.a(Opcode::Return, 8);
+    });
+    let thrown = run(&mut runtime, root).unwrap_err();
+    assert_eq!(
+        runtime.display(thrown.0).unwrap(),
+        "InternalError: stack overflow"
+    );
 }
 
 #[test]

@@ -55,6 +55,12 @@ pub fn operands(
         Format::AInt => format!("{}, {}", r(insn.a), insn.int()),
         Format::ABInt => format!("{}, {}, {}", r(insn.a), r(insn.b), insn.int()),
         Format::AConst => format!("{}, k{}", r(insn.a), insn.imm),
+        Format::AConstRange => format!(
+            "{}, k{}, {}",
+            r(insn.a),
+            insn.imm,
+            u16::from_le_bytes([insn.b, insn.c])
+        ),
         Format::Key => key(insn),
         Format::AKey => format!("{}, {}", r(insn.a), key(insn)),
         Format::ABKey => format!("{}, {}, {}", r(insn.a), r(insn.b), key(insn)),

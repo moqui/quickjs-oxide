@@ -8,7 +8,7 @@ The root crate's front end parses and resolves source into stack code; the regis
 
 `Runtime::publish` runs the validator (`bytecode/validate.rs`) once per unit and appends it to the `CodeStore`: every register operand is below `register_count`, every call window and `NewArray` range fits, every target, constant, child and capture index is in range. The loop then indexes without further checks of its own; a validator failure is an internal error of the lowering, never a JavaScript exception. `qjs --disassemble FILE` prints the register code.
 
-New opcodes are appended at the end of `Opcode`. Inserting one in the middle shifts the discriminants and changes how LLVM lays out the loop's arms, which moves the instructions of every V8 v7 program by 1–6%.
+New opcodes are appended at the end of `Opcode`. Inserting one in the middle shifts the discriminants and can change LLVM's dispatch code and arm layout; validate both work and timing rather than assuming an unrelated opcode is free.
 
 ## Frames and register windows
 
@@ -24,9 +24,9 @@ The register file (`VmStack::registers`) is one `Vec<Value>`; the frame table (`
 
 A frame's window is register 0 (`this`), the parameters, a hidden `new.target` local when the function reads it, the locals, then the operand temporaries. A function with the `ARGUMENTS` flag (`arguments` or a rest parameter) keeps the arguments past its parameters above its registers, where `NewArguments` and `Rest` read them. Calls follow the stack code's operand order: `Call a, b, c` has the callee in `b` and `c` arguments from `b + 1`, and the callee's window starts at `b`, where the call writes `this`; `CallMethod` and `New` have the receiver or `new.target` in `b` and start the window at `b + 1`. No argument is copied either way.
 
-Entering a frame (`enter_frame`) reserves the window, clears every register past the arguments to `undefined`, coerces a sloppy function's `undefined` or `null` receiver to the global object (a primitive one to its wrapper), pushes the frame and sets `top` to the window's end. `registers[..top]` are roots. Registers above a returned frame are dead; when a frame resumes over registers a collection may have freed since they were last below `top` (`stale_from`), `raise_top` clears them before they become roots again.
+Entering a frame prepares its window (`prepare_frame`) before publishing the frame: it reserves the window, clears every register past the arguments to `undefined`, coerces a sloppy function's `undefined` or `null` receiver to the global object (a primitive one to its wrapper), then pushes the frame and sets `top` to the window's end. The non-allocating entry admits an already reserved window, a poll counter above one, a receiver that needs no boxing, and no extra arguments to preserve. It writes the receiver once and initializes the window without a whole-context helper call. Misses keep the poll, reserve, extra-argument and boxing order out of line. Extra actual arguments are preserved only when the function reads them. Primitive receiver boxing roots the callee until its frame is published. `registers[..top]` are roots. Registers above a returned frame are dead; when a frame resumes over registers a collection may have freed since they were last below `top` (`stale_from`), `raise_top` clears them before they become roots again.
 
-`VmStack::reserve` keeps `SPAN` (512) values of padding past every frame's end, so the loop takes the running window as a fixed-size `&mut [Value; 512]` and an 8-bit operand (or a call's `b + 1`) needs no bounds check. The register file grows by doubling up to `DEFAULT_STACK_LIMIT` (2^20 values); a call past it throws `InternalError: stack overflow`.
+`VmStack::reserve` keeps `SPAN` (257) values of padding past every frame's end, so the loop takes the running window as a fixed-size `&mut [Value; 257]` and an 8-bit operand (or a call's `b + 1`) needs no bounds check. The register file grows by doubling up to `DEFAULT_STACK_LIMIT` (2^20 values); a call past it throws `InternalError: stack overflow`.
 
 ### Past the 256-register window
 
@@ -39,31 +39,37 @@ A function inside the window lowers exactly as it would without this path. The `
 
 ## The loop
 
-`vm::interp::run_at` runs the top frame from an instruction until the entry frame returns. It is one `'dispatch: loop` over `match insn.op` with the frame-derived values (`code`, `base`, `strict`, `ic_base`) in locals and the window in `regs`.
+`vm::interp::run_at` runs the top frame from an instruction until the entry frame returns. It is one `'dispatch: loop` over `match insn.op` with `code`, `base` and `ic_base` in locals and the window in `regs`. It borrows the current instruction at dispatch and copies it locally in operand-heavy arms. The full frame remains in `VmStack::frames`, read when an operation needs it rather than copied across every frame switch.
 
 - **Inline arms** cover moves and constants, `Int32` and double arithmetic and comparisons (an overflow or a non-number takes `ops`), the compare-jumps against registers and against `i16` literals, `GetField`, `SetField` and the global forms' cache hits, dense and typed-array element reads and writes, cells and captures, `NewObject`, calls and returns.
-- **The window and the heap.** `regs` borrows the register file inside the heap, so an arm that calls into the heap copies its operands out first and takes the window again afterwards (the `set!` and `write!` macros, and the common tail). The cache hits take the heap's arenas as separate fields, disjoint from the register file, and keep the window.
+- **Arithmetic dispatch.** Specialized multiply, divide, remainder, shift and bitwise arms pass a constant operation to `arith_fast`. A miss decodes the opcode in the shared out-of-line `arith_slow`; generic coercions and quotient normalization stay out of the dispatch loop.
+- **The window and the heap.** `regs` borrows the register file inside the heap, so an arm that calls into the heap copies its operands out first and takes the window again afterwards (the `set!` and `write!` macros, and the common tail). Cache hits, dense element reads and writes, constant loads, and cell accesses borrow only the arenas they use, disjoint from the register file, and keep the window. Typed-array hits borrow the object and internal-record arenas without borrowing registers or allocating.
 - **Slow paths** are `#[inline(never)]` functions in `ops`, `property`, `object` and the other modules, returning `Result<_, Throw>`. Their result falls into the common tail: success retakes the window and dispatches, a throw unwinds.
+- **Interrupts.** Calls and every taken backward branch decrement the poll counter, including numeric, truthiness and nullish conditional branches. A due poll runs after any comparison conversion; an interrupt retains the branch's original faulting PC. Successful polls use the common slow-path continuation to retake the register window.
 - **The rare-op split.** Opcodes no hot path runs share out-of-line arms: `rare_op` (accessor and method definitions, the spill scope, `arguments`, rest, `new.target`, regular-expression literals, `for-in` setup, spread elements, the error throws, `import()`, `ConcatN`), `iter::iter_op` (iteration), `class::class_op` (classes, private names, super and reference forms) and `suspend_op` (generators and `await`). A new opcode enters `run_at` inline only when a profile of a suite program shows it hot.
-- **Unwinding.** A thrown value travels as an unrooted `Throw`. The tail searches the running unit's handlers for the faulting instruction, stores the value in the handler's register and continues at its target; otherwise it pops the frame and repeats in the caller, until a frame marked `ENTRY` returns the throw to Rust. `error::place_frame` records the faulting position for the backtrace on every throw.
+- **Unwinding.** A thrown value travels as an unrooted `Throw`. After `error::place_frame` records its faulting position, an out-of-line handler search pops frames until it finds a handler or reaches `ENTRY`. No allocation occurs during that search. A handler returns its PC, destination and thrown value through the same continuation as a call return: the loop restores the handler frame's root range before writing the thrown value. Interrupts bypass handlers and unwind to `ENTRY`.
 
 ### Calls and returns
 
-A call or `new` of a bytecode function stays in the loop: the arm builds the callee's `Frame`, enters it and continues at the callee's instruction 0, with no Rust recursion. For `new`, `construct_this` allocates the receiver through the constructor's cache (below) unless the constructor is derived. `Function.prototype.call` and `apply` are natives the call arm rewrites (`rewrite_call`) into a call of their receiver, moving the window onto `thisArg` or spreading the argument list. `CallSpread` and `NewSpread` expand their array into the registers first. Natives and exotic callables (bound functions and proxies, which run through the re-entrant entry points below) go through the out-of-line `call_other`.
+A call or `new` of a bytecode function stays in the loop, with no Rust recursion. Ordinary calls to static bytecode resolve the callee once, prepare its window, build and publish its `Frame`, and continue directly with the already borrowed code unit. The successful path does not reload the published frame or encode and decode a generic call completion. Dynamic calls carry the resolved unit owner into the loop; constructions, spread and tail calls prepare their operands out of line, with construction and tail-call kinds specialized as Rust constants. For `new`, `construct_this` allocates the receiver through the constructor's cache (below) unless the constructor is derived. `Function.prototype.call` and `apply` are natives the call arm rewrites (`rewrite_call`) into a call of their receiver, moving the window onto `thisArg` or spreading the argument list. `CallSpread` and `NewSpread` expand their array into the registers first. Natives and exotic callables (bound functions and proxies, which run through the re-entrant entry points below) go through the out-of-line `call_other`.
 
-`Return` from a frame with none of `ENTRY`, `CONSTRUCT` or `TAIL` set pops it, writes the value into the caller's `return_dst` and resumes the caller in place. The other frames go through `finish_return`, which applies the constructor's receiver rule (a non-object result yields the receiver), teaches the `New` site its receiver size, returns through the frames a tail call left, or leaves the loop at an entry frame. `TailCall` does not reuse the frame; the compiler emits no tail call.
+Static code publication also derives an eight-byte completion plan beside each unit. A complete constant/parameter return, cached property read or chain, dense indexed read, numeric field comparison, guarded choice between fields, integer bit update, or single cached store can finish without publishing a frame. A bit-test-or-comparison plan reads its second arm only when needed. The plan admits the ordinary poll counter, reserved window, actual-argument and receiver rules first. Missing parameters read as `undefined`; primitive receiver boxing, polling and stack growth fall back to ordinary entry. Reads allocate nothing and call no JS. A store commits only after all its guards pass, with no subsequent miss. A cache or type miss therefore runs the original body once, with its normal exceptions, accessors and backtrace. Successful completion clears the call-clobbered suffix still covered by the caller's root range, writes its receiver, and decrements the entry poll before returning the value directly to the caller. Unrooted temporaries need no initialization. Dynamic units, constructors, spread and rewritten calls retain their owning frame paths.
+
+A read-only method forwarder may also complete its leaf without publishing either frame. The plan reads the live method value, resolves its current static unit and admits only supported read plans; replaced, native, bound, dynamic or accessor methods fall back. A field transfer may resolve two read-only selectors and read the source before its sole cached store. The two- and three-call plans require enough poll count and capacity for every original frame, and clear the caller-rooted suffix through the largest of those windows. Their read helper returns a scalar `Value`, with `EMPTY` as a miss, rather than constructing a tagged aggregate result. Every guard and read precedes a transfer's store, so fallback never repeats an observable effect. The original bytecode and its exception positions remain available on every miss.
+
+`Return` from a frame with none of `ENTRY`, `CONSTRUCT` or `TAIL` set pops it, writes the value into the caller's `return_dst` and resumes the caller in place. The loop passes an already popped uncommon frame directly to `finish_popped_return`; suspension and native tail-call completion enter it through `finish_return`. This applies the constructor's receiver rule (a non-object result yields the receiver), teaches the `New` site its receiver size, returns through the frames a tail call left, or leaves the loop at an entry frame. Calls, returns and suspension share one continuation for a resuming completion, carrying only its value, destination and PC: the loop loads the caller and its unit once, restores its root range, and only then writes the result. `TailCall` does not reuse the frame; the compiler emits no tail call.
 
 Rust re-enters JavaScript through `vm::call` and `vm::construct`: the receiver and arguments are written above `top` (rooted from that point), `call_from_rust` pushes an `ENTRY` frame and runs a nested `run_at` on the frames above its own. Each re-entry counts against a native-stack budget (`NATIVE_STACK_BUDGET`, 1 MiB measured from stack addresses, or a depth limit the embedder sets for a host whose stack cannot be measured); past it the call throws `InternalError: stack overflow`.
 
 ### The size gate
 
-`run_at` stays under 16,384 bytes, read with `nm --size-sort` on the release `qjs` (symbol `oxide_core::vm::interp::run_at`). It is 15,226 bytes. A change that crosses the gate moves code out of line before it merges; see [Execution principles](principles.md).
+`run_at` stays under 16,384 bytes, read with `nm --size-sort` on the release `qjs` (symbol `oxide_core::vm::interp::run_at`). Measure each build; size depends on the toolchain and profile. A change that crosses the gate moves code out of line before it merges; see [Execution principles](principles.md).
 
 ## Inline caches
 
 Each cache site has one 16-byte `IcEntry` (`w0`–`w3`) in the `IcStore`. The store lives in the `Heap`, beside the register file, rather than in a `CodeUnit`: the loop holds the unit's code borrowed across every heap call, and the collector prunes every entry that names a dead shape, object or cell after each marking, before an index is recycled. Entries are weak.
 
-`CodeBuilder::finish` numbers a unit's sites: the named-property sites first in instruction order (0 to 254 in `c`; the rest share the reserved site 255, which is never filled), then the global forms (`b | c << 8`), then `New` (`imm`). `Runtime::publish` reserves the unit's entries from its `ic_base`.
+`CodeBuilder::finish` numbers a unit's sites: named-property and `NewObjectLit` sites first in instruction order (0 to 254 in `c`; the rest share the reserved site 255, which is never filled), then the global forms (`b | c << 8`), then `New` (`imm`). `Runtime::publish` reserves the unit's entries from its `ic_base`.
 
 | Kind | Opcodes | Entry | Hit |
 | --- | --- | --- | --- |
@@ -71,18 +77,36 @@ Each cache site has one 16-byte `IcEntry` (`w0`–`w3`) in the `IcStore`. The st
 | Set | `SetField` | shape before, shape after, slot, validity cell | same shape: a slot store; transition: the shape matches, the slot is within the object's reserved range, the object is extensible and not used as a prototype, and the chain's cell holds; then the new shape and the store |
 | Global | `GetGlobal`, `GetGlobalOrUndefined`, `SetGlobal` | global generation, slot, property flags, holder | one compare of the heap's `global_generation` and a load (`SetGlobal` also checks `WRITABLE`) |
 | Construct | `New` | constructor shape, `prototype` slot, receiver slots | the constructor's shape matches: its `prototype` slot read live, the receiver allocated with the learned slot count |
+| Literal | `NewObjectLit` | final shape, learned by `FinishObjectLit` | allocate a fresh object with known slots; `InitField` writes each value after its evaluation |
 
 Details of the hit paths:
 
 - **Tagged `GetField` entries.** `LENGTH_TAG` reads an array's stored length or a string's unit count with no shape to compare; `STRING_RECEIVER_TAG` caches a property found on `%String.prototype%` or above, guarded by that prototype chain's cell.
-- **Polymorphic and megamorphic sites.** A `GetField` or `SetField` site is monomorphic until a second shape arrives, then links a row of four entries (`POLY`) that the out-of-line path (`property::get_cached`, `property::set_cached`) probes in order, then turns megamorphic. A megamorphic `GetField` site probes a shared direct-mapped table of 4,096 entries keyed by receiver shape and key, and fills it from its misses.
+- **Polymorphic and megamorphic sites.** A `GetField` or `SetField` site is monomorphic until a second shape arrives, then keeps four shapes in an out-of-line row (`POLY`). Its most recent successful entry also occupies the inline slot; a row hit promotes that entry, retaining all its original guards. A lazy side table links sites to rows. A fifth shape turns the site megamorphic. A megamorphic `GetField` site probes a shared direct-mapped table of 4,096 entries keyed by receiver shape and key, and fills it from its misses.
 - **What is never cached.** Accessors are not cached at `GetField`; a dictionary-mode receiver is never cached, while a prototype hit on a dictionary-mode holder is (any change to a prototype clears its cell). A transition is cached only when no prototype has the key as an accessor or read-only property.
 - **Globals.** Every insert, remove or reflag on the global object's dictionary bumps `global_generation`; a value write does not. A wrap of the generation clears every global entry. A miss looks up the global lexical environment first, then the global object's own data property.
 - **Construction.** A constructed receiver or empty object literal reserves at least four slots. When a constructor's frame returns to its `New`, `learn_receiver_size` raises the entry's slot count to the receiver shape's width (capped at twice the dictionary threshold), so the next construction reserves what the constructor added.
 
 Element access has no cache: `GetElem` and `SetElem` read and write an array's or ordinary object's dense elements inline for a non-negative `Int32` key, and a typed array's through `typed::fast_get` and `fast_set`. A hole is filled inline only while no object used as a prototype has an index property or is exotic (`Heap::holes_writable`).
 
-With the `ic-stats` feature (and in debug builds) the store counts hits, polymorphic hits, fills and unfilled misses per kind, misses per site and iteration starts; `qjs --ic-stats` prints `Runtime::ic_report` at exit. Release builds without the feature carry no counter.
+The lowering marks an adjacent prefix increment and element read with
+`IncGetElem`. It consumes the read only for a non-overflowing `Int32`
+increment and a present dense element. Coercion, holes and other receivers
+execute the original operations at their original PCs.
+
+Constant array literals of at least two elements use `NewArrayK`: allocate a
+fresh array, then copy immutable values from a consecutive pool range. A
+straight-line object literal with two to sixteen unique, non-index string
+keys uses `NewObjectLit`, `InitField` and `FinishObjectLit`. Its weak literal
+cache stores the final shape only after the definitions complete. A miss
+defines each property after evaluating its value, preserving allocation and
+exception order; a hit initializes known slots. The object allocation still
+precedes value evaluation.
+Duplicate or computed keys, methods, spreads, prototype definitions and
+control-flow joins use the general definition path. Literal initialization
+stays outside the hot loop.
+
+With the `ic-stats` feature (and in debug builds) the store counts inline hits (including the latest shape of a polymorphic site), out-of-line row hits, fills and unfilled misses per kind, misses per site and iteration starts; `qjs --ic-stats` prints `Runtime::ic_report` at exit. Release builds without the feature carry no counter.
 
 ## Iteration
 

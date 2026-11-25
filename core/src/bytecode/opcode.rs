@@ -20,6 +20,8 @@ pub enum Format {
     ABInt,
     /// `a` register, `imm` a constant-pool index.
     AConst,
+    /// `a` register, `imm` the first constant, `b | c << 8` the count.
+    AConstRange,
     /// `imm` a `PropertyKey`.
     Key,
     /// `a` register, `imm` a `PropertyKey`.
@@ -510,6 +512,17 @@ opcodes! {
     /// `Jmp` to a target at or before itself: a loop's back-edge, which
     /// counts down to the next interrupt poll.
     JmpBack: Jump,
+    /// `a = ++b`, with a hint to consume a following dense `GetElem`.
+    /// Misses execute that instruction normally, preserving its fault PC.
+    IncGetElem: AB,
+    /// A fresh array filled from a consecutive run of primitive constants.
+    NewArrayK: AConstRange,
+    /// A fresh object with `imm` slots and a weak final-shape cache in `c`.
+    NewObjectLit: ACount,
+    /// Defines key `imm` from `b`, or initializes known slot `c`, on `a`.
+    InitField: ABKey,
+    /// Publishes the completed shape at the NewObjectLit instruction `imm`.
+    FinishObjectLit: AInt,
 }
 
 /// The flags of `CheckGlobalVar`, `DeclareGlobal` and `DefineGlobal`, in

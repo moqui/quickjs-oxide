@@ -6,7 +6,7 @@
 
 use oxide_core::bytecode::Opcode;
 use oxide_core::heap::gc::HeapLimits;
-use oxide_core::vm::ic::{IcEntry, IcKind, IcStats, MEGA_TAG, POLY_TAG};
+use oxide_core::vm::ic::{IcEntry, IcKind, IcStats, MEGA_TAG};
 use oxide_core::{Intrinsic, PropertyFlags, Runtime, Value};
 
 use super::lower_script;
@@ -277,15 +277,87 @@ fn polymorphic_rows_and_the_megamorphic_mark() {
          getX(a); getX(b);",
     );
     let site = session.site("getX", Opcode::GetField, 0);
-    assert_eq!(session.entry(site).w0, POLY_TAG);
+    assert!(session.runtime.heap().ics().poly_row(site).is_some());
     let before = session.stats();
     assert_eq!(session.run("print(getX(a) + getX(b));"), "3\n");
     let after = session.stats();
     counted(poly_hits(&before, &after, IcKind::Get), |count| count == 2);
+    let before = session.stats();
+    assert_eq!(session.run("for (var i = 0; i < 100; i++) getX(b);"), "");
+    let after = session.stats();
+    counted(hits(&before, &after, IcKind::Get), |count| count == 100);
+    counted(poly_hits(&before, &after, IcKind::Get), |count| count == 0);
     assert_eq!(session.run("print(getX(c) + getX(d));"), "7\n");
-    assert_eq!(session.entry(site).w0, POLY_TAG);
+    assert!(session.runtime.heap().ics().poly_row(site).is_some());
     assert_eq!(session.run("print(getX(e), getX(a));"), "5 1\n");
     assert_eq!(session.entry(site).w0, MEGA_TAG);
+}
+
+#[test]
+fn promoted_polymorphic_entries_keep_prototype_guards() {
+    let mut session = Session::new();
+    assert_eq!(
+        session.run(
+            "var proto = { x: 1 };
+         var a = Object.create(proto), b = Object.create(proto);
+         a.a = 1; b.b = 2;
+         function read(o) { return o.x; }
+         read(a); read(b); read(b);"
+        ),
+        ""
+    );
+    let site = session.site("read", Opcode::GetField, 0);
+    assert!(session.runtime.heap().ics().poly_row(site).is_some());
+    assert_eq!(
+        session.run(
+            "Object.defineProperty(proto, 'x', { get: function () { return 7; } });
+         print(read(b), read(a));"
+        ),
+        "7 7\n"
+    );
+}
+
+#[test]
+fn literal_shapes_are_weak_and_refill_after_collection() {
+    let mut session = Session::new();
+    assert_eq!(
+        session.run("function literal() { return { left: 1, right: 2 }; } var keep = literal();"),
+        ""
+    );
+    let site = session.site("literal", Opcode::NewObjectLit, 0);
+    assert!(session.entry(site).is_filled());
+    let before = session.stats();
+    assert_eq!(session.run("keep = literal();"), "");
+    counted(hits(&before, &session.stats(), IcKind::Literal), |n| n == 1);
+    session.run("keep = undefined;");
+    session.runtime.heap_mut().collect();
+    assert!(session.entry(site).is_empty());
+    assert_eq!(
+        session.run("keep = literal(); print(keep.left, keep.right, Object.keys(keep).join());"),
+        "1 2 left,right\n"
+    );
+    assert!(session.entry(site).is_filled());
+}
+
+#[test]
+fn an_interrupted_literal_does_not_publish_a_partial_shape() {
+    let mut session = Session::new();
+    assert_eq!(
+        session.run(
+            "var log = [];
+         function value(fail) { log.push(1); if (fail) throw new Error('stop'); return 3; }
+         function literal(fail) { return { left: value(fail), right: (log.push(2), 4) }; }
+         try { literal(true); } catch(e) { print(e.message, log.join()); }"
+        ),
+        "stop 1\n"
+    );
+    let site = session.site("literal", Opcode::NewObjectLit, 0);
+    assert!(session.entry(site).is_empty());
+    assert_eq!(
+        session.run("var keep = literal(false); print(keep.left, keep.right, log.join());"),
+        "3 4 1,1,2\n"
+    );
+    assert!(session.entry(site).is_filled());
 }
 
 /// A closure is a header and a function record until an own-property

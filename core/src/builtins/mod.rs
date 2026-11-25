@@ -1470,8 +1470,20 @@ pub(crate) fn install_performance(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         let now = native_function(cx, Native::PerformanceNow)?;
         define(cx, performance, "now", Value::object(now), builtin)?;
         let origin = cx.host.hooks.now_ms() - agent::monotonic_ms();
-        define(cx, performance, "timeOrigin", Value::number(origin), PropertyFlags::data(false, true, true))?;
-        define(cx, global, "performance", Value::object(performance), PropertyFlags::data(true, true, true))
+        define(
+            cx,
+            performance,
+            "timeOrigin",
+            Value::number(origin),
+            PropertyFlags::data(false, true, true),
+        )?;
+        define(
+            cx,
+            global,
+            "performance",
+            Value::object(performance),
+            PropertyFlags::data(true, true, true),
+        )
     })();
     cx.heap.roots().truncate(mark);
     result

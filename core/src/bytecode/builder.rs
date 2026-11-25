@@ -87,6 +87,11 @@ impl CodeBuilder {
         self.push(Format::AConst, Insn::new(op, a, 0, 0, index))
     }
 
+    pub fn a_const_range(&mut self, op: Opcode, a: u8, first: u32, count: u16) -> u32 {
+        let [b, c] = count.to_le_bytes();
+        self.push(Format::AConstRange, Insn::new(op, a, b, c, first))
+    }
+
     #[track_caller]
     pub fn key(&mut self, op: Opcode, key: PropertyKey) -> u32 {
         self.push(Format::Key, Insn::new(op, 0, 0, 0, key.raw()))
@@ -176,6 +181,18 @@ impl CodeBuilder {
 
     pub fn code(&self) -> &[Insn] {
         &self.code
+    }
+
+    /// Keeps both PCs and their source/handler positions. The interpreter
+    /// may consume the read only when neither operation can throw or call JS.
+    pub fn hint_increment_element(&mut self) {
+        let n = self.code.len();
+        if n >= 2 {
+            let (increment, read) = (self.code[n - 2], self.code[n - 1]);
+            if increment.op == Opcode::Inc && read.op == Opcode::GetElem && increment.a == read.c {
+                self.code[n - 2].op = Opcode::IncGetElem;
+            }
+        }
     }
 
     /// Turns every `Jmp` whose target is at or before it into `JmpBack`,
@@ -270,7 +287,12 @@ fn key_table(code: &mut [Insn]) -> Box<[crate::PropertyKey]> {
 /// reserved and never filled. The global forms follow in `b | c << 8`, with
 /// the same rule at [`GLOBAL_NO_SITE`]; `New` sites come last, in `imm`.
 fn number_sites(code: &mut [Insn]) -> u32 {
-    let is_field = |insn: &Insn| matches!(IcKind::of(insn.op), Some(IcKind::Get | IcKind::Set));
+    let is_field = |insn: &Insn| {
+        matches!(
+            IcKind::of(insn.op),
+            Some(IcKind::Get | IcKind::Set | IcKind::Literal)
+        )
+    };
     let is_global = |insn: &Insn| IcKind::of(insn.op) == Some(IcKind::Global);
     let fields = code.iter().filter(|insn| is_field(insn)).count() as u32;
     let reserved = u32::from(FIELD_NO_SITE);

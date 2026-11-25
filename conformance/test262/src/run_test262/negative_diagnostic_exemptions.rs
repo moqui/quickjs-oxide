@@ -247,9 +247,10 @@ mod tests {
             )
             .is_err()
         );
-        let fork = NegativeDiagnosticExemptions::parse(
-            &source.replace("legacy-r3eg-b-phase-type-only", "fork-feature-phase-type-only"),
-        )
+        let fork = NegativeDiagnosticExemptions::parse(&source.replace(
+            "legacy-r3eg-b-phase-type-only",
+            "fork-feature-phase-type-only",
+        ))
         .unwrap();
         assert!(fork.is_fork_feature(std::path::Path::new("test/a.js"), crate::Variant::Sloppy));
         assert!(!parsed.is_fork_feature(std::path::Path::new("test/a.js"), crate::Variant::Sloppy));

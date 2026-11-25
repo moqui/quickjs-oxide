@@ -40,6 +40,32 @@ fn instruction_is_eight_bytes() {
     }
 }
 
+#[test]
+fn constant_array_ranges_are_validated_without_wrapping() {
+    for (first, count) in [(1, 2), (u32::MAX, 2), (0, u16::MAX)] {
+        let mut code = unit(8, |b| {
+            b.a_const_range(Opcode::NewArrayK, 5, first, count);
+            b.op(Opcode::ReturnUndefined);
+        });
+        code.constant_count = 2;
+        assert_eq!(validate(&code), Err(ValidateErrorKind::Constant(first)));
+    }
+}
+
+#[test]
+fn literal_finish_names_its_creator_and_object_register() {
+    let make = |register, target| {
+        unit(8, |b| {
+            b.a_count(Opcode::NewObjectLit, 5, 2);
+            b.a_int(Opcode::FinishObjectLit, register, target);
+            b.op(Opcode::ReturnUndefined);
+        })
+    };
+    assert_eq!(validate(&make(5, 0)), Ok(()));
+    assert_eq!(validate(&make(6, 0)), Err(ValidateErrorKind::Target(0)));
+    assert_eq!(validate(&make(5, 999)), Err(ValidateErrorKind::Target(999)));
+}
+
 /// Builds every opcode through the builder with format-specific operands,
 /// publishes the unit and checks each disassembled line.
 #[test]
@@ -48,7 +74,12 @@ fn every_opcode_round_trips_through_the_disassembler() {
     let mut builder = CodeBuilder::new();
     let mut expected = Vec::new();
     // The spill opcodes need a spill scope: `spill_scope_accesses_validate`.
-    let spill = [Opcode::NewSpill, Opcode::LoadSlot, Opcode::StoreSlot];
+    let spill = [
+        Opcode::NewSpill,
+        Opcode::LoadSlot,
+        Opcode::StoreSlot,
+        Opcode::FinishObjectLit,
+    ];
     for &op in Opcode::ALL.iter().filter(|op| !spill.contains(op)) {
         // Registers: this, p0, p1, l0, l1, t0 = 5, t1 = 6, ...
         let operands = match op.format() {
@@ -79,6 +110,10 @@ fn every_opcode_round_trips_through_the_disassembler() {
             Format::AConst => {
                 builder.a_const(op, 6, 1);
                 "t1, k1".into()
+            }
+            Format::AConstRange => {
+                builder.a_const_range(op, 5, 1, 2);
+                "t0, k1, 2".into()
             }
             Format::Key => {
                 builder.key(op, key);
@@ -162,7 +197,7 @@ fn every_opcode_round_trips_through_the_disassembler() {
         lines.next(),
         Some(
             "every: params 2, locals 2, registers 400, constants 3, children 1, this slots 0, \
-             cache sites 6"
+             cache sites 7"
         )
     );
     for (pc, (op, operands)) in expected.iter().enumerate() {

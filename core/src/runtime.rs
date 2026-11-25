@@ -760,9 +760,15 @@ impl Runtime {
         let _ = writeln!(
             out,
             "{:<10}{:>14}{:>14}{:>14}{:>14}{:>9}",
-            "ic", "mono hits", "poly hits", "fills", "unfilled", "hit %"
+            "ic", "inline hits", "poly hits", "fills", "unfilled", "hit %"
         );
-        let kinds = [IcKind::Get, IcKind::Set, IcKind::Global, IcKind::Construct];
+        let kinds = [
+            IcKind::Get,
+            IcKind::Set,
+            IcKind::Global,
+            IcKind::Construct,
+            IcKind::Literal,
+        ];
         for kind in kinds {
             let k = kind as usize;
             let hits = stats.mono_hits[k] + stats.poly_hits[k];

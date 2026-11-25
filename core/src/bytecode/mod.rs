@@ -10,6 +10,7 @@
 //! or job reaches it.
 
 pub mod builder;
+pub(crate) mod call_plan;
 pub mod disasm;
 pub mod opcode;
 pub mod validate;
@@ -65,7 +66,7 @@ impl Insn {
     #[inline]
     pub const fn site(self) -> Option<u32> {
         match self.op {
-            Opcode::GetField | Opcode::SetField => Some(self.c as u32),
+            Opcode::GetField | Opcode::SetField | Opcode::NewObjectLit => Some(self.c as u32),
             Opcode::GetGlobal | Opcode::GetGlobalOrUndefined | Opcode::SetGlobal => {
                 Some(self.b as u32 | (self.c as u32) << 8)
             }
@@ -407,14 +408,27 @@ impl std::ops::Deref for UnitRef<'_> {
 /// every id.
 #[derive(Default)]
 pub struct CodeStore {
-    units: Vec<CodeUnit>,
+    units: Vec<StoredUnit>,
     overflow: Overflow,
+}
+
+/// A published unit with the short completion planned for it at publication.
+struct StoredUnit {
+    unit: CodeUnit,
+    call: call_plan::CallPlan,
+}
+
+impl StoredUnit {
+    fn new(unit: CodeUnit) -> Self {
+        let call = call_plan::CallPlan::of(&unit);
+        StoredUnit { unit, call }
+    }
 }
 
 /// Units published while the store was shared, in id order after the
 /// settled ones: `CHUNKS` chunks of `CHUNK` cells, each filled once.
 struct Overflow {
-    chunks: [std::cell::OnceCell<Box<[std::cell::OnceCell<CodeUnit>]>>; CHUNKS],
+    chunks: [std::cell::OnceCell<Box<[std::cell::OnceCell<StoredUnit>]>>; CHUNKS],
     len: std::cell::Cell<u32>,
 }
 
@@ -436,7 +450,7 @@ impl Default for Overflow {
 
 impl Overflow {
     #[inline]
-    fn get(&self, index: usize) -> Option<&CodeUnit> {
+    fn get(&self, index: usize) -> Option<&StoredUnit> {
         self.chunks
             .get(index / CHUNK)?
             .get()?
@@ -466,7 +480,7 @@ impl CodeStore {
         let id = (self.units.len() + index) as u32;
         let cells = self.overflow.chunks[index / CHUNK]
             .get_or_init(|| (0..CHUNK).map(|_| std::cell::OnceCell::new()).collect());
-        if cells[index % CHUNK].set(unit).is_err() {
+        if cells[index % CHUNK].set(StoredUnit::new(unit)).is_err() {
             unreachable!("an overflow cell is filled once");
         }
         self.overflow.len.set(index as u32 + 1);
@@ -487,7 +501,7 @@ impl CodeStore {
             .ok()
             .filter(|&id| id < DYNAMIC)
             .expect("code store overflow");
-        self.units.push(unit);
+        self.units.push(StoredUnit::new(unit));
         CodeUnitId(id)
     }
 
@@ -526,8 +540,11 @@ impl CodeStore {
             return None;
         }
         match self.units.get(id.0 as usize) {
-            Some(unit) => Some(unit),
-            None => self.overflow.get(id.0 as usize - self.units.len()),
+            Some(entry) => Some(&entry.unit),
+            None => self
+                .overflow
+                .get(id.0 as usize - self.units.len())
+                .map(|entry| &entry.unit),
         }
     }
 
@@ -537,15 +554,28 @@ impl CodeStore {
         debug_assert!(!id.is_dynamic(), "a unit of the code store");
         let index = id.0 as usize;
         if index >= self.units.len() {
-            return self.get_overflow(id);
+            return &self.get_overflow(id).unit;
         }
-        &self.units[index]
+        &self.units[index].unit
     }
 
     #[cold]
     #[inline(never)]
-    fn get_overflow(&self, id: CodeUnitId) -> &CodeUnit {
-        self.lookup(id).expect("a published unit")
+    fn get_overflow(&self, id: CodeUnitId) -> &StoredUnit {
+        self.overflow
+            .get(id.0 as usize - self.units.len())
+            .expect("a published unit")
+    }
+
+    #[inline]
+    pub(crate) fn call_entry(&self, id: CodeUnitId) -> (&CodeUnit, &call_plan::CallPlan) {
+        debug_assert!(!id.is_dynamic(), "a static call plan");
+        let index = id.0 as usize;
+        let entry = match self.units.get(index) {
+            Some(entry) => entry,
+            None => self.get_overflow(id),
+        };
+        (&entry.unit, &entry.call)
     }
 
     pub fn len(&self) -> usize {
