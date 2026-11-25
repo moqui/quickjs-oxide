@@ -1,6 +1,8 @@
 //! The `Runtime`: the heap, the code store and the realm. Every operation is
 //! `fn(&mut Runtime, …)`; there is no shared interior mutability.
 
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
+
 use crate::PropertyKey;
 use crate::bytecode::{self, CodeStore, CodeUnit, CodeUnitId, ValidateError};
 use crate::heap::atom::KeyKind;
@@ -287,17 +289,17 @@ pub struct Realm {
     global: ObjectId,
     /// Cells so the builtins can record the intrinsics they create while the
     /// realm is shared (installation runs with a `Cx`); each is a fixed root.
-    intrinsics: [std::cell::Cell<ObjectId>; Intrinsic::COUNT],
+    intrinsics: [core::cell::Cell<ObjectId>; Intrinsic::COUNT],
     pub(crate) names: Names,
     pub(crate) symbols: WellKnown,
     /// The private key under which a home object keeps its class's brand.
     pub(crate) brand: SymbolId,
     /// `%RegExp.prototype%`'s flag accessors as installed, for the `flags`
     /// getter's fast path.
-    pub(crate) regexp_flags: std::cell::Cell<Option<crate::builtins::RegExpFlagCache>>,
+    pub(crate) regexp_flags: core::cell::Cell<Option<crate::builtins::RegExpFlagCache>>,
     /// The shape `regexp_flags` holds for, read alone where a fast path
     /// first checks it.
-    pub(crate) regexp_flags_shape: std::cell::Cell<Option<crate::value::ShapeId>>,
+    pub(crate) regexp_flags_shape: core::cell::Cell<Option<crate::value::ShapeId>>,
 }
 
 impl Realm {
@@ -321,8 +323,8 @@ pub struct Runtime {
     pub(crate) heap: Box<Heap>,
     /// The units published before the program runs. Beside the heap, not in
     /// it: the main loop borrows the running unit's code across heap calls.
-    pub(crate) code: std::rc::Rc<CodeStore>,
-    pub(crate) realm: std::rc::Rc<Realm>,
+    pub(crate) code: alloc::rc::Rc<CodeStore>,
+    pub(crate) realm: alloc::rc::Rc<Realm>,
     pub(crate) host: Box<Services>,
 }
 
@@ -380,8 +382,31 @@ pub struct ThrownSummary {
 
 impl Runtime {
     pub fn new(options: impl Into<RuntimeOptions>) -> Result<Runtime, HeapError> {
-        let options = options.into();
+        Self::initialize(options.into(), None)
+    }
+
+    /// Installs platform services before realm initialization, including any
+    /// collections triggered by the initial allocation budget.
+    pub fn with_host(
+        options: impl Into<RuntimeOptions>,
+        hooks: Box<dyn crate::host::Host>,
+    ) -> Result<Runtime, HeapError> {
+        Self::initialize(options.into(), Some(hooks))
+    }
+
+    fn initialize(
+        options: RuntimeOptions,
+        mut hooks: Option<Box<dyn crate::host::Host>>,
+    ) -> Result<Runtime, HeapError> {
+        let clock = hooks
+            .as_mut()
+            .map_or(crate::host::Monotonic::NONE, |hooks| hooks.monotonic());
+        let shared = hooks.as_mut().and_then(|hooks| hooks.shared_atoms());
         let mut heap = Heap::new(options.heap);
+        heap.gc.clock = clock;
+        if let Some(shared) = shared {
+            heap.strings.set_shared(shared);
+        }
         let reserved = heap.bytes();
         heap.gc
             .configure(options.min_heap, options.growth, reserved);
@@ -465,18 +490,23 @@ impl Runtime {
         }
         let realm = Realm {
             global,
-            intrinsics: intrinsics.map(std::cell::Cell::new),
+            intrinsics: intrinsics.map(core::cell::Cell::new),
             names,
             symbols,
             brand,
-            regexp_flags: std::cell::Cell::new(None),
-            regexp_flags_shape: std::cell::Cell::new(None),
+            regexp_flags: core::cell::Cell::new(None),
+            regexp_flags_shape: core::cell::Cell::new(None),
         };
+        let mut services = Services::default();
+        if let Some(mut hooks) = hooks {
+            services.seed_random(hooks.random_seed());
+            services.hooks = hooks;
+        }
         let mut runtime = Runtime {
             heap: Box::new(heap),
-            code: std::rc::Rc::new(CodeStore::default()),
-            realm: std::rc::Rc::new(realm),
-            host: Box::default(),
+            code: alloc::rc::Rc::new(CodeStore::default()),
+            realm: alloc::rc::Rc::new(realm),
+            host: Box::new(services),
         };
         let out_of_memory = crate::builtins::install(&mut runtime.cx())?;
         runtime.set_intrinsic(Intrinsic::OutOfMemoryError, out_of_memory);
@@ -499,7 +529,7 @@ impl Runtime {
     pub(crate) fn cx(&mut self) -> Cx<'_> {
         // Between entries the store is this runtime's alone: what a host
         // function published joins the units the loop reads directly.
-        if let Some(code) = std::rc::Rc::get_mut(&mut self.code) {
+        if let Some(code) = alloc::rc::Rc::get_mut(&mut self.code) {
             code.settle();
         }
         Cx {
@@ -535,10 +565,18 @@ impl Runtime {
         self.host.can_block = can_block;
     }
 
+    /// Installs a process-lifetime shared-memory ordering and wait service.
+    /// Every runtime sharing buffers must use the same coordinator.
+    pub fn set_waiter(&mut self, waiter: &'static dyn crate::vm::waiter::Waiter) {
+        self.host.waiter = Some(waiter);
+        self.host.can_block = true;
+    }
+
     /// Installs the embedder's hooks and seeds `Math.random` from
     /// [`Host::random_seed`](crate::host::Host::random_seed).
     pub fn set_host(&mut self, mut hooks: Box<dyn crate::host::Host>) {
         let seed = hooks.random_seed();
+        self.heap.gc.clock = hooks.monotonic();
         self.host.seed_random(seed);
         self.host.hooks = hooks;
     }
@@ -570,7 +608,7 @@ impl Runtime {
     /// The output captured since the last call.
     pub fn take_output(&mut self) -> String {
         match &mut self.host.output {
-            Output::Capture(text) => std::mem::take(text),
+            Output::Capture(text) => core::mem::take(text),
             Output::Stdout => String::new(),
         }
     }
@@ -716,10 +754,10 @@ impl Runtime {
     /// live as long as the runtime (in the code store, where the loop runs
     /// them as a plain borrow): the program and its modules.
     pub fn compiler(&mut self) -> crate::vm::compile::Compiler<'_> {
-        if std::rc::Rc::get_mut(&mut self.code).is_none() {
+        if alloc::rc::Rc::get_mut(&mut self.code).is_none() {
             return crate::vm::compile::Compiler::owned(&mut self.heap, &self.code, &self.realm);
         }
-        let code = std::rc::Rc::get_mut(&mut self.code).expect("an unshared code store");
+        let code = alloc::rc::Rc::get_mut(&mut self.code).expect("an unshared code store");
         crate::vm::compile::Compiler::unique(&mut self.heap, code, &self.realm)
     }
 
@@ -751,7 +789,7 @@ impl Runtime {
     /// the `worst` sites with the most misses (unit name, instruction index,
     /// key).
     pub fn ic_report(&self, worst: usize) -> Option<String> {
-        use std::fmt::Write;
+        use core::fmt::Write;
 
         use crate::vm::ic::IcKind;
         let ics = self.heap.ics();
@@ -815,7 +853,7 @@ impl Runtime {
                 }
             }
         }
-        sites.sort_by_key(|&(misses, id, pc, _)| (std::cmp::Reverse(misses), id, pc));
+        sites.sort_by_key(|&(misses, id, pc, _)| (core::cmp::Reverse(misses), id, pc));
         for &(misses, id, pc, insn) in sites.iter().take(worst) {
             let unit = self.units().get(id);
             let name = if unit.debug.name.is_empty() {
@@ -982,7 +1020,7 @@ impl Runtime {
     /// are the same in every runtime. Returns the setting before. An
     /// embedder that sets it clears it before it handles run-time data.
     pub fn set_share_atoms(&mut self, share: bool) -> bool {
-        std::mem::replace(&mut self.heap.share_atoms, share)
+        core::mem::replace(&mut self.heap.share_atoms, share)
     }
 
     /// What every part of the runtime holds, read without a collection. Its
@@ -996,15 +1034,15 @@ impl Runtime {
             code.static_bytes += unit.own_bytes();
             if unit.owns_shared() {
                 code.static_bytes += unit.shared_bytes();
-            } else if bodies.insert(std::sync::Arc::as_ptr(&unit.body)) {
+            } else if bodies.insert(alloc::sync::Arc::as_ptr(&unit.body)) {
                 code.shared_body_bytes += unit.shared_bytes();
             }
         }
         for (_, unit) in self.units().all() {
             code.units += 1;
             code.instructions += unit.code.len();
-            code.instruction_bytes += std::mem::size_of_val(&*unit.code);
-            code.position_bytes += std::mem::size_of_val(&*unit.debug.positions);
+            code.instruction_bytes += core::mem::size_of_val(&*unit.code);
+            code.position_bytes += core::mem::size_of_val(&*unit.debug.positions);
             code.source_bytes += unit.source.as_ref().map_or(0, |source| source.len());
         }
         report
@@ -1065,8 +1103,8 @@ pub struct AtomCensus {
     pub units: [usize; 8],
 }
 
-impl std::fmt::Display for AtomCensus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for AtomCensus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let [
             total,
             builtin,
@@ -1102,12 +1140,6 @@ impl std::fmt::Display for AtomCensus {
     }
 }
 
-std::thread_local! {
-    /// The atom texts of a fresh runtime, made once a thread.
-    static BUILTIN_TEXTS: std::cell::OnceCell<crate::heap::hash::FxHashSet<Vec<u16>>> =
-        const { std::cell::OnceCell::new() };
-}
-
 impl Runtime {
     /// Classifies the live atoms ([`AtomCensus`]). A probe: it walks every
     /// string, unit and shape.
@@ -1120,17 +1152,9 @@ impl Runtime {
                 .map(|id| heap.strings.get(id.0).repr().units().collect())
                 .collect()
         }
-        // A thread being torn down has no slot left: no builtin texts then.
-        let builtin = BUILTIN_TEXTS
-            .try_with(|texts| {
-                texts
-                    .get_or_init(|| {
-                        Runtime::new(crate::HeapLimits::default())
-                            .map(|fresh| atom_texts(&fresh))
-                            .unwrap_or_default()
-                    })
-                    .clone()
-            })
+        // A fresh runtime's atoms, made for each census (a probe).
+        let builtin = Runtime::new(crate::HeapLimits::default())
+            .map(|fresh| atom_texts(&fresh))
             .unwrap_or_default();
         let mut image_code = FxHashSet::default();
         let mut static_code = FxHashSet::default();
@@ -1151,7 +1175,7 @@ impl Runtime {
             } else {
                 image_units += 1;
                 image_key_entries += unit.keys.len();
-                if std::sync::Arc::strong_count(&unit.keys) == 1 {
+                if alloc::sync::Arc::strong_count(&unit.keys) == 1 {
                     own_key_entries += unit.keys.len();
                 }
                 name(&mut image_code, unit);
@@ -1185,7 +1209,7 @@ impl Runtime {
             image_units,
             image_key_entries,
             own_key_entries,
-            process: crate::heap::shared::stats(),
+            process: self.heap.strings.shared().stats(),
             ..AtomCensus::default()
         };
         let strings = &self.heap.strings;

@@ -17,8 +17,9 @@
 //! lists, every cell downstream. A shape caches its prototype's cell; the
 //! prototype IC records `(holder, slot, cell)` and tests one boolean.
 
-use std::cell::{Cell, OnceCell};
-use std::fmt;
+use alloc::{boxed::Box, vec, vec::Vec};
+use core::cell::{Cell, OnceCell};
+use core::fmt;
 
 use crate::heap::arena::Record;
 use crate::heap::atom::{KeyKind, PropertyKey};

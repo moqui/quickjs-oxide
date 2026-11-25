@@ -21,8 +21,9 @@
 //! [`ObjectKind::HostExotic`]: crate::ObjectKind::HostExotic
 //! [`ObjectKind::is_exotic`]: crate::ObjectKind::is_exotic
 
-use std::any::Any;
-use std::rc::Rc;
+use alloc::rc::Rc;
+use alloc::vec::Vec;
+use core::any::Any;
 
 use super::object::Descriptor;
 use super::{Cx, Throw};
@@ -133,8 +134,8 @@ pub struct HostExotic {
     pub(crate) data: Rc<dyn Any>,
 }
 
-impl std::fmt::Debug for HostExotic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for HostExotic {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("HostExotic")
             .field("class", &self.class)
             .finish_non_exhaustive()

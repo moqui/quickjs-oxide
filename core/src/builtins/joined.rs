@@ -7,6 +7,7 @@ use crate::heap::string::StringRepr;
 use crate::value::{StringId, Value};
 use crate::vm::error;
 use crate::vm::{Cx, Throw};
+use alloc::vec::Vec;
 
 pub(crate) enum Joined {
     Bytes(Vec<u8>),
@@ -107,7 +108,7 @@ impl Joined {
         &mut self,
         cx: &Cx<'_>,
         id: StringId,
-        range: std::ops::Range<usize>,
+        range: core::ops::Range<usize>,
     ) {
         match cx.heap.string(id).repr() {
             StringRepr::OneByte(bytes) => self.push_bytes(&bytes[range]),

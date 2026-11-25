@@ -6,7 +6,10 @@
 //! instance create a plain array. `sort` is QuickJS's `rqsort` with its
 //! comparison and write-back shortcuts.
 
-use std::cmp::Ordering;
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use super::joined::Joined;
 use super::{
@@ -1309,7 +1312,7 @@ pub(crate) fn merge_sort_by(
             buffer[k..k + right - j].copy_from_slice(&values[j..right]);
             left = right;
         }
-        std::mem::swap(values, &mut buffer);
+        core::mem::swap(values, &mut buffer);
         width *= 2;
     }
     Ok(())

@@ -13,6 +13,8 @@
 //! string constants) are held. Before the program runs, its atoms are pinned
 //! for good instead.
 
+use alloc::{boxed::Box, format, string::String, vec::Vec};
+
 use super::native::CallSite;
 use super::{Cx, Throw, error, ops};
 use crate::ErrorKind;
@@ -120,7 +122,7 @@ impl<'a> Compiler<'a> {
         length: u32,
         constructor: bool,
         data: &[Value],
-        body: std::rc::Rc<super::native::HostFn>,
+        body: alloc::rc::Rc<super::native::HostFn>,
     ) -> Result<ObjectId, HeapError> {
         crate::embed::host_function(self.heap, self.realm, name, length, constructor, data, body)
     }
@@ -129,7 +131,7 @@ impl<'a> Compiler<'a> {
     pub fn new_host_object(
         &mut self,
         prototype: Option<ObjectId>,
-        data: std::rc::Rc<dyn std::any::Any>,
+        data: alloc::rc::Rc<dyn core::any::Any>,
     ) -> Result<ObjectId, HeapError> {
         crate::embed::host_object(self.heap, prototype, data)
     }
@@ -408,7 +410,7 @@ impl Compiler<'_> {
         // An image's atoms (its keys, names and string constants) are the
         // same in every runtime that loads it: they go in the process's
         // shared table, while it has room.
-        let sharing = std::mem::replace(&mut self.heap.share_atoms, true);
+        let sharing = core::mem::replace(&mut self.heap.share_atoms, true);
         let result = (|| {
             let mut ids: Vec<CodeUnitId> = Vec::with_capacity(count);
             // Children follow their parent in pre-order and have higher

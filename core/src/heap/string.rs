@@ -6,7 +6,8 @@
 //! flattens on the first use of its units ([`super::Heap::string`]); its
 //! length and width are known without flattening.
 
-use std::cell::{Cell, OnceCell};
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::cell::{Cell, OnceCell};
 
 use super::arena::Record;
 use super::object::NONE;
@@ -91,7 +92,7 @@ pub fn array_index(len: usize, mut units: impl Iterator<Item = u16>) -> Option<u
         return (len == 1).then_some(0);
     }
     let mut value: u64 = 0;
-    for unit in std::iter::once(first).chain(units) {
+    for unit in core::iter::once(first).chain(units) {
         let digit = unit
             .checked_sub(u16::from(b'0'))
             .filter(|digit| *digit <= 9)?;
@@ -292,25 +293,48 @@ impl<'a> StrRef<'a> {
     }
 }
 
-/// A shared atom's record.
-#[inline(always)]
-fn shared_ref(index: u32) -> StrRef<'static> {
-    StrRef::Shared(super::shared::get(index))
-}
-
 /// A runtime's string arena, which also answers for the shared atoms' ids
 /// ([`super::shared::SHARED_BASE`] and above): a shared atom is always live
 /// and marked, and never in the arena.
-#[derive(Default)]
 pub struct Strings {
     arena: super::arena::Arena<StringRecord>,
+    /// The process's shared atoms ([`super::shared`]), the same for every
+    /// runtime that shares code or keys with this one.
+    shared: &'static dyn super::shared::SharedAtoms,
+}
+
+impl Default for Strings {
+    fn default() -> Self {
+        Strings {
+            arena: Default::default(),
+            shared: &super::shared::NO_SHARED,
+        }
+    }
 }
 
 impl Strings {
+    /// The shared table, which names the ids at and above
+    /// [`super::shared::SHARED_BASE`].
+    #[inline(always)]
+    pub fn shared(&self) -> &'static dyn super::shared::SharedAtoms {
+        self.shared
+    }
+
+    /// Installs the shared table, before the first atom is made.
+    pub(crate) fn set_shared(&mut self, shared: &'static dyn super::shared::SharedAtoms) {
+        self.shared = shared;
+    }
+
+    /// A shared atom's record.
+    #[inline(always)]
+    fn shared_ref(&self, index: u32) -> StrRef<'static> {
+        StrRef::Shared(self.shared.get(index))
+    }
+
     #[inline(always)]
     pub fn get(&self, index: u32) -> StrRef<'_> {
         if super::shared::is_shared(index) {
-            return shared_ref(index);
+            return self.shared_ref(index);
         }
         StrRef::Local(self.arena.get(index))
     }
@@ -319,7 +343,7 @@ impl Strings {
     #[inline(always)]
     pub fn len_of(&self, index: u32) -> usize {
         if super::shared::is_shared(index) {
-            return shared_ref(index).len();
+            return self.shared_ref(index).len();
         }
         self.arena.get(index).len()
     }
@@ -328,7 +352,7 @@ impl Strings {
     #[inline(always)]
     pub fn is_one_byte(&self, index: u32) -> bool {
         if super::shared::is_shared(index) {
-            return shared_ref(index).is_one_byte();
+            return self.shared_ref(index).is_one_byte();
         }
         self.arena.get(index).is_one_byte()
     }

@@ -8,6 +8,10 @@
 //! their own work (`sort` with a comparator, `replace` with a function) use the
 //! same re-entrant call.
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+
 pub mod agent;
 mod array;
 mod atomics;
@@ -1469,7 +1473,7 @@ pub(crate) fn install_performance(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         let builtin = PropertyFlags::data(true, false, true);
         let now = native_function(cx, Native::PerformanceNow)?;
         define(cx, performance, "now", Value::object(now), builtin)?;
-        let origin = cx.host.hooks.now_ms() - agent::monotonic_ms();
+        let origin = cx.host.hooks.now_ms() - cx.host.hooks.performance_now_ms();
         define(
             cx,
             performance,

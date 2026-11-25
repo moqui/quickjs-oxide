@@ -4,6 +4,8 @@
 //! Each method asserts (in debug builds) that the opcode has the format it is
 //! built with; the publication validator checks the operand values.
 
+use alloc::{boxed::Box, string::String, vec::Vec};
+
 use super::{Capture, CodeUnit, CodeUnitId, DebugInfo, Format, Handler, Insn, Opcode};
 use crate::heap::atom::PropertyKey;
 use crate::vm::ic::{FIELD_NO_SITE, GLOBAL_NO_SITE, IcKind};
@@ -223,13 +225,13 @@ impl CodeBuilder {
             constant_count: layout.constant_count,
             spill_register: layout.spill_register.unwrap_or(super::NO_SPILL),
             spill_slots: layout.spill_slots,
-            ic_base: std::cell::Cell::new(super::IC_UNRESERVED),
+            ic_base: core::cell::Cell::new(super::IC_UNRESERVED),
             ic_count,
             children: layout.children.into(),
             name_atom: layout.name_atom,
             length: layout.length,
             atoms: Box::new([]),
-            body: std::sync::Arc::new(super::UnitBody {
+            body: alloc::sync::Arc::new(super::UnitBody {
                 handlers: self.handlers.into(),
                 captures: layout.captures.into(),
                 debug: DebugInfo {
@@ -347,5 +349,5 @@ pub struct UnitLayout {
     /// its three-byte form, as QuickJS's `JS_ToCStringLen2` keeps it).
     pub source: Option<Box<[u8]>>,
     /// The script or module the function belongs to.
-    pub filename: Option<std::sync::Arc<str>>,
+    pub filename: Option<alloc::sync::Arc<str>>,
 }

@@ -6,6 +6,11 @@
 //! or two-byte storage. `Symbol.species` is dropped: `matchAll` and `split`
 //! construct `%RegExp%`.
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+
 use oxide_regexp::{ExecError, RegExpFlags, RegExpMatch};
 
 use super::joined::Joined;
@@ -651,21 +656,21 @@ fn run(
 ) -> Result<Option<RegExpMatch>, Throw> {
     let heap = &*cx.heap;
     let services = &mut *cx.host;
+    // The scratch buffers and the interrupt sources are separate fields.
+    let scratch = &services.regexp_scratch;
+    let flag = &services.interrupt;
+    let hooks = &mut services.hooks;
     // The loop's interrupt sources, polled every 10,000 matcher steps as
     // QuickJS's `lre_check_timeout` polls: a backtracking pattern stops at
     // the embedder's deadline.
     let already = heap.vm.interrupted;
-    let interrupted = || {
-        already
-            || services
-                .interrupt
-                .load(std::sync::atomic::Ordering::Relaxed)
-            || services.hooks.interrupt()
-    };
+    let interrupted =
+        || already || flag.load(core::sync::atomic::Ordering::Relaxed) || hooks.interrupt();
     let mut countdown = heap.vm.regexp_poll;
     let compiled = heap.regexps.program(program);
     let result = match &heap.string(string).repr() {
         StringRepr::OneByte(bytes) => oxide_regexp::execute_latin1_with_countdown(
+            scratch,
             compiled,
             bytes,
             start,
@@ -673,6 +678,7 @@ fn run(
             interrupted,
         ),
         StringRepr::TwoByte(units) => oxide_regexp::execute_with_countdown(
+            scratch,
             compiled,
             units,
             start,
@@ -1440,7 +1446,7 @@ fn substitute_with_groups(
     // pass records the `$<name>` tokens in order, each is then read (and
     // converted) once per token as QuickJS does, and a second pass
     // consumes the values in that order.
-    let names = std::cell::RefCell::new(Vec::<Vec<u16>>::new());
+    let names = core::cell::RefCell::new(Vec::<Vec<u16>>::new());
     let record = |name: &[u16]| -> Option<Option<Vec<u16>>> {
         names.borrow_mut().push(name.to_vec());
         Some(None)
@@ -1460,7 +1466,7 @@ fn substitute_with_groups(
             Some(units(cx, value))
         });
     }
-    let next = std::cell::Cell::new(0usize);
+    let next = core::cell::Cell::new(0usize);
     let lookup = |_: &[u16]| -> Option<Option<Vec<u16>>> {
         let index = next.get();
         next.set(index + 1);

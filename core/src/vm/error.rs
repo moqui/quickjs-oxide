@@ -2,7 +2,8 @@
 //! `ERROR`, with the kind's prototype and an own `message`; `name` lives on the
 //! prototype. Each carries QuickJS's `stack` backtrace.
 
-use std::fmt::Write;
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
+use core::fmt::Write;
 
 use super::{Cx, Throw, frame_flags};
 use crate::heap::HeapError;
@@ -353,7 +354,7 @@ fn backtrace(
 #[cold]
 #[inline(never)]
 pub(crate) fn sample_native(cx: &mut Cx<'_>, callee: Value) {
-    use std::sync::atomic::Ordering;
+    use core::sync::atomic::Ordering;
     let take = cx.host.sampler.as_ref().is_some_and(|sampler| {
         sampler.flag.load(Ordering::Relaxed) && sampler.flag.swap(false, Ordering::Relaxed)
     });
@@ -750,7 +751,7 @@ fn poll_sampled(
     pc: Option<u32>,
     entering: Option<&super::Frame>,
 ) -> Result<(), Throw> {
-    use std::sync::atomic::Ordering;
+    use core::sync::atomic::Ordering;
     // With a sampler the loop polls at every call and back-edge, so a sample lands at the first one after the flag is
     // set; the interrupt checks below still run every INTERRUPT_INTERVAL of them.
     let sampling = cx.host.sampler.is_some();

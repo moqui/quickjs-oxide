@@ -16,6 +16,8 @@
 //! [`CodeUnit`]: crate::bytecode::CodeUnit
 //! [`Heap`]: crate::heap::Heap
 
+use alloc::vec::Vec;
+
 use crate::bytecode::{CodeUnit, Opcode};
 use crate::heap::arena::Arena;
 use crate::heap::object::{NONE, ObjectHeader, ObjectKind, flags};
@@ -389,7 +391,7 @@ impl IcStore {
                 unit.ic_count > 0 && unit.ic_base.get() != crate::bytecode::IC_UNRESERVED
             })
             .collect::<Vec<_>>();
-        held.sort_unstable_by_key(|unit| std::cmp::Reverse(unit.ic_base.get()));
+        held.sort_unstable_by_key(|unit| core::cmp::Reverse(unit.ic_base.get()));
         for unit in held {
             let (old, count) = (unit.ic_base.get(), unit.ic_count);
             let Some(position) = self

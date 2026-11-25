@@ -215,34 +215,3 @@ fn unit_strings_are_atoms_kept_by_the_table() {
     assert_eq!(heap.string_text(e_acute), "\u{e9}");
     assert_eq!(heap.intern("a").unwrap(), a);
 }
-
-/// Runtimes made on several threads at once share their builtin names: the
-/// same atom for a name in each, from the process's table.
-#[test]
-fn runtimes_on_threads_share_the_builtin_names() {
-    let names = std::thread::scope(|scope| {
-        let handles = (0..8)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut runtime =
-                        oxide_core::Runtime::new(oxide_core::HeapLimits::default()).unwrap();
-                    let heap = runtime.heap_mut();
-                    ["length", "prototype", "toString", "fromCharCode"]
-                        .map(|name| heap.intern(name).unwrap())
-                })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect::<Vec<_>>()
-    });
-    for other in &names[1..] {
-        assert_eq!(other, &names[0]);
-    }
-    assert!(
-        names[0]
-            .iter()
-            .all(|id| id.index() >= oxide_core::heap::shared::SHARED_BASE)
-    );
-}

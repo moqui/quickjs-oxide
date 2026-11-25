@@ -11,7 +11,7 @@ use crate::engine::compiler::register::run_tests::{corpus, run_on_core};
 #[derive(Default)]
 struct Capture(Rc<RefCell<String>>);
 
-impl oxide_core::host::Host for Capture {
+impl super::Host for Capture {
     fn write(&mut self, _: oxide_core::host::Stream, text: &[u8]) {
         self.0.borrow_mut().push_str(&String::from_utf8_lossy(text));
     }
@@ -377,7 +377,7 @@ fn planned_field_choices_read_only_the_selected_branch() {
 #[test]
 fn conditional_backedges_poll_numeric_and_truthiness_loops() {
     struct Stop;
-    impl oxide_core::host::Host for Stop {
+    impl super::Host for Stop {
         fn interrupt(&mut self) -> bool {
             true
         }
@@ -516,7 +516,7 @@ fn delegated_read_plans_follow_live_methods_and_fall_back_before_callbacks() {
 #[test]
 fn delegated_read_calls_poll_without_loop_backedges() {
     struct Stop;
-    impl oxide_core::host::Host for Stop {
+    impl super::Host for Stop {
         fn interrupt(&mut self) -> bool {
             true
         }
@@ -837,5 +837,41 @@ fn capture_stack_trace_and_the_limit_shape_a_backtrace() {
     assert_eq!(
         text,
         "h,<eval> k,<eval> TypeError TypeError <eval> \"\" 64:true:true:true 3 2 \"\" 64"
+    );
+}
+
+/// Runtimes made on several threads at once share their builtin names: the
+/// same atom for a name in each, from the process's table.
+/// (`ProcessAtoms`).
+#[test]
+fn runtimes_on_threads_share_the_builtin_names() {
+    let names = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    // The embedding API's host brings the process's table.
+                    let mut runtime = oxide_core::Runtime::with_host(
+                        oxide_core::RuntimeOptions::default(),
+                        Box::new(super::Host::into_core(super::SystemHost)),
+                    )
+                    .unwrap();
+                    let heap = runtime.heap_mut();
+                    ["length", "prototype", "toString", "fromCharCode"]
+                        .map(|name| heap.intern(name).unwrap())
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for other in &names[1..] {
+        assert_eq!(other, &names[0]);
+    }
+    assert!(
+        names[0]
+            .iter()
+            .all(|id| id.index() >= oxide_core::heap::shared::SHARED_BASE)
     );
 }
