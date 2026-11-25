@@ -6,6 +6,8 @@
 //! a `RegExp` object's payload names its program, a collection marks the
 //! programs of the live objects (and their two atoms), and sweeps the rest.
 
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+
 use oxide_regexp::CompiledRegExp;
 
 use super::error::{self, ErrorKind};
@@ -41,34 +43,12 @@ pub struct RegExpStore {
     /// Calls of the protocol methods that took the pristine path, counted
     /// as the inline caches are (`ic-stats` or a debug build).
     #[cfg(any(feature = "ic-stats", debug_assertions))]
-    pub(crate) pristine_calls: std::cell::Cell<u64>,
+    pub(crate) pristine_calls: core::cell::Cell<u64>,
 }
 
 /// Bytes a program holds, including the arrays its instructions own.
 fn program_bytes(program: &CompiledRegExp) -> usize {
-    size_of::<Option<(RegExpRecord, CompiledRegExp)>>()
-        + std::mem::size_of_val(program.instructions())
-        + program.first_units_bytes()
-        + program
-            .instructions()
-            .iter()
-            .map(|instruction| match instruction {
-                oxide_regexp::Instruction::Range { ranges, .. } => std::mem::size_of_val(&**ranges),
-                oxide_regexp::Instruction::BackReference { captures, .. }
-                | oxide_regexp::Instruction::BackwardBackReference { captures, .. } => {
-                    std::mem::size_of_val(&**captures)
-                }
-                _ => 0,
-            })
-            .sum::<usize>()
-        + program.group_names().map_or(0, |names| {
-            std::mem::size_of_val(names)
-                + names
-                    .iter()
-                    .flatten()
-                    .map(|name| std::mem::size_of_val(&**name))
-                    .sum::<usize>()
-        })
+    size_of::<Option<(RegExpRecord, CompiledRegExp)>>() + program.owned_bytes()
 }
 
 impl RegExpStore {
@@ -190,7 +170,7 @@ impl RegExpStore {
     pub(crate) fn sweep(&mut self) {
         #[cfg(feature = "gc-stress")]
         let held = {
-            let released = std::mem::take(&mut self.quarantine);
+            let released = core::mem::take(&mut self.quarantine);
             self.free.extend_from_slice(&released);
             self.free.len()
         };
@@ -311,12 +291,14 @@ pub(crate) fn regexp_object_with(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     fn assert_owned_payload_bytes(pattern: &str, payload_bytes: usize) {
         let program =
             oxide_regexp::compile(&pattern.encode_utf16().collect::<Vec<_>>(), &[]).unwrap();
         assert!(program.group_names().is_none());
         let inline_bytes = size_of::<Option<(super::RegExpRecord, oxide_regexp::CompiledRegExp)>>()
-            + std::mem::size_of_val(program.instructions());
+            + core::mem::size_of_val(program.instructions());
         assert_eq!(
             super::program_bytes(&program),
             inline_bytes + payload_bytes,
@@ -327,13 +309,6 @@ mod tests {
     #[test]
     fn program_bytes_includes_character_ranges() {
         assert_owned_payload_bytes("[aceg]", 4 * size_of::<oxide_regexp::CharacterRange>());
-    }
-
-    #[test]
-    fn program_bytes_includes_the_start_filter() {
-        // [a-c\u{100}-\u{200}] keeps its range above Latin-1 for the filter.
-        let range = size_of::<oxide_regexp::CharacterRange>();
-        assert_owned_payload_bytes("[a-c\u{100}-\u{200}]", 2 * range + range);
     }
 
     #[test]
@@ -379,12 +354,28 @@ mod tests {
 
     #[test]
     fn program_bytes_includes_backreference_captures() {
-        assert_owned_payload_bytes("(a)\\1", 1);
+        assert_owned_payload_bytes("(.)\\1", 1);
     }
 
     #[test]
     fn program_bytes_includes_backward_backreference_captures() {
-        assert_owned_payload_bytes("(a)(?<=\\1)", 1);
+        assert_owned_payload_bytes("(.)(?<=\\1)", 1);
+    }
+
+    #[test]
+    fn program_bytes_includes_repeat_descriptors_and_search_literals() {
+        assert_owned_payload_bytes(
+            "[aceg]+",
+            size_of::<oxide_regexp::ClassRepeat>() + 4 * size_of::<oxide_regexp::CharacterRange>(),
+        );
+        let pattern: Vec<u16> = "abcdef".encode_utf16().collect();
+        let program = oxide_regexp::compile(&pattern, &[]).unwrap();
+        assert!(
+            super::program_bytes(&program)
+                >= size_of::<Option<(super::RegExpRecord, oxide_regexp::CompiledRegExp)>>()
+                    + core::mem::size_of_val(program.instructions())
+                    + pattern.len() * size_of::<u16>()
+        );
     }
 
     #[test]

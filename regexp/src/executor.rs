@@ -6,15 +6,20 @@
 //! through the Rust call stack and never delegates to a host regular-expression
 //! engine.
 
-use std::error::Error as StdError;
-use std::fmt;
-use std::ops::Range;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+use core::error::Error as StdError;
+use core::fmt;
+use core::ops::Range;
 
-use super::{CharacterRange, CompiledRegExp, Instruction, RegExpFlags};
+use super::{CharacterRange, ClassRepeat, CompiledRegExp, Instruction, RegExpFlags};
 use crate::unicode::case::regexp_canonicalize as canonicalize;
 
 /// The steps between polls of the interrupt callback.
 pub const POLL_INTERVAL: u32 = 10_000;
+const INTERRUPT_POLL_INTERVAL: u32 = POLL_INTERVAL;
+const REQUIRED_PREFILTER_DELAY: u32 = 128;
 
 /// One successful match. Every range is measured in UTF-16 code units.
 /// Capture zero is the complete match; an unmatched group is `None`.
@@ -54,7 +59,6 @@ pub enum ProgramError {
     InvalidCharacterRange { pc: usize, start: u32, end: u32 },
     AssertionStructure { pc: usize },
     IncompleteCapture { capture: u8 },
-    CharLoopStructure { pc: usize },
 }
 
 impl fmt::Display for ProgramError {
@@ -128,12 +132,6 @@ impl fmt::Display for ProgramError {
             Self::IncompleteCapture { capture } => {
                 write!(formatter, "RegExp capture {capture} has only one boundary")
             }
-            Self::CharLoopStructure { pc } => {
-                write!(
-                    formatter,
-                    "RegExp instruction {pc} is a character loop without a one-character body"
-                )
-            }
         }
     }
 }
@@ -173,16 +171,18 @@ impl From<ProgramError> for ExecError {
 
 /// Execute without an embedding interrupt hook.
 pub fn execute(
+    scratch: &ScratchCache,
     program: &CompiledRegExp,
     input: &[u16],
     start: usize,
 ) -> Result<Option<RegExpMatch>, ExecError> {
-    execute_with_interrupt(program, input, start, || false)
+    execute_with_interrupt(scratch, program, input, start, || false)
 }
 
 /// Execute while polling `interrupted` every 10,000 dispatched control steps.
 /// Returning `true` stops execution with [`ExecError::Interrupted`].
 pub fn execute_with_interrupt<F>(
+    scratch: &ScratchCache,
     program: &CompiledRegExp,
     input: &[u16],
     start: usize,
@@ -191,113 +191,353 @@ pub fn execute_with_interrupt<F>(
 where
     F: FnMut() -> bool,
 {
-    execute_units(program, input, start, &mut { POLL_INTERVAL }, interrupted)
+    execute_units(
+        scratch,
+        program,
+        input,
+        start,
+        &mut { POLL_INTERVAL },
+        interrupted,
+    )
 }
 
 /// Execute a borrowed Latin-1 leaf directly; offsets remain UTF-16 units.
 pub fn execute_latin1_with_interrupt<F: FnMut() -> bool>(
+    scratch: &ScratchCache,
     program: &CompiledRegExp,
     input: &[u8],
     start: usize,
     interrupted: F,
 ) -> Result<Option<RegExpMatch>, ExecError> {
-    execute_units(program, input, start, &mut { POLL_INTERVAL }, interrupted)
+    execute_units(
+        scratch,
+        program,
+        input,
+        start,
+        &mut { POLL_INTERVAL },
+        interrupted,
+    )
 }
 
 /// [`execute_with_interrupt`] with the caller's countdown to the next poll
 /// (start it at [`POLL_INTERVAL`]), carried from one call to the next so a
 /// `/g` loop of short searches is polled by their total work.
 pub fn execute_with_countdown<F: FnMut() -> bool>(
+    scratch: &ScratchCache,
     program: &CompiledRegExp,
     input: &[u16],
     start: usize,
     countdown: &mut u32,
     interrupted: F,
 ) -> Result<Option<RegExpMatch>, ExecError> {
-    execute_units(program, input, start, countdown, interrupted)
+    execute_units(scratch, program, input, start, countdown, interrupted)
 }
 
 /// [`execute_latin1_with_interrupt`] with the caller's countdown, as
 /// [`execute_with_countdown`].
 pub fn execute_latin1_with_countdown<F: FnMut() -> bool>(
+    scratch: &ScratchCache,
     program: &CompiledRegExp,
     input: &[u8],
     start: usize,
     countdown: &mut u32,
     interrupted: F,
 ) -> Result<Option<RegExpMatch>, ExecError> {
-    execute_units(program, input, start, countdown, interrupted)
+    execute_units(scratch, program, input, start, countdown, interrupted)
 }
 
 fn execute_units<T: Copy + Into<u16>, F: FnMut() -> bool>(
+    scratch: &ScratchCache,
+    program: &CompiledRegExp,
+    input: &[T],
+    start: usize,
+    countdown: &mut u32,
+    interrupted: F,
+) -> Result<Option<RegExpMatch>, ExecError> {
+    match execute_search(scratch, program, input, start, countdown, interrupted) {
+        Ok(result) => Ok(result),
+        Err(ExecutionStop::Rejected) => Ok(None),
+        Err(ExecutionStop::Error(error)) => Err(error),
+    }
+}
+
+// A proved search rejection is control flow, not a guest interruption or an
+// execution error. Keep it private while unwinding any active scratch lease.
+enum ExecutionStop {
+    Error(ExecError),
+    Rejected,
+}
+
+impl From<ExecError> for ExecutionStop {
+    fn from(error: ExecError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl From<ProgramError> for ExecutionStop {
+    fn from(error: ProgramError) -> Self {
+        Self::Error(error.into())
+    }
+}
+
+fn poll_interrupt<F: FnMut() -> bool>(interrupted: &mut F) -> Result<u32, ExecutionStop> {
+    if interrupted() {
+        Err(ExecError::Interrupted.into())
+    } else {
+        Ok(INTERRUPT_POLL_INTERVAL)
+    }
+}
+
+fn execute_search<T: Copy + Into<u16>, F: FnMut() -> bool>(
+    scratch: &ScratchCache,
     program: &CompiledRegExp,
     input: &[T],
     start: usize,
     countdown: &mut u32,
     mut interrupted: F,
-) -> Result<Option<RegExpMatch>, ExecError> {
+) -> Result<Option<RegExpMatch>, ExecutionStop> {
     #[cfg(test)]
     validate_program(program)?;
     if start > input.len() {
         return Err(ExecError::StartOutOfBounds {
             start,
             input_len: input.len(),
-        });
+        }
+        .into());
     }
 
     let flags = program.flags();
     let unicode = flags.is_unicode();
     let sticky = flags.contains(RegExpFlags::STICKY);
-    let mut candidate = normalize_start(input, start, unicode);
-    let mut poller = Poller::new(&mut interrupted, *countdown);
-
-    let mut state =
-        AttemptState::new(program.capture_count(), program.register_count(), candidate)?;
-    let filter = if sticky { None } else { program.first_units() };
-    // An attempt is polled at every backtrack and jump back; between them it
-    // runs forward, at most the program's length. The starts go in chunks,
-    // and each chunk counts that bound for its starts: the search is polled
-    // by the work it can do, with no cost per attempt.
-    let length = program.instructions().len();
-    // About one poll interval of work per chunk.
-    let chunk = (POLL_INTERVAL as usize / length.max(1)).max(1);
-    let found = 'search: loop {
-        let end = candidate.saturating_add(chunk).min(input.len());
-        let first = candidate;
-        loop {
-            if let Some(filter) = filter {
-                // No attempt from a unit the first instruction rejects.
-                match filter.find(&input[candidate..]) {
-                    Some(skip) => candidate += skip,
-                    None => return Ok(None),
-                }
-            }
-            state.reset(candidate);
-            if let Some(result) = run_attempt(program, input, unicode, &mut poller, &mut state)? {
-                // The chunk's work so far counts toward the next search's
-                // poll (a /g loop of matches).
-                poller.step_by(chunk_work(candidate - first, length))?;
-                break 'search Some(result);
-            }
-            if sticky || candidate >= end {
-                break;
-            }
-            candidate = advance_string_index(input, candidate, unicode);
-        }
-        if sticky || candidate >= input.len() {
-            break 'search None;
-        }
-        poller.step_by(chunk_work(candidate - first, length))?;
-        candidate = advance_string_index(input, candidate, unicode);
+    let candidate = normalize_start(input, start, unicode);
+    let search = program.search();
+    if search.anchored && candidate != 0 {
+        return Ok(None);
+    }
+    if search.minimum > input.len() - candidate {
+        return Ok(None);
+    }
+    let fixed_start = sticky || search.anchored;
+    if fixed_start && candidate < input.len() && !search.first.contains(input[candidate].into()) {
+        return Ok(None);
+    }
+    // Let a cheap single-start match finish before searching its suffix. Use
+    // one early checkpoint to retain required-literal rejection before an
+    // expensive backtracking attempt, without a new per-step budget counter.
+    let initial_start = candidate;
+    let mut deferred = if fixed_start {
+        search.required.as_ref()
+    } else {
+        None
     };
-    *countdown = poller.remaining;
-    Ok(found)
+    // The caller's countdown is the most this search runs before its first
+    // checkpoint, so a `/g` loop of short searches is polled by their total
+    // work.
+    let first_checkpoint = if deferred.is_some() {
+        REQUIRED_PREFILTER_DELAY
+    } else {
+        INTERRUPT_POLL_INTERVAL
+    }
+    .min((*countdown).clamp(1, INTERRUPT_POLL_INTERVAL));
+    let mut checkpoint = || {
+        if let Some(required) = deferred.take() {
+            let mut interrupt_only = || poll_interrupt(&mut interrupted);
+            let mut scanner = Poller::new(&mut interrupt_only);
+            scanner.remaining = INTERRUPT_POLL_INTERVAL - REQUIRED_PREFILTER_DELAY;
+            let last_start = required
+                .max_prefix
+                .map_or(input.len(), |prefix| initial_start.saturating_add(prefix));
+            if find_literal(
+                input,
+                &required.units,
+                initial_start,
+                last_start,
+                &mut scanner,
+            )?
+            .is_none()
+            {
+                return Err(ExecutionStop::Rejected);
+            }
+            // Preserve partial polling progress made by the proof scan.
+            return Ok(scanner.remaining);
+        }
+        poll_interrupt(&mut interrupted)
+    };
+    let mut poller = Poller::new(&mut checkpoint);
+    poller.remaining = first_checkpoint;
+    let found = search_from(scratch, program, input, candidate, &mut poller);
+    // What is left counts toward the caller's next search; a stop leaves the
+    // countdown spent, so the next search polls at once.
+    *countdown = poller.remaining.max(1);
+    found
 }
 
-/// The most steps the starts `first ..= first + starts` ran unpolled.
-#[inline]
-fn chunk_work(starts: usize, length: usize) -> u32 {
-    u32::try_from((starts + 1).saturating_mul(length)).unwrap_or(u32::MAX)
+/// The search from `candidate` on, once the checkpoint is set up.
+#[inline(always)]
+fn search_from<T: Copy + Into<u16>, F: FnMut() -> Result<u32, ExecutionStop>>(
+    scratch: &ScratchCache,
+    program: &CompiledRegExp,
+    input: &[T],
+    mut candidate: usize,
+    poller: &mut Poller<'_, F>,
+) -> Result<Option<RegExpMatch>, ExecutionStop> {
+    let flags = program.flags();
+    let unicode = flags.is_unicode();
+    let sticky = flags.contains(RegExpFlags::STICKY);
+    let search = program.search();
+    let fixed_start = sticky || search.anchored;
+    if let Some(literal) = &search.literal {
+        let last_start = if fixed_start {
+            candidate
+        } else {
+            input.len() - literal.len()
+        };
+        let found = find_literal(input, literal, candidate, last_start, poller)?;
+        return match found {
+            Some(position) => {
+                let mut captures = Vec::new();
+                captures
+                    .try_reserve_exact(1)
+                    .map_err(|_| ExecError::OutOfMemory)?;
+                captures.push(Some(position..position + literal.len()));
+                Ok(Some(RegExpMatch {
+                    captures: captures.into_boxed_slice(),
+                }))
+            }
+            _ => Ok(None),
+        };
+    }
+    // Unanchored searches retain the eager proof to avoid retrying starts when
+    // a required substring is absent. Single-start searches defer it above.
+    if !fixed_start && let Some(required) = &search.required {
+        let Some(position) = find_literal(
+            input,
+            &required.units,
+            candidate,
+            input.len().saturating_sub(required.units.len()),
+            poller,
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Some(prefix) = required.max_prefix {
+            let lower = position.saturating_sub(prefix);
+            // A required substring can be in the middle of a match. Only its
+            // proven maximum prefix bounds the earliest possible start.
+            while candidate < lower {
+                poller.step()?;
+                candidate = advance_string_index(input, candidate, unicode);
+            }
+        }
+    }
+    let mut state = None;
+    loop {
+        while candidate < input.len() && !search.first.contains(input[candidate].into()) {
+            if sticky || search.anchored {
+                return Ok(None);
+            }
+            poller.step()?;
+            candidate = advance_string_index(input, candidate, unicode);
+        }
+        if search.minimum > input.len() - candidate {
+            return Ok(None);
+        }
+        if state.is_none() {
+            state = Some(Scratch::acquire(
+                scratch,
+                program.capture_count(),
+                program.register_count(),
+                candidate,
+            )?);
+        }
+        let state = &mut state.as_mut().expect("attempt state was initialized").state;
+        state.reset(candidate);
+        if let Some(result) = run_attempt(program, input, unicode, poller, state)? {
+            return Ok(Some(result));
+        }
+        if sticky || search.anchored || candidate == input.len() {
+            return Ok(None);
+        }
+        candidate = advance_string_index(input, candidate, unicode);
+    }
+}
+
+fn find_literal<T: Copy + Into<u16>, F: FnMut() -> Result<u32, ExecutionStop>>(
+    input: &[T],
+    literal: &[u16],
+    start: usize,
+    last_start: usize,
+    poller: &mut Poller<'_, F>,
+) -> Result<Option<usize>, ExecutionStop> {
+    if literal.len() > input.len() - start {
+        return Ok(None);
+    }
+    let Some((&first, suffix)) = literal.split_first() else {
+        return Ok(Some(start));
+    };
+    let last_start = last_start.min(input.len() - literal.len());
+    let mut position = start;
+    while position <= last_start {
+        // Scan only as far as the next checkpoint. Common first-unit misses
+        // need one comparison, without a polling branch or suffix iterator
+        // setup for every unit. Charge all inspected units before proceeding.
+        let end = (last_start + 1).min(position.saturating_add(poller.remaining as usize));
+        let found = input[position..end]
+            .iter()
+            .position(|unit| (*unit).into() == first);
+        let inspected = found.map_or(end - position, |offset| offset + 1);
+        poller.advance(inspected as u32)?;
+        let Some(offset) = found else {
+            position = end;
+            continue;
+        };
+        position += offset;
+        let mut matched = true;
+        for (offset, expected) in suffix.iter().enumerate() {
+            poller.step()?;
+            if input[position + offset + 1].into() != *expected {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return Ok(Some(position));
+        }
+        position += 1;
+    }
+    Ok(None)
+}
+
+fn validate_ranges(ranges: &[CharacterRange], pc: usize) -> Result<(), ExecError> {
+    for range in ranges {
+        if range.start > range.end || range.end > 0x10_ffff {
+            return Err(ProgramError::InvalidCharacterRange {
+                pc,
+                start: range.start,
+                end: range.end,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn repeat_next<T: Copy + Into<u16>>(
+    repeat: &ClassRepeat,
+    input: &[T],
+    position: usize,
+    unicode: bool,
+) -> Option<usize> {
+    let (mut character, next) = read_character(input, position, unicode)?;
+    let matched = if character < 128 {
+        repeat.ascii[(character / 64) as usize] & (1 << (character % 64)) != 0
+    } else {
+        if repeat.ignore_case {
+            character = canonicalize(character, unicode);
+        }
+        range_contains(&repeat.ranges, character) != repeat.inverted
+    };
+    matched.then_some(next)
 }
 
 pub(super) fn validate_program(program: &CompiledRegExp) -> Result<(), ExecError> {
@@ -358,6 +598,7 @@ pub(super) fn validate_program(program: &CompiledRegExp) -> Result<(), ExecError
             Instruction::Char { value, .. } if *value > 0x10_ffff => {
                 return Err(ProgramError::InvalidCharacter { pc, value: *value }.into());
             }
+            Instruction::ClassRepeat(repeat) => validate_ranges(&repeat.ranges, pc)?,
             Instruction::Range { ranges, .. } => {
                 for range in ranges {
                     if range.start > range.end || range.end > 0x10_ffff {
@@ -410,24 +651,6 @@ pub(super) fn validate_program(program: &CompiledRegExp) -> Result<(), ExecError
                     return Err(ProgramError::AssertionStructure { pc }.into());
                 }
             }
-            Instruction::CharLoop { min, max, .. } => {
-                let matcher = instructions.get(pc + 1);
-                if min > max
-                    || pc + 2 >= instructions.len()
-                    || !matches!(
-                        matcher,
-                        Some(
-                            Instruction::Char { .. }
-                                | Instruction::Dot
-                                | Instruction::Any
-                                | Instruction::Space { .. }
-                                | Instruction::Range { .. }
-                        )
-                    )
-                {
-                    return Err(ProgramError::CharLoopStructure { pc }.into());
-                }
-            }
             Instruction::SetRegister { register, .. }
             | Instruction::Loop { register, .. }
             | Instruction::SavePosition { register }
@@ -477,36 +700,53 @@ pub(super) fn validate_program(program: &CompiledRegExp) -> Result<(), ExecError
 
 struct Poller<'a, F> {
     remaining: u32,
-    interrupted: &'a mut F,
+    checkpoint: &'a mut F,
 }
 
 impl<'a, F> Poller<'a, F>
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> Result<u32, ExecutionStop>,
 {
-    fn new(interrupted: &'a mut F, remaining: u32) -> Self {
+    fn new(checkpoint: &'a mut F) -> Self {
         Self {
-            remaining: remaining.clamp(1, POLL_INTERVAL),
-            interrupted,
+            remaining: INTERRUPT_POLL_INTERVAL,
+            checkpoint,
         }
     }
 
-    fn step(&mut self) -> Result<(), ExecError> {
-        self.step_by(1)
+    #[inline(always)]
+    fn step(&mut self) -> Result<(), ExecutionStop> {
+        self.advance(1)
     }
 
-    /// Counts `work` steps at once: a failed attempt's instructions, which
-    /// ran without a poll.
+    #[inline(always)]
+    fn advance(&mut self, steps: u32) -> Result<(), ExecutionStop> {
+        debug_assert!(steps > 0 && steps <= self.remaining);
+        self.remaining -= steps;
+        if self.remaining == 0 {
+            self.refill()?;
+        }
+        Ok(())
+    }
+
+    /// Counts `steps` of work done at once (a back-reference's compare),
+    /// across as many checkpoints as it spans.
     #[inline]
-    fn step_by(&mut self, work: u32) -> Result<(), ExecError> {
-        if work < self.remaining {
-            self.remaining -= work;
-            return Ok(());
+    fn charge(&mut self, mut steps: usize) -> Result<(), ExecutionStop> {
+        while steps > 0 {
+            let now = steps.min(self.remaining as usize);
+            self.advance(now as u32)?;
+            steps -= now;
         }
-        self.remaining = POLL_INTERVAL;
-        if (self.interrupted)() {
-            return Err(ExecError::Interrupted);
-        }
+        Ok(())
+    }
+
+    // Keep required-literal scans and host callbacks out of every character's
+    // decrement-and-branch path, even when the checkpoint closure grows.
+    #[cold]
+    #[inline(never)]
+    fn refill(&mut self) -> Result<(), ExecutionStop> {
+        self.remaining = (self.checkpoint)()?;
         Ok(())
     }
 }
@@ -554,12 +794,12 @@ enum ControlKind {
         negative: bool,
         target: usize,
     },
-    /// A [`Instruction::CharLoop`] that can give characters back: the
-    /// frame's position is where the loop now ends, `floor` where it ended
-    /// after its `min` characters, and `pc` its continuation.
-    Loop {
+    /// `limit` is the minimum endpoint for greedy rollback, or the remaining
+    /// optional character count for lazy expansion (usize::MAX is unbounded).
+    Repeat {
         pc: usize,
-        floor: usize,
+        limit: usize,
+        greedy: bool,
     },
 }
 
@@ -570,45 +810,7 @@ struct ControlFrame {
     undo_len: usize,
 }
 
-/// The buffers of the last search's [`AttemptState`], kept for the thread's
-/// next (a nested search takes none and allocates its own).
 #[derive(Default)]
-struct Spare {
-    captures: Vec<Option<usize>>,
-    registers: Vec<RegisterValue>,
-    undo: Vec<Undo>,
-    controls: Vec<ControlFrame>,
-}
-
-/// The most backtrack or undo entries a kept buffer may hold room for.
-const SPARE_MAX: usize = 4096;
-
-std::thread_local! {
-    static SPARE: std::cell::RefCell<Option<Spare>> = const { std::cell::RefCell::new(None) };
-}
-
-/// The buffers go back for the thread's next search, unless a deep
-/// backtrack grew them past [`SPARE_MAX`] entries.
-impl Drop for AttemptState {
-    fn drop(&mut self) {
-        if self.undo.capacity() > SPARE_MAX || self.controls.capacity() > SPARE_MAX {
-            return;
-        }
-        let spare = Spare {
-            captures: std::mem::take(&mut self.captures),
-            registers: std::mem::take(&mut self.registers),
-            undo: std::mem::take(&mut self.undo),
-            controls: std::mem::take(&mut self.controls),
-        };
-        // a thread being torn down has no slot left: the buffers just drop
-        let _ = SPARE.try_with(|slot| {
-            if let Ok(mut slot) = slot.try_borrow_mut() {
-                *slot = Some(spare);
-            }
-        });
-    }
-}
-
 struct AttemptState {
     pc: usize,
     position: usize,
@@ -616,6 +818,93 @@ struct AttemptState {
     registers: Vec<RegisterValue>,
     undo: Vec<Undo>,
     controls: Vec<ControlFrame>,
+}
+
+// Storage-independent policy: one bounded spare, with no borrow held while the
+// executor uses it.
+const MAX_SCRATCH_BYTES: usize = 32 * 1024;
+
+/// Reusable execution workspace owned by the caller, shared across programs.
+///
+/// A cache retains at most one workspace of 32 KiB. Executions release the
+/// storage borrow before matching or invoking interrupt hooks, so the same
+/// cache supports reentrant execution without locks or additional ownership.
+#[derive(Default)]
+pub struct ScratchCache {
+    spare: RefCell<Option<AttemptState>>,
+}
+
+impl ScratchCache {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            spare: RefCell::new(None),
+        }
+    }
+
+    fn take(&self) -> Option<AttemptState> {
+        self.spare.borrow_mut().take()
+    }
+
+    // Check the bound and clear the workspace before borrowing cache storage.
+    fn prepare_return(state: &mut AttemptState) -> bool {
+        let bytes = state
+            .captures
+            .capacity()
+            .saturating_mul(size_of::<Option<usize>>())
+            .saturating_add(
+                state
+                    .registers
+                    .capacity()
+                    .saturating_mul(size_of::<RegisterValue>()),
+            )
+            .saturating_add(state.undo.capacity().saturating_mul(size_of::<Undo>()))
+            .saturating_add(
+                state
+                    .controls
+                    .capacity()
+                    .saturating_mul(size_of::<ControlFrame>()),
+            );
+        if bytes > MAX_SCRATCH_BYTES {
+            return false;
+        }
+        state.reset(0);
+        true
+    }
+
+    // The caller has prepared this workspace outside the storage borrow.
+    fn put_prepared(&self, state: &mut AttemptState) {
+        let mut spare = self.spare.borrow_mut();
+        if spare.is_none() {
+            *spare = Some(core::mem::take(state));
+        }
+    }
+}
+
+struct Scratch<'a> {
+    state: AttemptState,
+    cache: &'a ScratchCache,
+}
+
+impl<'a> Scratch<'a> {
+    fn acquire(
+        cache: &'a ScratchCache,
+        captures: u8,
+        registers: u8,
+        position: usize,
+    ) -> Result<Self, ExecError> {
+        let mut state = cache.take().unwrap_or_default();
+        state.prepare(captures, registers, position)?;
+        Ok(Self { state, cache })
+    }
+}
+
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        if ScratchCache::prepare_return(&mut self.state) {
+            self.cache.put_prepared(&mut self.state);
+        }
+    }
 }
 
 impl AttemptState {
@@ -628,49 +917,32 @@ impl AttemptState {
         self.controls.clear();
     }
 
-    /// A state for a program with `capture_count` captures and
-    /// `register_count` registers, on this thread's spare buffers when the
-    /// last search left them (its drop), so a search allocates
-    /// nothing for its state once one has run.
+    #[cfg(test)]
     fn new(capture_count: u8, register_count: u8, position: usize) -> Result<Self, ExecError> {
-        let Spare {
-            mut captures,
-            mut registers,
-            mut undo,
-            mut controls,
-        } = SPARE
-            .try_with(|spare| {
-                spare
-                    .try_borrow_mut()
-                    .ok()
-                    .and_then(|mut spare| spare.take())
-            })
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        captures.clear();
-        registers.clear();
-        undo.clear();
-        controls.clear();
+        let mut state = Self::default();
+        state.prepare(capture_count, register_count, position)?;
+        Ok(state)
+    }
+
+    fn prepare(
+        &mut self,
+        capture_count: u8,
+        register_count: u8,
+        position: usize,
+    ) -> Result<(), ExecError> {
         let capture_slots = usize::from(capture_count) * 2;
-        captures
-            .try_reserve_exact(capture_slots)
+        self.captures
+            .try_reserve_exact(capture_slots.saturating_sub(self.captures.len()))
             .map_err(|_| ExecError::OutOfMemory)?;
-        captures.resize(capture_slots, None);
+        self.captures.resize(capture_slots, None);
 
-        registers
-            .try_reserve_exact(usize::from(register_count))
+        self.registers
+            .try_reserve_exact(usize::from(register_count).saturating_sub(self.registers.len()))
             .map_err(|_| ExecError::OutOfMemory)?;
-        registers.resize(usize::from(register_count), RegisterValue::Unset);
-
-        Ok(Self {
-            pc: 0,
-            position,
-            captures,
-            registers,
-            undo,
-            controls,
-        })
+        self.registers
+            .resize(usize::from(register_count), RegisterValue::Unset);
+        self.reset(position);
+        Ok(())
     }
 
     fn push_backtrack(&mut self, pc: usize) -> Result<(), ExecError> {
@@ -685,13 +957,19 @@ impl AttemptState {
         Ok(())
     }
 
-    fn push_loop(&mut self, pc: usize, floor: usize) -> Result<(), ExecError> {
+    fn push_repeat(
+        &mut self,
+        pc: usize,
+        position: usize,
+        limit: usize,
+        greedy: bool,
+    ) -> Result<(), ExecError> {
         self.controls
             .try_reserve(1)
             .map_err(|_| ExecError::OutOfMemory)?;
         self.controls.push(ControlFrame {
-            kind: ControlKind::Loop { pc, floor },
-            position: self.position,
+            kind: ControlKind::Repeat { pc, limit, greedy },
+            position,
             undo_len: self.undo.len(),
         });
         Ok(())
@@ -722,31 +1000,71 @@ impl AttemptState {
     ///
     /// A failed positive lookahead propagates through its boundary. A failed
     /// negative lookahead succeeds at its continuation. Split frames resume
-    /// their retained branch. A loop frame gives back one character and
-    /// stays while it has more to give.
-    fn restore_backtrack<T: Copy + Into<u16>>(&mut self, input: &[T], unicode: bool) -> bool {
+    /// their retained branch.
+    fn restore_backtrack<T: Copy + Into<u16>, F: FnMut() -> Result<u32, ExecutionStop>>(
+        &mut self,
+        instructions: &[Instruction],
+        input: &[T],
+        unicode: bool,
+        poller: &mut Poller<'_, F>,
+    ) -> Result<bool, ExecutionStop> {
         loop {
             let Some(frame) = self.controls.pop() else {
-                return false;
+                return Ok(false);
             };
             self.rollback_to(frame.undo_len);
             self.position = frame.position;
             match frame.kind {
                 ControlKind::Split { pc } => {
                     self.pc = pc;
-                    return true;
+                    return Ok(true);
                 }
-                ControlKind::Loop { pc, floor } => {
-                    let position =
-                        read_previous_character_bounded(input, frame.position, floor, unicode)
-                            .map_or(floor, |(_, previous)| previous);
-                    if position > floor {
-                        // The slot just popped: no allocation.
-                        self.controls.push(ControlFrame { position, ..frame });
-                    }
-                    self.position = position;
+                ControlKind::Repeat {
+                    pc,
+                    limit,
+                    greedy: true,
+                } => {
                     self.pc = pc;
-                    return true;
+                    if self.position > limit {
+                        let (_, previous) = read_previous_character(input, self.position, unicode)
+                            .expect("repeat endpoint follows a character");
+                        self.controls.push(ControlFrame {
+                            position: previous,
+                            ..frame
+                        });
+                    }
+                    return Ok(true);
+                }
+                ControlKind::Repeat {
+                    pc,
+                    limit,
+                    greedy: false,
+                } => {
+                    poller.step()?;
+                    let Instruction::ClassRepeat(repeat) = &instructions[pc - 1] else {
+                        unreachable!("repeat frame refers to its instruction")
+                    };
+                    let Some(next) = repeat_next(repeat, input, self.position, unicode) else {
+                        continue;
+                    };
+                    self.position = next;
+                    self.pc = pc;
+                    if limit > 1 {
+                        self.controls.push(ControlFrame {
+                            kind: ControlKind::Repeat {
+                                pc,
+                                limit: if limit == usize::MAX {
+                                    limit
+                                } else {
+                                    limit - 1
+                                },
+                                greedy: false,
+                            },
+                            position: next,
+                            ..frame
+                        });
+                    }
+                    return Ok(true);
                 }
                 ControlKind::LookAhead {
                     negative: false, ..
@@ -756,7 +1074,7 @@ impl AttemptState {
                     target,
                 } => {
                     self.pc = target;
-                    return true;
+                    return Ok(true);
                 }
             }
         }
@@ -920,19 +1238,15 @@ fn run_attempt<T: Copy + Into<u16>, F>(
     unicode: bool,
     poller: &mut Poller<'_, F>,
     state: &mut AttemptState,
-) -> Result<Option<RegExpMatch>, ExecError>
+) -> Result<Option<RegExpMatch>, ExecutionStop>
 where
-    F: FnMut() -> bool,
+    F: FnMut() -> Result<u32, ExecutionStop>,
 {
     let instructions = program.instructions();
 
-    // The interrupt is polled on backtracking, on a jump back and on a
-    // counted loop's repeat, as QuickJS's `lre_poll_timeout` is: an attempt
-    // that passes none of them is bounded by the program's length.
     macro_rules! fail_branch {
         () => {{
-            if state.restore_backtrack(input, unicode) {
-                poller.step()?;
+            if state.restore_backtrack(instructions, input, unicode, poller)? {
                 continue;
             }
             return Ok(None);
@@ -940,6 +1254,7 @@ where
     }
 
     loop {
+        poller.step()?;
         let instruction_pc = state.pc;
         let instruction = instructions
             .get(instruction_pc)
@@ -1002,6 +1317,46 @@ where
                 }
                 state.position = next;
             }
+            Instruction::ClassRepeat(repeat) => {
+                let mut count = 0u32;
+                let mut failed = false;
+                while count < repeat.minimum {
+                    poller.step()?;
+                    let Some(next) = repeat_next(repeat, input, state.position, unicode) else {
+                        failed = true;
+                        break;
+                    };
+                    state.position = next;
+                    count += 1;
+                }
+                if failed {
+                    fail_branch!();
+                }
+                let minimum_position = state.position;
+                let remaining = repeat
+                    .maximum
+                    .map_or(usize::MAX, |maximum| (maximum - count) as usize);
+                if repeat.greedy {
+                    let mut optional = 0usize;
+                    let mut previous = state.position;
+                    while optional < remaining {
+                        poller.step()?;
+                        let Some(next) = repeat_next(repeat, input, state.position, unicode) else {
+                            break;
+                        };
+                        previous = state.position;
+                        state.position = next;
+                        optional += 1;
+                    }
+                    // A possessive repeat's continuation rejects every
+                    // character it would give back.
+                    if state.position != minimum_position && !repeat.possessive {
+                        state.push_repeat(state.pc, previous, minimum_position, true)?;
+                    }
+                } else if remaining != 0 {
+                    state.push_repeat(state.pc, state.position, remaining, false)?;
+                }
+            }
             Instruction::LineStart { multiline } => {
                 if state.position != 0
                     && (!*multiline
@@ -1052,10 +1407,9 @@ where
                     }
                 });
                 if let Some((start, end)) = participating {
-                    // The compare reads the capture's length of input: a
-                    // long capture is work the attempt's bound does not
-                    // count.
-                    poller.step_by(u32::try_from(end - start).unwrap_or(u32::MAX))?;
+                    // The compare reads the capture's length of input: work
+                    // the per-instruction count does not see.
+                    poller.charge(end - start)?;
                     let Some(position) = match_back_reference(
                         input,
                         start,
@@ -1081,10 +1435,8 @@ where
                     }
                 });
                 if let Some((start, end)) = participating {
-                    // The compare reads the capture's length of input: a
-                    // long capture is work the attempt's bound does not
-                    // count.
-                    poller.step_by(u32::try_from(end - start).unwrap_or(u32::MAX))?;
+                    // As for a forward back-reference.
+                    poller.charge(end - start)?;
                     let Some(position) = match_backward_back_reference(
                         input,
                         start,
@@ -1108,54 +1460,14 @@ where
                 state.reject_negative_lookahead(instruction_pc)?;
                 fail_branch!();
             }
-            Instruction::Jump { target } => {
-                // A jump back closes a loop: polled too.
-                if *target <= instruction_pc {
-                    poller.step()?;
-                }
-                state.pc = *target;
-            }
+            Instruction::Jump { target } => state.pc = *target,
             Instruction::Split { first, second } => {
                 state.push_backtrack(*second)?;
                 state.pc = *first;
             }
-            Instruction::CharLoop {
-                min,
-                max,
-                possessive,
-            } => {
-                let matcher =
-                    instructions
-                        .get(instruction_pc + 1)
-                        .ok_or(ProgramError::ProgramCounter {
-                            pc: instruction_pc + 1,
-                        })?;
-                let start = state.position;
-                let mut position = start;
-                let mut floor = start;
-                let mut count = 0u32;
-                while count < *max {
-                    let Some(next) = match_one(matcher, input, position, unicode) else {
-                        break;
-                    };
-                    position = next;
-                    count += 1;
-                    if count == *min {
-                        floor = position;
-                    }
-                }
-                if count < *min {
-                    fail_branch!();
-                }
-                // A long run is work the attempt's bound does not count.
-                poller.step_by(count)?;
-                state.position = position;
-                state.pc = instruction_pc + 2;
-                if !*possessive && position > floor {
-                    state.push_loop(instruction_pc + 2, floor)?;
-                }
+            Instruction::Match => {
+                return state.finish_match().map(Some).map_err(ExecutionStop::Error);
             }
-            Instruction::Match => return state.finish_match().map(Some),
             Instruction::SaveStart { capture } => {
                 state.set_capture(usize::from(*capture) * 2, Some(state.position))?;
             }
@@ -1183,8 +1495,6 @@ where
                 let value = value.wrapping_sub(1);
                 state.set_register(register_index, RegisterValue::Counter(value))?;
                 if value != 0 {
-                    // A counted loop may run 2^31 times, nested twice.
-                    poller.step()?;
                     state.pc = *target;
                 }
             }
@@ -1226,45 +1536,6 @@ fn normalize_start<T: Copy + Into<u16>>(input: &[T], start: usize, unicode: bool
 
 fn advance_string_index<T: Copy + Into<u16>>(input: &[T], position: usize, unicode: bool) -> usize {
     read_character(input, position, unicode).map_or(input.len(), |(_, next)| next)
-}
-
-/// Where the one-character instruction `matcher` ends when it matches at
-/// `position`: the loop body of an [`Instruction::CharLoop`].
-#[inline(always)]
-fn match_one<T: Copy + Into<u16>>(
-    matcher: &Instruction,
-    input: &[T],
-    position: usize,
-    unicode: bool,
-) -> Option<usize> {
-    let (character, next) = read_character(input, position, unicode)?;
-    let matched = match matcher {
-        Instruction::Char { value, ignore_case } => {
-            let character = if *ignore_case {
-                canonicalize(character, unicode)
-            } else {
-                character
-            };
-            character == *value
-        }
-        Instruction::Dot => !is_line_terminator(character),
-        Instruction::Any => true,
-        Instruction::Space { inverted } => is_space(character) != *inverted,
-        Instruction::Range {
-            ranges,
-            inverted,
-            ignore_case,
-        } => {
-            let character = if *ignore_case {
-                canonicalize(character, unicode)
-            } else {
-                character
-            };
-            range_contains(ranges, character) != *inverted
-        }
-        _ => false,
-    };
-    matched.then_some(next)
 }
 
 fn read_character<T: Copy + Into<u16>>(
@@ -1416,176 +1687,6 @@ fn is_word(character: u32, ignore_case: bool) -> bool {
         || ignore_case && matches!(character, 0x017f | 0x212a)
 }
 
-/// The code units a match can start with: those of the first instruction
-/// that reads input, when it is a case-sensitive character or a positive
-/// class (or `\s`) and only captures and registers come before it; for a
-/// character loop, its body's, and with no minimum, those of what follows it
-/// too. In Unicode mode only a set below the surrogates qualifies, where a
-/// unit is its own character. A match can start only at such a unit, so the
-/// search skips the others without an attempt; a set of one unit is found
-/// by a scan the compiler vectorizes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct FirstUnits {
-    latin1: [u64; 4],
-    wide: Box<[CharacterRange]>,
-    single: Option<u16>,
-}
-
-impl FirstUnits {
-    pub(super) fn of(flags: RegExpFlags, instructions: &[Instruction]) -> Option<Self> {
-        let limit = if flags.is_unicode() { 0xd7ff } else { 0xffff };
-        let mut ranges = Vec::new();
-        first_ranges(instructions, 0, &mut ranges)?;
-        // A loop's set and its follower's may overlap: sorted and merged.
-        ranges.sort_unstable_by_key(|range| range.start);
-        ranges.dedup_by(|next, kept| {
-            let touches = next.start <= kept.end.saturating_add(1);
-            if touches {
-                kept.end = kept.end.max(next.end);
-            }
-            touches
-        });
-        if ranges.iter().any(|range| range.end > limit) {
-            return None;
-        }
-        let mut latin1 = [0u64; 4];
-        for range in &ranges {
-            for unit in range.start..=range.end.min(0xff) {
-                latin1[(unit >> 6) as usize] |= 1 << (unit & 63);
-            }
-        }
-        let wide = ranges
-            .iter()
-            .filter(|range| range.end > 0xff)
-            .map(|range| CharacterRange::new(range.start.max(0x100), range.end))
-            .collect::<Box<[_]>>();
-        let single = match ranges.as_slice() {
-            [range] if range.start == range.end => u16::try_from(range.start).ok(),
-            _ => None,
-        };
-        Some(FirstUnits {
-            latin1,
-            wide,
-            single,
-        })
-    }
-
-    /// The offset of the first unit of `units` a match can start with.
-    #[inline]
-    pub(super) fn find<T: Copy + Into<u16>>(&self, units: &[T]) -> Option<usize> {
-        match self.single {
-            Some(unit) => find_unit(units, unit),
-            None => units.iter().position(|&unit| self.contains(unit.into())),
-        }
-    }
-
-    pub(super) fn owned_bytes(&self) -> usize {
-        std::mem::size_of_val(&*self.wide)
-    }
-
-    #[inline]
-    pub(super) fn contains(&self, unit: u16) -> bool {
-        if unit < 0x100 {
-            self.latin1[usize::from(unit >> 6)] >> (unit & 63) & 1 != 0
-        } else {
-            range_contains(&self.wide, u32::from(unit))
-        }
-    }
-}
-
-/// Adds to `out` the characters the program from `pc` can start a match
-/// with ([`FirstUnits`]); `None` when it cannot tell or a match can start
-/// with any (or no) character.
-fn first_ranges(
-    instructions: &[Instruction],
-    mut pc: usize,
-    out: &mut Vec<CharacterRange>,
-) -> Option<()> {
-    // A loop with no minimum adds its body and goes on: a few at most.
-    for _ in 0..8 {
-        let instruction = instructions.get(pc)?;
-        let body = match instruction {
-            Instruction::SaveStart { .. }
-            | Instruction::SaveEnd { .. }
-            | Instruction::ResetCaptures { .. }
-            | Instruction::SetRegister { .. } => {
-                pc += 1;
-                continue;
-            }
-            Instruction::CharLoop { min, .. } => {
-                let body = instructions.get(pc + 1)?;
-                if *min > 0 {
-                    return push_positive_set(body, out);
-                }
-                push_positive_set(body, out)?;
-                pc += 2;
-                continue;
-            }
-            body => body,
-        };
-        return push_positive_set(body, out);
-    }
-    None
-}
-
-/// Adds the set of a case-sensitive character, positive class or `\s` to
-/// `out`; `None` for any other instruction.
-fn push_positive_set(instruction: &Instruction, out: &mut Vec<CharacterRange>) -> Option<()> {
-    match instruction {
-        Instruction::Char {
-            value,
-            ignore_case: false,
-        } => out.push(CharacterRange::new(*value, *value)),
-        Instruction::Range {
-            ranges,
-            inverted: false,
-            ignore_case: false,
-        } => out.extend_from_slice(ranges),
-        Instruction::Space { inverted: false } => {
-            for (start, end) in [
-                (0x09, 0x0d),
-                (0x20, 0x20),
-                (0xa0, 0xa0),
-                (0x1680, 0x1680),
-                (0x2000, 0x200a),
-                (0x2028, 0x2029),
-                (0x202f, 0x202f),
-                (0x205f, 0x205f),
-                (0x3000, 0x3000),
-                (0xfeff, 0xfeff),
-            ] {
-                out.push(CharacterRange::new(start, end));
-            }
-        }
-        _ => return None,
-    }
-    Some(())
-}
-
-/// The offset of the first `unit` in `units`, sixteen at a time: each
-/// block's compare is one branch-free reduction.
-#[inline]
-fn find_unit<T: Copy + Into<u16>>(units: &[T], unit: u16) -> Option<usize> {
-    const LANES: usize = 16;
-    let (chunks, remainder) = units.as_chunks::<LANES>();
-    let mut base = 0;
-    for chunk in chunks {
-        if chunk.iter().fold(false, |found, &candidate| {
-            found | (candidate.into() == unit)
-        }) {
-            return chunk
-                .iter()
-                .position(|&candidate| candidate.into() == unit)
-                .map(|offset| base + offset);
-        }
-        base += LANES;
-    }
-    remainder
-        .iter()
-        .position(|&candidate| candidate.into() == unit)
-        .map(|offset| base + offset)
-}
-
 fn range_contains(ranges: &[CharacterRange], character: u32) -> bool {
     let candidate = ranges.partition_point(|range| range.start <= character);
     candidate
@@ -1597,6 +1698,7 @@ fn range_contains(ranges: &[CharacterRange], character: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{format, vec};
 
     fn program(
         flags: RegExpFlags,
@@ -1618,6 +1720,547 @@ mod tests {
 
     fn units(value: &str) -> Vec<u16> {
         value.encode_utf16().collect()
+    }
+
+    #[test]
+    fn search_plan_agrees_with_unfiltered_execution() {
+        for pattern in [
+            "abc",
+            "(a)b",
+            "^ab",
+            "\\bab",
+            "é",
+            "a?b",
+            "a|b",
+            "(?=a)a",
+            "",
+            "😀a",
+            "\\ud800",
+            "(a)\\1",
+            "[a-z]+END",
+            "a{0,3}bc",
+            ".*abc",
+            "(?:ab|cd)ef",
+            "a*b",
+            "(?<=x)ab",
+            "(?<!a)b",
+            "(?=ab)ab",
+            "(a|ab)+b",
+            "(?i:a)b",
+            "(?-i:a)b",
+            "(?m:^a)b",
+            "(?:^a|^b)",
+            "(?:a?|b)c",
+            "[A-Z]+",
+            "[^a]+b",
+            "(a)?\\1b",
+            "[\\uD800-\\uDFFF]+a",
+            "\\uD800a",
+            "a\\uDC00",
+            "[a-z]{0}b",
+            "a{257}",
+        ] {
+            for flags in ["", "u", "y", "i", "m"] {
+                let filtered = compile(pattern, flags);
+                let plain = program(
+                    filtered.flags(),
+                    filtered.capture_count(),
+                    filtered.register_count(),
+                    filtered.instructions().to_vec(),
+                );
+                for text in [
+                    "", "abc", "zzzabc", "baab", "\né", "😀abc", "a\nab", "END", "abcEND",
+                    "xyzEND", "KaſAb", "xabab", "cddef",
+                ] {
+                    let input = units(text);
+                    for start in 0..=input.len() {
+                        assert_eq!(
+                            execute(&ScratchCache::new(), &filtered, &input, start),
+                            execute(&ScratchCache::new(), &plain, &input, start),
+                            "{pattern:?}/{flags} {text:?} @{start}"
+                        );
+                    }
+                }
+                for input in [
+                    vec![0xd800, 0xdc00, 0x61],
+                    vec![0xd800, 0x61, 0xdc00],
+                    vec![0x61, 0xd800, 0xdc00],
+                    vec![0xdc00, 0xd800],
+                ] {
+                    for start in 0..=input.len() {
+                        assert_eq!(
+                            execute(&ScratchCache::new(), &filtered, &input, start),
+                            execute(&ScratchCache::new(), &plain, &input, start),
+                            "{pattern:?}/{flags} {input:?} @{start}"
+                        );
+                    }
+                }
+                for bytes in [&b""[..], &b"zzzabc"[..], &[0xe9, b'a'][..]] {
+                    for start in 0..=bytes.len() {
+                        assert_eq!(
+                            execute_latin1_with_interrupt(
+                                &ScratchCache::new(),
+                                &filtered,
+                                bytes,
+                                start,
+                                || false
+                            ),
+                            execute_latin1_with_interrupt(
+                                &ScratchCache::new(),
+                                &plain,
+                                bytes,
+                                start,
+                                || false
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn required_literal_retains_its_prefix_and_unicode_sets_alternatives() {
+        for (pattern, flags, text, expected) in [
+            ("[a-z]{2,4}END", "", "012abcEND", Some(3..9)),
+            ("[a-z]*END", "", "012abcEND", Some(3..9)),
+            ("a?END", "y", "aEND", Some(0..4)),
+            ("[\\q{ab|}]c", "v", "abc", Some(0..3)),
+            ("[\\q{ab|}]c", "v", "c", Some(0..1)),
+            ("[\\q{😀|ab}]c", "v", "😀c", Some(0..3)),
+        ] {
+            let filtered = compile(pattern, flags);
+            let plain = program(
+                filtered.flags(),
+                filtered.capture_count(),
+                filtered.register_count(),
+                filtered.instructions().to_vec(),
+            );
+            let input = units(text);
+            assert_eq!(
+                execute(&ScratchCache::new(), &filtered, &input, 0),
+                execute(&ScratchCache::new(), &plain, &input, 0)
+            );
+            assert_eq!(
+                execute(&ScratchCache::new(), &filtered, &input, 0)
+                    .unwrap()
+                    .and_then(|m| m.capture(0).cloned()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_start_rejections_do_not_search_the_remaining_input() {
+        let mut input = vec![u16::from(b'x'); 30_000];
+        input[0] = u16::from(b'a');
+        input.extend(units("abcEND"));
+        let latin1: Vec<u8> = input.iter().map(|unit| *unit as u8).collect();
+        for (pattern, flags) in [
+            ("abc", "y"),
+            ("(abc)", "y"),
+            ("[ab]+END", "y"),
+            ("^abc", ""),
+            ("^a.*END", ""),
+            ("^(?:a|b)cEND", ""),
+        ] {
+            // ^a.*END must inspect its suffix; use a first-character miss for
+            // that case. The others accept the first character, then reject.
+            let start = usize::from(pattern == "^a.*END");
+            let compiled = compile(pattern, flags);
+            assert_eq!(
+                execute_with_interrupt(&ScratchCache::new(), &compiled, &input[start..], 0, || {
+                    panic!("{pattern}/{flags} searched past its only start")
+                }),
+                Ok(None)
+            );
+            assert_eq!(
+                execute_latin1_with_interrupt(
+                    &ScratchCache::new(),
+                    &compiled,
+                    &latin1[start..],
+                    0,
+                    || { panic!("Latin-1 {pattern}/{flags} searched past its only start") }
+                ),
+                Ok(None)
+            );
+        }
+        // lastIndex may be nonzero, and the first-character test alone is not
+        // sufficient: the literal still differs at its second character.
+        for flags in ["y", "uy"] {
+            let compiled = compile("abc", flags);
+            let mut input = units("xa");
+            input.extend(core::iter::repeat_n(u16::from(b'x'), 30_000));
+            input.extend(units("abc"));
+            assert_eq!(
+                execute_with_interrupt(&ScratchCache::new(), &compiled, &input, 1, || {
+                    panic!("sticky literal searched beyond lastIndex")
+                }),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_start_prefilter_still_cuts_off_expensive_failures() {
+        let input = vec![u16::from(b'a'); 30];
+        for (pattern, flags) in [("^(a+)+END$", ""), ("(a+)+END$", "y")] {
+            let compiled = compile(pattern, flags);
+            let mut polls = 0;
+            // Keep this test bounded even if deferred rejection is removed:
+            // a missing literal must reject before exponential backtracking
+            // exhausts the interrupt allowance.
+            assert_eq!(
+                execute_with_interrupt(&ScratchCache::new(), &compiled, &input, 0, || {
+                    polls += 1;
+                    polls > 2
+                }),
+                Ok(None),
+                "{pattern}/{flags} exhausted its backtracking allowance"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_prefilter_resumes_captures_and_polls_during_its_scan() {
+        let input = units(&format!("{}END", "a".repeat(300)));
+        let latin1: Vec<u8> = input.iter().map(|unit| *unit as u8).collect();
+        for (pattern, flags) in [
+            ("^([ab]+)(END)$", ""),
+            ("([ab]+)(END)$", "y"),
+            ("([ab]+)(END)$", "uy"),
+            ("^([ab]{200,400})(END)$", ""),
+            ("^((a|aa)+)(END)$", ""),
+        ] {
+            let compiled = compile(pattern, flags);
+            let original = crate::compiler::compile_unoptimized(&units(pattern), &units(flags));
+            let expected = execute(&ScratchCache::new(), &original, &input, 0).unwrap();
+            assert!(expected.is_some());
+            assert_eq!(
+                execute(&ScratchCache::new(), &compiled, &input, 0).unwrap(),
+                expected
+            );
+            assert_eq!(
+                execute_latin1_with_interrupt(&ScratchCache::new(), &compiled, &latin1, 0, || {
+                    false
+                })
+                .unwrap(),
+                expected
+            );
+        }
+
+        let compiled = compile("^([ab]+)(END)$", "");
+        let long = units(&format!("{}END", "a".repeat(30_000)));
+        assert_eq!(
+            execute_with_interrupt(&ScratchCache::new(), &compiled, &long, 0, || true),
+            Err(ExecError::Interrupted)
+        );
+        // Interruption during the proof must release and clear its lease.
+        assert_eq!(
+            execute(&ScratchCache::new(), &compiled, &input, 0)
+                .unwrap()
+                .unwrap()
+                .capture(1),
+            Some(&(0..300))
+        );
+    }
+
+    #[test]
+    fn fused_repetitions_agree_with_the_original_instruction_path() {
+        for pattern in [
+            "[ab]*b",
+            "[ab]*?b",
+            "[ab]+b",
+            "[ab]+?b",
+            "[ab]{2,4}b",
+            "[ab]{2,4}?b",
+            "[ab]{3}b",
+            "[ab]{0,2}b",
+            "[ab]{0,2}?b",
+            "[ab]{2,}b",
+            "[ab]{2,}?b",
+            "([ab]+)([ab]*)",
+            "([ab]+?)([ab]*)",
+            "(?:([ab]+)|[ab]+)b",
+            "([ab]+)?\\1",
+            "(?=([ab]+))[ab]*b",
+            "(?![ab]+b)[ab]*",
+            "(?<=([ab]+))[ab]+",
+            "([ab]+a)*",
+            "([ab]*?b)*",
+            "[^a]+a",
+            "[a-z]+",
+            "[\\s\\S]*b",
+            "^([ab]+)$",
+            "(?i:[a-z]+)(?-i:[ab]*)",
+            "[\\uD800-\\uDFFF]+a",
+            "[😀a]+b",
+            "[😀a]+?b",
+            // Possessive where the follower is disjoint, and the near misses.
+            "[ab]+x",
+            "[ab]*x",
+            "[ab]+$",
+            "[ab]+(x)",
+            "[ab]+[^ab]",
+            "[^x]+x",
+            "[ab]+\\s",
+            "[ab]+.",
+            "[ab]+[xa]",
+            "[ab]+(?:x|a)",
+            "[ab]+[x\\n]{1,2}",
+            "[ab]+[ab]?x",
+            "([ab]+)x\\1",
+        ] {
+            for flags in ["", "u", "y", "i", "iu", "m", "v"] {
+                let optimized = compile(pattern, flags);
+                let original = crate::compiler::compile_unoptimized(&units(pattern), &units(flags));
+                assert!(
+                    optimized
+                        .instructions()
+                        .iter()
+                        .any(|i| matches!(i, Instruction::ClassRepeat(_)))
+                );
+                let alphabet = [0x61u16, 0x62, 0x78, 0x0a, 0x212a, 0x17f, 0xd83d, 0xde00];
+                let mut seed = 17u32;
+                for index in 0..120 {
+                    let mut input = Vec::new();
+                    for _ in 0..index % 8 {
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        input.push(alphabet[(seed >> 16) as usize % alphabet.len()]);
+                    }
+                    for start in 0..=input.len() {
+                        assert_eq!(
+                            execute(&ScratchCache::new(), &optimized, &input, start),
+                            execute(&ScratchCache::new(), &original, &input, start),
+                            "{pattern}/{flags} {input:?} @{start}"
+                        );
+                    }
+                }
+                for input in [&b""[..], &b"aaaaab"[..], &b"abbabba"[..], &b"xab\nab"[..]] {
+                    for start in 0..=input.len() {
+                        assert_eq!(
+                            execute_latin1_with_interrupt(
+                                &ScratchCache::new(),
+                                &optimized,
+                                input,
+                                start,
+                                || false
+                            ),
+                            execute_latin1_with_interrupt(
+                                &ScratchCache::new(),
+                                &original,
+                                input,
+                                start,
+                                || false
+                            ),
+                            "{pattern}/{flags} {input:?} @{start}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A greedy class repeat is possessive only where what reads after it
+    /// cannot read one of its characters.
+    #[test]
+    fn possessive_repeats_are_those_whose_follower_rejects_their_characters() {
+        let possessive = |pattern: &str, flags: &str| {
+            compile(pattern, flags)
+                .instructions()
+                .iter()
+                .find_map(|instruction| match instruction {
+                    Instruction::ClassRepeat(repeat) => Some(repeat.possessive),
+                    _ => None,
+                })
+                .expect("a class repeat")
+        };
+        for pattern in [
+            r"\d*:",
+            "[ab]+x",
+            "[ab]+$",
+            "[ab]+(x)",
+            "[ab]+[^ab]",
+            "[ab]+",
+            r"\w+\s",
+        ] {
+            assert!(possessive(pattern, ""), "{pattern}");
+        }
+        for pattern in [
+            "[ab]+?x",
+            "[ab]+[xa]",
+            "[ab]+(?:x|a)",
+            "[ab]+[ab]?x",
+            "[ab]+.",
+            "[ab]+$",
+        ] {
+            let flags = if pattern.ends_with('$') { "m" } else { "" };
+            assert!(!possessive(pattern, flags), "{pattern}/{flags}");
+        }
+        // A case-insensitive set is not compared.
+        assert!(!possessive("[ab]+x", "i"));
+    }
+
+    #[test]
+    fn repeated_scans_poll_and_lazy_empty_matches_do_not_scan_ahead() {
+        let input = vec![u16::from(b'a'); 30_000];
+        for pattern in ["[a-z]+$", "[a-z]{20000}", "[a-z]*?b"] {
+            // A required literal could reject before reaching repetition, so
+            // remove just the search plan for this interruption test.
+            let compiled = compile(pattern, "");
+            let unfiltered = program(
+                compiled.flags(),
+                compiled.capture_count(),
+                compiled.register_count(),
+                compiled.instructions().to_vec(),
+            );
+            assert_eq!(
+                execute_with_interrupt(&ScratchCache::new(), &unfiltered, &input, 0, || true),
+                Err(ExecError::Interrupted)
+            );
+        }
+        let lazy = compile("[a-z]*?", "");
+        assert_eq!(
+            execute_with_interrupt(&ScratchCache::new(), &lazy, &input, 0, || panic!(
+                "empty lazy match scanned input"
+            ))
+            .unwrap()
+            .unwrap()
+            .capture(0),
+            Some(&(0..0))
+        );
+    }
+
+    #[test]
+    fn scratch_is_reentrant_cleared_after_errors_and_bounded() {
+        let cache = ScratchCache::new();
+        let outer = compile("([a-z]+)$", "");
+        let inner = compile("(b)+", "");
+        let input = vec![u16::from(b'a'); 30_000];
+        let mut called = false;
+        assert!(
+            execute_with_interrupt(&cache, &outer, &input, 0, || {
+                called = true;
+                assert_eq!(
+                    execute(&cache, &inner, &units("bb"), 0)
+                        .unwrap()
+                        .unwrap()
+                        .capture(1),
+                    Some(&(1..2))
+                );
+                false
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert!(called);
+        assert_eq!(
+            execute_with_interrupt(&cache, &outer, &input, 0, || true),
+            Err(ExecError::Interrupted)
+        );
+        assert_eq!(
+            execute(&cache, &inner, &units("b"), 0)
+                .unwrap()
+                .unwrap()
+                .capture(1),
+            Some(&(0..1))
+        );
+        {
+            let spare = cache.spare.borrow();
+            let state = spare.as_ref().unwrap();
+            assert!(state.captures.iter().all(Option::is_none));
+            assert!(state.controls.is_empty() && state.undo.is_empty());
+        }
+        let mut large = Scratch::acquire(&cache, 1, 0, 0).unwrap();
+        large
+            .state
+            .controls
+            .reserve(MAX_SCRATCH_BYTES / size_of::<ControlFrame>() + 1);
+        drop(large);
+        assert!(cache.spare.borrow().is_none());
+    }
+
+    #[test]
+    fn scratch_cache_reuses_all_buffers_and_keeps_the_first_spare() {
+        let cache = ScratchCache::new();
+        let mut outer = cache.take().unwrap_or_default();
+        outer.prepare(2, 1, 0).unwrap();
+        let mut inner = cache.take().unwrap_or_default();
+        inner.prepare(1, 1, 0).unwrap();
+        inner.push_backtrack(0).unwrap();
+        inner.undo.push(Undo::Capture {
+            slot: 0,
+            previous: None,
+        });
+        let buffers = (
+            inner.captures.as_ptr(),
+            inner.registers.as_ptr(),
+            inner.undo.as_ptr(),
+            inner.controls.as_ptr(),
+        );
+        assert!(ScratchCache::prepare_return(&mut inner));
+        cache.put_prepared(&mut inner);
+        assert!(ScratchCache::prepare_return(&mut outer));
+        cache.put_prepared(&mut outer);
+        let mut reused = cache.take().unwrap();
+        reused.prepare(1, 1, 0).unwrap();
+        assert_eq!(
+            (
+                reused.captures.as_ptr(),
+                reused.registers.as_ptr(),
+                reused.undo.as_ptr(),
+                reused.controls.as_ptr(),
+            ),
+            buffers,
+        );
+    }
+
+    #[test]
+    fn first_unit_filter_polls_while_skipping_failed_candidates() {
+        let program = compile("z", "u");
+        assert!(program.search().first.contains(u16::from(b'z')));
+        assert_eq!(
+            execute_with_interrupt(
+                &ScratchCache::new(),
+                &program,
+                &vec![u16::from(b'a'); 30_000],
+                0,
+                || true
+            ),
+            Err(ExecError::Interrupted)
+        );
+    }
+
+    #[test]
+    fn literal_scans_keep_the_interrupt_budget_at_chunk_boundaries() {
+        let compiled = compile("abc", "u");
+        for prefix in [0, 9_997, 9_998, 9_999, 10_000, 10_001, 20_000] {
+            let mut input = vec![u16::from(b'x'); prefix];
+            input.extend(units("abc"));
+            let mut polls = 0;
+            let result = execute_with_interrupt(&ScratchCache::new(), &compiled, &input, 0, || {
+                polls += 1;
+                false
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.capture(0), Some(&(prefix..prefix + 3)));
+            assert_eq!(polls, (prefix + 3) / INTERRUPT_POLL_INTERVAL as usize);
+            let latin1: Vec<u8> = input.iter().map(|unit| *unit as u8).collect();
+            assert_eq!(
+                execute_latin1_with_interrupt(&ScratchCache::new(), &compiled, &latin1, 0, || {
+                    false
+                })
+                .unwrap(),
+                Some(result)
+            );
+            if prefix + 3 >= INTERRUPT_POLL_INTERVAL as usize {
+                assert_eq!(
+                    execute_with_interrupt(&ScratchCache::new(), &compiled, &input, 0, || true),
+                    Err(ExecError::Interrupted)
+                );
+            }
+        }
     }
 
     #[test]
@@ -1658,8 +2301,14 @@ mod tests {
             let wide = bytes.iter().copied().map(u16::from).collect::<Vec<_>>();
             for start in 0..=bytes.len() {
                 assert_eq!(
-                    execute_latin1_with_interrupt(&program, bytes, start, || false),
-                    execute(&program, &wide, start)
+                    execute_latin1_with_interrupt(
+                        &ScratchCache::new(),
+                        &program,
+                        bytes,
+                        start,
+                        || false
+                    ),
+                    execute(&ScratchCache::new(), &program, &wide, start)
                 );
             }
         }
@@ -1712,16 +2361,36 @@ mod tests {
         let input = units("zzababa");
         assert_eq!(
             complete_range(
-                execute(&captured(RegExpFlags::EMPTY, body.clone()), &input, 0).unwrap()
+                execute(
+                    &ScratchCache::new(),
+                    &captured(RegExpFlags::EMPTY, body.clone()),
+                    &input,
+                    0
+                )
+                .unwrap()
             ),
             Some(2..4)
         );
         assert_eq!(
-            execute(&captured(RegExpFlags::STICKY, body.clone()), &input, 0).unwrap(),
+            execute(
+                &ScratchCache::new(),
+                &captured(RegExpFlags::STICKY, body.clone()),
+                &input,
+                0
+            )
+            .unwrap(),
             None
         );
         assert_eq!(
-            complete_range(execute(&captured(RegExpFlags::STICKY, body), &input, 2).unwrap()),
+            complete_range(
+                execute(
+                    &ScratchCache::new(),
+                    &captured(RegExpFlags::STICKY, body),
+                    &input,
+                    2
+                )
+                .unwrap()
+            ),
             Some(2..4)
         );
     }
@@ -1776,11 +2445,11 @@ mod tests {
         );
         let input = units("aaab");
         assert_eq!(
-            complete_range(execute(&greedy, &input, 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &greedy, &input, 0).unwrap()),
             Some(0..3)
         );
         assert_eq!(
-            complete_range(execute(&lazy, &input, 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &lazy, &input, 0).unwrap()),
             Some(0..1)
         );
     }
@@ -1820,7 +2489,9 @@ mod tests {
                 Instruction::Match,
             ],
         );
-        let result = execute(&regexp, &units("ab"), 0).unwrap().unwrap();
+        let result = execute(&ScratchCache::new(), &regexp, &units("ab"), 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(result.capture(0), Some(&(0..2)));
         assert_eq!(result.capture(1), None);
     }
@@ -1839,13 +2510,16 @@ mod tests {
             ],
         );
         assert_eq!(
-            complete_range(execute(&multiline, &units("a\nb\r\nc"), 0).unwrap()),
+            complete_range(
+                execute(&ScratchCache::new(), &multiline, &units("a\nb\r\nc"), 0).unwrap()
+            ),
             Some(2..3)
         );
 
         let newline = [u16::from(b'\n')];
         assert_eq!(
             execute(
+                &ScratchCache::new(),
                 &captured(RegExpFlags::EMPTY, vec![Instruction::Dot]),
                 &newline,
                 0,
@@ -1856,6 +2530,7 @@ mod tests {
         assert_eq!(
             complete_range(
                 execute(
+                    &ScratchCache::new(),
                     &captured(RegExpFlags::EMPTY, vec![Instruction::Any]),
                     &newline,
                     0,
@@ -1878,7 +2553,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            complete_range(execute(&class, &units("xx5"), 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &class, &units("xx5"), 0).unwrap()),
             Some(2..3)
         );
 
@@ -1887,7 +2562,9 @@ mod tests {
             vec![Instruction::Space { inverted: false }],
         );
         assert_eq!(
-            complete_range(execute(&space, &[u16::from(b'x'), 0x00a0], 0).unwrap()),
+            complete_range(
+                execute(&ScratchCache::new(), &space, &[u16::from(b'x'), 0x00a0], 0).unwrap()
+            ),
             Some(1..2)
         );
 
@@ -1902,7 +2579,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            complete_range(execute(&word, &[0x212a], 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &word, &[0x212a], 0).unwrap()),
             Some(0..1)
         );
 
@@ -1916,7 +2593,10 @@ mod tests {
                 Instruction::Any,
             ],
         );
-        assert_eq!(execute(&legacy_word, &[0x017f], 0).unwrap(), None);
+        assert_eq!(
+            execute(&ScratchCache::new(), &legacy_word, &[0x017f], 0).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1930,18 +2610,18 @@ mod tests {
             }],
         );
         assert_eq!(
-            complete_range(execute(&literal, &smile, 1).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &literal, &smile, 1).unwrap()),
             Some(0..2)
         );
 
         let unicode_any = captured(RegExpFlags::UNICODE, vec![Instruction::Any]);
         let code_unit_any = captured(RegExpFlags::EMPTY, vec![Instruction::Any]);
         assert_eq!(
-            complete_range(execute(&unicode_any, &smile, 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &unicode_any, &smile, 0).unwrap()),
             Some(0..2)
         );
         assert_eq!(
-            complete_range(execute(&code_unit_any, &smile, 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &code_unit_any, &smile, 0).unwrap()),
             Some(0..1)
         );
 
@@ -1953,7 +2633,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            complete_range(execute(&kelvin, &[0x212a], 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &kelvin, &[0x212a], 0).unwrap()),
             Some(0..1)
         );
     }
@@ -1983,7 +2663,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            complete_range(execute(&exact_three, &units("aaab"), 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &exact_three, &units("aaab"), 0).unwrap()),
             Some(0..3)
         );
 
@@ -2001,174 +2681,9 @@ mod tests {
             ],
         );
         assert_eq!(
-            complete_range(execute(&advances, &units("x"), 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &advances, &units("x"), 0).unwrap()),
             Some(0..1)
         );
-    }
-
-    /// Compiled with character loops and without (QuickJS's split loops),
-    /// a pattern finds the same match and captures.
-    fn with_and_without_loops(
-        pattern: &str,
-        flags: &str,
-    ) -> Option<(CompiledRegExp, CompiledRegExp)> {
-        let compile = |on: bool| {
-            super::super::compiler::CHAR_LOOPS.with(|loops| loops.set(on));
-            let compiled = super::super::compiler::compile_units(&units(pattern), &units(flags));
-            super::super::compiler::CHAR_LOOPS.with(|loops| loops.set(true));
-            compiled.ok()
-        };
-        Some((compile(true)?, compile(false)?))
-    }
-
-    fn assert_same_matches(pattern: &str, flags: &str, inputs: &[Vec<u16>]) {
-        let Some((loops, splits)) = with_and_without_loops(pattern, flags) else {
-            return;
-        };
-        for input in inputs {
-            for start in 0..=input.len() {
-                let expected = execute(&splits, input, start);
-                assert_eq!(
-                    execute(&loops, input, start),
-                    expected,
-                    "/{pattern}/{flags} on {:?} from {start}",
-                    String::from_utf16_lossy(input)
-                );
-                if let Some(bytes) = input
-                    .iter()
-                    .map(|&unit| u8::try_from(unit).ok())
-                    .collect::<Option<Vec<u8>>>()
-                {
-                    assert_eq!(
-                        execute_latin1_with_interrupt(&loops, &bytes, start, || false),
-                        expected,
-                        "/{pattern}/{flags} on Latin-1 {:?} from {start}",
-                        String::from_utf16_lossy(input)
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn character_loops_match_as_split_loops_do() {
-        let mut inputs = [
-            "",
-            "12345.6",
-            "a1b2::c",
-            "aaab",
-            "ab ab\nab",
-            "2026-11-08 10:00:01 ERROR Find: 404\n",
-            "x\u{1F600}\u{1F600}y",
-            "AaBb",
-            "::1:",
-        ]
-        .map(units)
-        .to_vec();
-        // Lone and paired surrogates.
-        inputs.push(vec![
-            0xd83d,
-            u16::from(b'a'),
-            0xde00,
-            0xd83d,
-            0xde00,
-            0xde00,
-        ]);
-        for (pattern, flags) in [
-            // zipp's counterexample to skipping a failed loop's run.
-            (r"(\d{1,3})\.", ""),
-            (r"\d*:", ""),
-            (r"ERROR (\w+): (\d+)", ""),
-            (r"\d*1", ""),
-            (r"(a*)ab", ""),
-            (r"a{2,3}a", ""),
-            (r"a{2,3}?a", ""),
-            (r".*x", ""),
-            (r".+y", "u"),
-            (r".+\u{DE00}", "u"),
-            (r"[^a]*a", "u"),
-            (r"\S+\s", ""),
-            (r"(?=(\d+))\d", ""),
-            (r"(?!\d+:)\d", ""),
-            (r"(?<=a+)b", ""),
-            (r"(\w+)\s\1", ""),
-            (r"a+$", "m"),
-            (r"b+$", ""),
-            (r"^\w*", "m"),
-            (r"a*B", "i"),
-            (r"[a-c]+B", "i"),
-            (r"(?:x\d+|y):", ""),
-            (r"\d{3,}", ""),
-            (r"\d{0}a", ""),
-            (r"(?:a|\d+)+:", ""),
-        ] {
-            assert_same_matches(pattern, flags, &inputs);
-        }
-    }
-
-    #[test]
-    fn random_patterns_match_as_split_loops_do() {
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = move |bound: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % bound as u64) as usize
-        };
-        const ATOMS: [&str; 14] = [
-            "a", "b", "1", ":", ".", r"\d", r"\w", r"\s", r"\S", "[ab]", "[^a]", r"\b", "$", "^",
-        ];
-        const QUANTIFIERS: [&str; 10] = ["", "", "*", "+", "?", "{2}", "{1,2}", "{2,}", "*?", "+?"];
-        const FLAGS: [&str; 5] = ["", "i", "m", "u", "s"];
-        const ALPHABET: [&str; 7] = ["a", "b", "1", ":", " ", "\n", "A"];
-        let mut inputs = Vec::new();
-        for _ in 0..12 {
-            let length = next(9);
-            inputs.push(units(
-                &(0..length)
-                    .map(|_| ALPHABET[next(ALPHABET.len())])
-                    .collect::<String>(),
-            ));
-        }
-        for _ in 0..2000 {
-            let mut pattern = String::new();
-            for term in 0..1 + next(4) {
-                if term > 0 && next(6) == 0 {
-                    pattern.push('|');
-                }
-                let atom = match next(8) {
-                    0 => format!("({}{})", ATOMS[next(ATOMS.len())], QUANTIFIERS[next(4)]),
-                    1 => format!(
-                        "(?:{}|{})",
-                        ATOMS[next(ATOMS.len())],
-                        ATOMS[next(ATOMS.len())]
-                    ),
-                    2 => format!("(?={})", ATOMS[next(ATOMS.len())]),
-                    _ => ATOMS[next(ATOMS.len())].to_owned(),
-                };
-                pattern.push_str(&atom);
-                pattern.push_str(QUANTIFIERS[next(QUANTIFIERS.len())]);
-            }
-            assert_same_matches(&pattern, FLAGS[next(FLAGS.len())], &inputs);
-        }
-    }
-
-    #[test]
-    fn first_units_take_a_loop_and_its_follower() {
-        let first = |pattern: &str| compile(pattern, "").first_units().cloned();
-        let digits_or_colon = first(r"\d*:").unwrap();
-        for unit in "0123456789:".encode_utf16() {
-            assert!(digits_or_colon.contains(unit));
-        }
-        assert!(!digits_or_colon.contains(u16::from(b'a')));
-        assert_eq!(first(r"\d+x").unwrap().find(&units("ab7x")), Some(2));
-        assert_eq!(first("E+RROR").unwrap().single, Some(u16::from(b'E')));
-        assert_eq!(first("ERROR").unwrap().find(&units(&"x".repeat(40))), None);
-        let long = format!("{}E", "x".repeat(37));
-        assert_eq!(first("ERROR").unwrap().find(long.as_bytes()), Some(37));
-        // A loop with no minimum before the end can match anywhere.
-        assert_eq!(first(r"\d*"), None);
-        assert_eq!(first(r"a*b*"), None);
     }
 
     /// A back-reference's compare counts its capture's length toward the
@@ -2180,7 +2695,7 @@ mod tests {
         let polls = |pattern: &str| {
             let program = compile(pattern, "");
             let mut polls = 0;
-            execute_with_interrupt(&program, &input, 0, || {
+            execute_with_interrupt(&ScratchCache::new(), &program, &input, 0, || {
                 polls += 1;
                 false
             })
@@ -2194,12 +2709,52 @@ mod tests {
         let program = compile(r"(a{50000})\1", "");
         let mut polls = 0;
         assert_eq!(
-            execute_with_interrupt(&program, &input, 0, || {
+            execute_with_interrupt(&ScratchCache::new(), &program, &input, 0, || {
                 polls += 1;
                 polls > alone
             }),
             Err(ExecError::Interrupted)
         );
+    }
+
+    /// A countdown carried from one search to the next polls a `/g` loop of
+    /// short matches by their total work, where a fresh countdown per call
+    /// would never reach a poll.
+    #[test]
+    fn a_carried_countdown_polls_a_loop_of_short_searches() {
+        let program = compile("a", "g");
+        let input = units(&"a".repeat(30_000));
+        let mut countdown = POLL_INTERVAL;
+        let mut polls = 0;
+        let mut start = 0;
+        while let Some(found) = execute_with_countdown(
+            &ScratchCache::new(),
+            &program,
+            &input,
+            start,
+            &mut countdown,
+            || {
+                polls += 1;
+                false
+            },
+        )
+        .unwrap()
+        {
+            start = found.capture(0).unwrap().end;
+        }
+        assert!(polls >= 2, "{polls} polls");
+        let mut fresh = 0;
+        let mut start = 0;
+        while let Some(found) =
+            execute_with_interrupt(&ScratchCache::new(), &program, &input, start, || {
+                fresh += 1;
+                false
+            })
+            .unwrap()
+        {
+            start = found.capture(0).unwrap().end;
+        }
+        assert_eq!(fresh, 0);
     }
 
     #[test]
@@ -2211,7 +2766,7 @@ mod tests {
             vec![Instruction::Jump { target: 0 }],
         );
         let mut polls = 0;
-        let error = execute_with_interrupt(&looping, &[], 0, || {
+        let error = execute_with_interrupt(&ScratchCache::new(), &looping, &[], 0, || {
             polls += 1;
             true
         })
@@ -2229,7 +2784,7 @@ mod tests {
             vec![Instruction::Jump { target: 4 }],
         );
         assert_eq!(
-            execute(&invalid, &[], 0),
+            execute(&ScratchCache::new(), &invalid, &[], 0),
             Err(ExecError::InvalidProgram(ProgramError::BranchTarget {
                 pc: 0,
                 target: 4,
@@ -2246,7 +2801,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            execute(&empty_back_reference, &[], 0),
+            execute(&ScratchCache::new(), &empty_back_reference, &[], 0),
             Err(ExecError::InvalidProgram(
                 ProgramError::EmptyBackReference { pc: 0 }
             ))
@@ -2261,7 +2816,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            execute(&empty_backward_reference, &[], 0),
+            execute(&ScratchCache::new(), &empty_backward_reference, &[], 0),
             Err(ExecError::InvalidProgram(
                 ProgramError::EmptyBackReference { pc: 0 }
             ))
@@ -2277,7 +2832,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            execute(&invalid_back_reference, &[], 0),
+            execute(&ScratchCache::new(), &invalid_back_reference, &[], 0),
             Err(ExecError::InvalidProgram(ProgramError::CaptureIndex {
                 pc: 0,
                 capture: 1,
@@ -2293,7 +2848,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            execute(&invalid_backward_reference, &[], 0),
+            execute(&ScratchCache::new(), &invalid_backward_reference, &[], 0),
             Err(ExecError::InvalidProgram(ProgramError::CaptureIndex {
                 pc: 0,
                 capture: 1,
@@ -2377,7 +2932,7 @@ mod tests {
         ] {
             let invalid = program(RegExpFlags::EMPTY, 1, 0, instructions);
             assert_eq!(
-                execute(&invalid, &[], 0),
+                execute(&ScratchCache::new(), &invalid, &[], 0),
                 Err(ExecError::InvalidProgram(
                     ProgramError::AssertionStructure { pc }
                 ))
@@ -2389,12 +2944,12 @@ mod tests {
     fn compiler_programs_execute_quantifiers_backtracking_and_captures() {
         let input = units("xxabbbc");
         assert_eq!(
-            complete_range(execute(&compile("ab+c", ""), &input, 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &compile("ab+c", ""), &input, 0).unwrap()),
             Some(2..7)
         );
 
         let input = units("abc");
-        let result = execute(&compile("(a|ab)c", "y"), &input, 0)
+        let result = execute(&ScratchCache::new(), &compile("(a|ab)c", "y"), &input, 0)
             .unwrap()
             .unwrap();
         assert_eq!(result.capture(0).cloned(), Some(0..3));
@@ -2402,11 +2957,15 @@ mod tests {
 
         let input = units("aaab");
         assert_eq!(
-            complete_range(execute(&compile("(?:a?)*b", "y"), &input, 0).unwrap()),
+            complete_range(
+                execute(&ScratchCache::new(), &compile("(?:a?)*b", "y"), &input, 0).unwrap()
+            ),
             Some(0..4)
         );
         assert_eq!(
-            complete_range(execute(&compile("a{2,4}?", "y"), &input, 0).unwrap()),
+            complete_range(
+                execute(&ScratchCache::new(), &compile("a{2,4}?", "y"), &input, 0).unwrap()
+            ),
             Some(0..2)
         );
     }
@@ -2415,20 +2974,32 @@ mod tests {
     fn compiler_programs_execute_unicode_and_ignore_case() {
         let input = units("x😀😀");
         assert_eq!(
-            complete_range(execute(&compile("😀+", "u"), &input, 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &compile("😀+", "u"), &input, 0).unwrap()),
             Some(1..5)
         );
 
         assert_eq!(
-            complete_range(execute(&compile("a", "i"), &units("A"), 0).unwrap()),
+            complete_range(
+                execute(&ScratchCache::new(), &compile("a", "i"), &units("A"), 0).unwrap()
+            ),
             Some(0..1)
         );
         assert_eq!(
-            complete_range(execute(&compile("[A-Z]", "iu"), &units("k"), 0).unwrap()),
+            complete_range(
+                execute(
+                    &ScratchCache::new(),
+                    &compile("[A-Z]", "iu"),
+                    &units("k"),
+                    0
+                )
+                .unwrap()
+            ),
             Some(0..1)
         );
         assert_eq!(
-            complete_range(execute(&compile("[k]", "iu"), &[0x212a], 0).unwrap()),
+            complete_range(
+                execute(&ScratchCache::new(), &compile("[k]", "iu"), &[0x212a], 0).unwrap()
+            ),
             Some(0..1)
         );
     }
@@ -2448,7 +3019,15 @@ mod tests {
             (r"^\p{RGI_Emoji_Flag_Sequence}$", "v", "🇨🇳", Some(0..4)),
         ] {
             assert_eq!(
-                complete_range(execute(&compile(pattern, flags), &units(input), 0).unwrap()),
+                complete_range(
+                    execute(
+                        &ScratchCache::new(),
+                        &compile(pattern, flags),
+                        &units(input),
+                        0
+                    )
+                    .unwrap()
+                ),
                 expected,
                 "{pattern:?}/{flags} on {input:?}",
             );
@@ -2463,7 +3042,15 @@ mod tests {
             (r"(?<=[\q{ba}])a", "baa", Some(1..2)),
         ] {
             assert_eq!(
-                complete_range(execute(&compile(pattern, "v"), &units(input), 0).unwrap()),
+                complete_range(
+                    execute(
+                        &ScratchCache::new(),
+                        &compile(pattern, "v"),
+                        &units(input),
+                        0
+                    )
+                    .unwrap()
+                ),
                 expected,
                 "{pattern:?} on {input:?}",
             );
@@ -2485,14 +3072,19 @@ mod tests {
             (r"(a)?\1b", "b", 0..1, vec![Some(0..1), None]),
             (r"()\1x", "x", 0..1, vec![Some(0..1), Some(0..0)]),
         ] {
-            let result = execute(&compile(pattern, "u"), &units(input), 0)
-                .unwrap()
-                .unwrap();
+            let result = execute(
+                &ScratchCache::new(),
+                &compile(pattern, "u"),
+                &units(input),
+                0,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(result.capture(0), Some(&complete), "{pattern}");
             assert_eq!(result.captures(), captures.as_slice(), "{pattern}");
         }
 
-        let empty_loop = execute(&compile(r"^(a)?\1*$", ""), &[], 0)
+        let empty_loop = execute(&ScratchCache::new(), &compile(r"^(a)?\1*$", ""), &[], 0)
             .unwrap()
             .unwrap();
         assert_eq!(empty_loop.capture(0), Some(&(0..0)));
@@ -2510,22 +3102,37 @@ mod tests {
             (r"^(?!(?!a))a$", "a", true),
         ] {
             assert_eq!(
-                execute(&compile(pattern, "u"), &units(input), 0)
-                    .unwrap()
-                    .is_some(),
+                execute(
+                    &ScratchCache::new(),
+                    &compile(pattern, "u"),
+                    &units(input),
+                    0
+                )
+                .unwrap()
+                .is_some(),
                 expected,
                 "{pattern}"
             );
         }
 
-        let positive = execute(&compile(r"^(?=(a+))\1$", "u"), &units("aaa"), 0)
-            .unwrap()
-            .unwrap();
+        let positive = execute(
+            &ScratchCache::new(),
+            &compile(r"^(?=(a+))\1$", "u"),
+            &units("aaa"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(positive.captures(), &[Some(0..3), Some(0..3)]);
 
-        let negative = execute(&compile(r"^(?!b(a))a\1$", "u"), &units("a"), 0)
-            .unwrap()
-            .unwrap();
+        let negative = execute(
+            &ScratchCache::new(),
+            &compile(r"^(?!b(a))a\1$", "u"),
+            &units("a"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(negative.captures(), &[Some(0..1), None]);
     }
 
@@ -2543,16 +3150,26 @@ mod tests {
             ),
             (r"(?<=\1(a))b", "aab", 2..3, vec![Some(2..3), Some(1..2)]),
         ] {
-            let result = execute(&compile(pattern, "u"), &units(input), 0)
-                .unwrap()
-                .unwrap();
+            let result = execute(
+                &ScratchCache::new(),
+                &compile(pattern, "u"),
+                &units(input),
+                0,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(result.capture(0), Some(&complete), "{pattern}");
             assert_eq!(result.captures(), captures.as_slice(), "{pattern}");
         }
 
-        let negative = execute(&compile(r"(?<!(^|[ab]))\w{2}", "u"), &units("abcdef"), 0)
-            .unwrap()
-            .unwrap();
+        let negative = execute(
+            &ScratchCache::new(),
+            &compile(r"(?<!(^|[ab]))\w{2}", "u"),
+            &units("abcdef"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(negative.captures(), &[Some(3..5), None]);
     }
 
@@ -2567,34 +3184,62 @@ mod tests {
             (r"(?<=\ba)b", "u", "ab", 1..2),
         ] {
             assert_eq!(
-                complete_range(execute(&compile(pattern, flags), &units(input), 0).unwrap()),
+                complete_range(
+                    execute(
+                        &ScratchCache::new(),
+                        &compile(pattern, flags),
+                        &units(input),
+                        0
+                    )
+                    .unwrap()
+                ),
                 Some(complete),
                 "{pattern}/{flags}",
             );
         }
 
-        let result = execute(&compile(r"(?<=\1(\w))d", "iu"), &units("abcCd"), 0)
-            .unwrap()
-            .unwrap();
+        let result = execute(
+            &ScratchCache::new(),
+            &compile(r"(?<=\1(\w))d", "iu"),
+            &units("abcCd"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.captures(), &[Some(4..5), Some(3..4)]);
     }
 
     #[test]
     fn lookbehind_is_atomic_and_rolls_back_abandoned_captures() {
         assert!(
-            execute(&compile(r"(?<=(a|ba))c", "u"), &units("bac"), 0)
-                .unwrap()
-                .is_some()
+            execute(
+                &ScratchCache::new(),
+                &compile(r"(?<=(a|ba))c", "u"),
+                &units("bac"),
+                0
+            )
+            .unwrap()
+            .is_some()
         );
 
-        let result = execute(&compile(r"(?:(?<=(a))b|a)", "u"), &units("a"), 0)
-            .unwrap()
-            .unwrap();
+        let result = execute(
+            &ScratchCache::new(),
+            &compile(r"(?:(?<=(a))b|a)", "u"),
+            &units("a"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.captures(), &[Some(0..1), None]);
 
-        let result = execute(&compile(r"(?<!(a))b", "u"), &units("b"), 0)
-            .unwrap()
-            .unwrap();
+        let result = execute(
+            &ScratchCache::new(),
+            &compile(r"(?<!(a))b", "u"),
+            &units("b"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.captures(), &[Some(0..1), None]);
     }
 
@@ -2607,20 +3252,33 @@ mod tests {
         );
 
         let at_start = captured(compile("", "uy").flags(), vec![Instruction::Prev]);
-        assert_eq!(execute(&at_start, &input, 0).unwrap(), None);
+        assert_eq!(
+            execute(&ScratchCache::new(), &at_start, &input, 0).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn positive_lookahead_is_atomic_and_outer_backtracking_undoes_its_captures() {
         assert!(
-            execute(&compile(r"^(?=(a|ab))\1c$", "u"), &units("abc"), 0)
-                .unwrap()
-                .is_none()
+            execute(
+                &ScratchCache::new(),
+                &compile(r"^(?=(a|ab))\1c$", "u"),
+                &units("abc"),
+                0
+            )
+            .unwrap()
+            .is_none()
         );
 
-        let result = execute(&compile(r"^(?:(?=(a))b|a)$", "u"), &units("a"), 0)
-            .unwrap()
-            .unwrap();
+        let result = execute(
+            &ScratchCache::new(),
+            &compile(r"^(?:(?=(a))b|a)$", "u"),
+            &units("a"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.captures(), &[Some(0..1), None]);
     }
 
@@ -2634,7 +3292,7 @@ mod tests {
             r"^(?!b)*a$",
         ] {
             assert!(
-                execute(&compile(pattern, ""), &units("a"), 0)
+                execute(&ScratchCache::new(), &compile(pattern, ""), &units("a"), 0)
                     .unwrap()
                     .is_some(),
                 "{pattern}"
@@ -2642,7 +3300,7 @@ mod tests {
         }
 
         for pattern in [r"^(?=(a))*a$", r"^(?=(a)){0}a$"] {
-            let result = execute(&compile(pattern, ""), &units("a"), 0)
+            let result = execute(&ScratchCache::new(), &compile(pattern, ""), &units("a"), 0)
                 .unwrap()
                 .unwrap();
             assert_eq!(result.captures(), &[Some(0..1), None], "{pattern}");
@@ -2651,44 +3309,79 @@ mod tests {
 
     #[test]
     fn backreferences_restore_backtracking_captures_and_apply_scoped_case_folding() {
-        let result = execute(&compile(r"^(a+)\1$", ""), &units("aaaaaa"), 0)
-            .unwrap()
-            .unwrap();
+        let result = execute(
+            &ScratchCache::new(),
+            &compile(r"^(a+)\1$", ""),
+            &units("aaaaaa"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.capture(0), Some(&(0..6)));
         assert_eq!(result.capture(1), Some(&(0..3)));
 
-        let result = execute(&compile(r"^(a|ab)+\1$", ""), &units("abab"), 0)
-            .unwrap()
-            .unwrap();
+        let result = execute(
+            &ScratchCache::new(),
+            &compile(r"^(a|ab)+\1$", ""),
+            &units("abab"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.capture(0), Some(&(0..4)));
         assert_eq!(result.capture(1), Some(&(0..2)));
 
-        let result = execute(&compile(r"(a(b)?)+\2", ""), &units("aba"), 0)
-            .unwrap()
-            .unwrap();
+        let result = execute(
+            &ScratchCache::new(),
+            &compile(r"(a(b)?)+\2", ""),
+            &units("aba"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.capture(0), Some(&(0..3)));
         assert_eq!(result.capture(1), Some(&(2..3)));
         assert_eq!(result.capture(2), None);
 
         assert!(
-            execute(&compile(r"(a)(?i:\1)", ""), &units("aA"), 0)
-                .unwrap()
-                .is_some()
+            execute(
+                &ScratchCache::new(),
+                &compile(r"(a)(?i:\1)", ""),
+                &units("aA"),
+                0
+            )
+            .unwrap()
+            .is_some()
         );
         assert!(
-            execute(&compile(r"(a)(?-i:\1)", "i"), &units("aA"), 0)
-                .unwrap()
-                .is_none()
+            execute(
+                &ScratchCache::new(),
+                &compile(r"(a)(?-i:\1)", "i"),
+                &units("aA"),
+                0
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            execute(&compile(r"(k)\1", "iu"), &units("kK"), 0)
-                .unwrap()
-                .is_some()
+            execute(
+                &ScratchCache::new(),
+                &compile(r"(k)\1", "iu"),
+                &units("kK"),
+                0
+            )
+            .unwrap()
+            .is_some()
         );
         assert!(
-            execute(&compile(r"(k)\1", "i"), &units("kK"), 0)
-                .unwrap()
-                .is_none()
+            execute(
+                &ScratchCache::new(),
+                &compile(r"(k)\1", "i"),
+                &units("kK"),
+                0
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -2715,7 +3408,9 @@ mod tests {
             ],
         );
         assert_eq!(
-            complete_range(execute(&first_unmatched, &units("aa"), 0).unwrap()),
+            complete_range(
+                execute(&ScratchCache::new(), &first_unmatched, &units("aa"), 0).unwrap()
+            ),
             Some(0..2)
         );
 
@@ -2742,7 +3437,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            complete_range(execute(&first_empty, &units("aa"), 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &first_empty, &units("aa"), 0).unwrap()),
             Some(0..1)
         );
 
@@ -2772,7 +3467,10 @@ mod tests {
                 Instruction::Match,
             ],
         );
-        assert_eq!(execute(&first_mismatch, &units("abb"), 0).unwrap(), None);
+        assert_eq!(
+            execute(&ScratchCache::new(), &first_mismatch, &units("abb"), 0).unwrap(),
+            None
+        );
 
         let all_unmatched = program(
             RegExpFlags::STICKY,
@@ -2789,7 +3487,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            complete_range(execute(&all_unmatched, &[], 0).unwrap()),
+            complete_range(execute(&ScratchCache::new(), &all_unmatched, &[], 0).unwrap()),
             Some(0..0)
         );
     }
@@ -2801,9 +3499,14 @@ mod tests {
             0xd801, 0xdc28, // U+10428
         ];
         assert!(
-            execute(&compile(r"(\u{10400})\1", "iu"), &deseret, 0)
-                .unwrap()
-                .is_some()
+            execute(
+                &ScratchCache::new(),
+                &compile(r"(\u{10400})\1", "iu"),
+                &deseret,
+                0
+            )
+            .unwrap()
+            .is_some()
         );
 
         let split_pair = [
@@ -2818,9 +3521,14 @@ mod tests {
             0xdc00,
         ];
         assert!(
-            execute(&compile(r"foo(.+)bar\1", "u"), &split_pair, 0)
-                .unwrap()
-                .is_none()
+            execute(
+                &ScratchCache::new(),
+                &compile(r"foo(.+)bar\1", "u"),
+                &split_pair,
+                0
+            )
+            .unwrap()
+            .is_none()
         );
 
         let lone_surrogates = [
@@ -2835,20 +3543,35 @@ mod tests {
             0xd834,
         ];
         assert_eq!(
-            complete_range(execute(&compile(r"foo(.+)bar\1", "u"), &lone_surrogates, 0).unwrap()),
+            complete_range(
+                execute(
+                    &ScratchCache::new(),
+                    &compile(r"foo(.+)bar\1", "u"),
+                    &lone_surrogates,
+                    0
+                )
+                .unwrap()
+            ),
             Some(0..8)
         );
     }
 
     #[test]
     fn nullable_finite_quantifiers_roll_back_zero_advance_captures() {
-        let result = execute(&compile("(a?)?", ""), &[], 0).unwrap().unwrap();
+        let result = execute(&ScratchCache::new(), &compile("(a?)?", ""), &[], 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(result.capture(0), Some(&(0..0)));
         assert_eq!(result.capture(1), None);
 
-        let result = execute(&compile("(a|){0,2}", ""), &units("a"), 0)
-            .unwrap()
-            .unwrap();
+        let result = execute(
+            &ScratchCache::new(),
+            &compile("(a|){0,2}", ""),
+            &units("a"),
+            0,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(result.capture(0), Some(&(0..1)));
         assert_eq!(result.capture(1), Some(&(0..1)));
     }
@@ -2856,16 +3579,26 @@ mod tests {
     #[test]
     fn class_shorthand_complements_fold_before_outer_inversion() {
         for input in [[0x017f], [0x212a]] {
-            assert_eq!(execute(&compile(r"[\W]", "iu"), &input, 0).unwrap(), None);
             assert_eq!(
-                complete_range(execute(&compile(r"[^\W]", "iu"), &input, 0).unwrap()),
+                execute(&ScratchCache::new(), &compile(r"[\W]", "iu"), &input, 0).unwrap(),
+                None
+            );
+            assert_eq!(
+                complete_range(
+                    execute(&ScratchCache::new(), &compile(r"[^\W]", "iu"), &input, 0).unwrap()
+                ),
                 Some(0..1)
             );
             assert_eq!(
-                complete_range(execute(&compile(r"[\W]", "i"), &input, 0).unwrap()),
+                complete_range(
+                    execute(&ScratchCache::new(), &compile(r"[\W]", "i"), &input, 0).unwrap()
+                ),
                 Some(0..1)
             );
-            assert_eq!(execute(&compile(r"[^\W]", "i"), &input, 0).unwrap(), None);
+            assert_eq!(
+                execute(&ScratchCache::new(), &compile(r"[^\W]", "i"), &input, 0).unwrap(),
+                None
+            );
         }
     }
 }

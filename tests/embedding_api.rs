@@ -389,6 +389,102 @@ fn the_host_receives_output_time_and_rejections() {
     assert_eq!(first, second);
 }
 
+#[test]
+fn partial_hosts_keep_the_process_file_service() {
+    let path = std::env::temp_dir().join(format!(
+        "oxide-host-default-file-{}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, "process file contents\n").unwrap();
+    let runtime = Runtime::with_host(Recorder::default(), RuntimeOptions::default());
+    let context = runtime.context();
+    context
+        .install_qjs_helpers(&QjsHelpers {
+            std: true,
+            ..QjsHelpers::default()
+        })
+        .unwrap();
+    let result = context.eval(&format!("read({:?})", path.to_string_lossy()));
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(
+        result.unwrap(),
+        Value::String(JsString::from_static("process file contents\n"))
+    );
+}
+
+#[test]
+fn collection_and_performance_use_their_own_host_clocks() {
+    use quickjs_oxide::engine::api::core::Monotonic;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+    fn now_ns() -> u64 {
+        TICKS.fetch_add(100, Ordering::Relaxed)
+    }
+    struct Clocks;
+    impl Host for Clocks {
+        fn monotonic(&mut self) -> Monotonic {
+            Monotonic::new(now_ns)
+        }
+
+        fn performance_now_ms(&mut self) -> f64 {
+            123.75
+        }
+    }
+
+    let runtime = Runtime::with_host(
+        Clocks,
+        RuntimeOptions {
+            min_heap: 0,
+            ..RuntimeOptions::default()
+        },
+    );
+    let context = runtime.context();
+    context.install_qjs_helpers(&QjsHelpers::default()).unwrap();
+    assert_eq!(
+        context.eval("performance.now()").unwrap(),
+        Value::Float(123.75)
+    );
+    let before = runtime.gc_stats().unwrap();
+    assert!(before.collections > 0);
+    assert_eq!(
+        before.total_pause,
+        Duration::from_nanos(before.collections * 100)
+    );
+    runtime.run_gc().unwrap();
+    let after = runtime.gc_stats().unwrap();
+    assert_eq!(after.collections - before.collections, 1);
+    assert_eq!(
+        after.total_pause - before.total_pause,
+        Duration::from_nanos(100)
+    );
+}
+
+#[cfg(feature = "test262-host")]
+#[test]
+fn spawned_agents_keep_blocking_wait_support() {
+    use quickjs_oxide::engine::api::core::{SystemHost, test262::Worker};
+
+    let mut worker = Worker::new(true, Box::new(SystemHost.into_core())).unwrap();
+    let script = worker
+        .compile_script(
+            r#"$262.agent.start(`
+                const values = new Int32Array(new SharedArrayBuffer(4));
+                $262.agent.report(Atomics.wait(values, 0, 0, 0));
+            `);"#,
+            "agent-wait.js",
+        )
+        .unwrap();
+    worker.run_script(script).unwrap();
+    worker.join_agents();
+    let report = worker
+        .compile_script("print($262.agent.getReport())", "agent-report.js")
+        .unwrap();
+    worker.run_script(report).unwrap();
+    assert_eq!(worker.take_print_log(), ["timed-out"]);
+}
+
 struct Files;
 
 impl ModuleLoader for Files {
@@ -477,6 +573,70 @@ fn modules_load_through_the_loader_and_its_scope() {
         .unwrap();
     runtime.run_jobs().unwrap();
     assert_eq!(context.eval("dynamic").unwrap(), Value::Int(42));
+}
+
+#[test]
+fn async_module_order_is_shared_across_interleaved_graphs() {
+    struct Loader;
+    impl ModuleLoader for Loader {
+        fn load(
+            &mut self,
+            scope: &mut ModuleScope<'_>,
+            name: &str,
+            _: &ModuleImportAttributes,
+        ) -> Result<ModuleSource, Value> {
+            let source = match name {
+                "shared.js" => {
+                    "await new Promise(resolve => { globalThis.release = resolve; }); \
+                     order.push('shared');"
+                }
+                "left.js" => {
+                    "import 'shared.js'; order.push('left-start'); \
+                     await 0; order.push('left-end');"
+                }
+                "right.js" => "import 'shared.js'; order.push('right');",
+                _ => {
+                    return Err(scope
+                        .new_native_error(NativeErrorKind::Reference, name)
+                        .unwrap());
+                }
+            };
+            Ok(ModuleSource::source(source))
+        }
+    }
+    let (runtime, context) = runtime();
+    runtime.set_module_loader(Loader).unwrap();
+    context.eval("globalThis.order = []").unwrap();
+    let left = context
+        .compile_module_with_filename("import 'left.js'; order.push('root-a');", "root-a.js")
+        .unwrap();
+    let right = context
+        .compile_module_with_filename("import 'right.js'; order.push('root-b');", "root-b.js")
+        .unwrap();
+    let Value::Object(left) = context.execute_module(&left).unwrap() else {
+        panic!("module evaluation did not return a promise");
+    };
+    let Value::Object(right) = context.execute_module(&right).unwrap() else {
+        panic!("module evaluation did not return a promise");
+    };
+    // Another runtime can evaluate and drain its graph while both remain pending.
+    let other = Runtime::new();
+    let mut other_context = other.new_context().unwrap();
+    run_module(&mut other_context, "await 0; globalThis.done = 42;").unwrap();
+    assert_eq!(other_context.eval("done").unwrap(), Value::Int(42));
+    assert_eq!(context.eval("order.join()").unwrap(), string(""));
+    context.eval("release()").unwrap();
+    runtime.run_jobs().unwrap();
+    assert_eq!(
+        context.eval("order.join()").unwrap(),
+        string("shared,left-start,right,root-b,left-end,root-a")
+    );
+    for promise in [left, right] {
+        assert_eq!(
+            runtime.promise_snapshot(&promise).unwrap().unwrap().state(),
+            PromiseState::Fulfilled
+        );
+    }
 }
 
 struct Reentrant(Runtime);
@@ -1429,7 +1589,9 @@ fn a_sampler_counts_the_running_stacks_by_function_and_line() {
     assert!(total > 0, "{samples:?}");
     // the loop's back-edge is on line 3, and hot was called from outer
     assert!(
-        samples.iter().any(|(stack, _)| stack.starts_with("hot:3;outer:6")),
+        samples
+            .iter()
+            .any(|(stack, _)| stack.starts_with("hot:3;outer:6")),
         "{samples:?}"
     );
     // A take empties the counts; a stop drops the profiler.
@@ -1461,7 +1623,9 @@ fn a_sample_asked_while_a_host_function_runs_is_its_own() {
         .unwrap();
     let samples = runtime.take_samples().unwrap();
     assert!(
-        samples.iter().any(|(stack, _)| stack.starts_with("slow (native);caller:2")),
+        samples
+            .iter()
+            .any(|(stack, _)| stack.starts_with("slow (native);caller:2")),
         "{samples:?}"
     );
 }
@@ -1473,7 +1637,10 @@ fn a_thread_interrupts_an_endless_loop_while_a_sampler_runs() {
     runtime.start_sampling(flag).unwrap();
     let started = std::time::Instant::now();
     let thread = interrupt_later(&runtime, std::time::Duration::from_millis(50));
-    assert_eq!(context.eval("while (true) {}"), Err(RuntimeError::Interrupted));
+    assert_eq!(
+        context.eval("while (true) {}"),
+        Err(RuntimeError::Interrupted)
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
     thread.join().unwrap();
     runtime.interrupt_handle().clear();
@@ -1622,7 +1789,9 @@ fn a_backtracking_regexp_stops_at_an_interrupt() {
 #[test]
 fn a_counted_regexp_loop_stops_at_an_interrupt() {
     // No backtracking: counted loops of empty bodies, alone and before a
-    // failing character at every start position.
+    // failing character at every start position. The bodies are `\b|`: an
+    // empty body is elided at compile time and an absent literal rejects the
+    // search before any loop runs.
     struct Deadline(std::time::Instant);
     impl Host for Deadline {
         fn interrupt(&mut self) -> bool {
@@ -1630,9 +1799,8 @@ fn a_counted_regexp_loop_stops_at_an_interrupt() {
         }
     }
     for source in [
-        "/(?:(?:){2147483646}){2147483646}/.test('')",
-        "/(?:){2147483646}x/.test('a'.repeat(1000))",
-        "/(?:\\b){2147483646}x/.test('a'.repeat(1000))",
+        "/(?:(?:\\b|){2147483646}){2147483646}y/.test('y')",
+        "/(?:\\b|){2147483646}y/.test('a'.repeat(1000) + 'y')",
         // Each attempt fails forward, 20,000 characters in, at every start.
         "new RegExp('a'.repeat(20000) + 'b').test('a'.repeat(1 << 22))",
         // A /g loop of matches, each inside its search's first chunk.

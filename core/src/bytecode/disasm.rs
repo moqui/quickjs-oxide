@@ -1,7 +1,8 @@
 //! The disassembler: one instruction per line, registers by role (`this`,
 //! `p0`, `l3`, `t2`, or `r300` above a frame's temporaries).
 
-use std::fmt::Write;
+use alloc::{borrow::ToOwned, format, string::String};
+use core::fmt::Write;
 
 use super::{Capture, CodeUnit, Format, Insn};
 use crate::heap::atom::{KeyKind, PropertyKey};
@@ -55,6 +56,12 @@ pub fn operands(
         Format::AInt => format!("{}, {}", r(insn.a), insn.int()),
         Format::ABInt => format!("{}, {}, {}", r(insn.a), r(insn.b), insn.int()),
         Format::AConst => format!("{}, k{}", r(insn.a), insn.imm),
+        Format::AConstRange => format!(
+            "{}, k{}, {}",
+            r(insn.a),
+            insn.imm,
+            u16::from_le_bytes([insn.b, insn.c])
+        ),
         Format::Key => key(insn),
         Format::AKey => format!("{}, {}", r(insn.a), key(insn)),
         Format::ABKey => format!("{}, {}, {}", r(insn.a), r(insn.b), key(insn)),

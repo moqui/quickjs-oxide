@@ -18,7 +18,7 @@ documents each one. The rules behind them are in
 | Where do the instructions go? | Explain | `probes`, `slopes`, `run --callgrind`; `qjs --ic-stats`, `--gc-stats` ([Diagnostics](../profiling.md)) |
 | How does cost grow with size? | Explain | `scaling` |
 | What does compilation cost? | Explain | `compile corpus`, `compile probes`, `compile matrix` |
-| How much of a time difference is code layout? | Explain | `relink`, then `run` over the variants |
+| How sensitive are both builds to code placement? | Explain | `layout` (0/16/32/48-byte offsets, time and cycles); `relink` for custom offsets |
 
 Each tier is a different kind of evidence, not a smaller version of the next
 one. The Sweep is the default check of every change that reaches the engine;
@@ -28,10 +28,10 @@ pull request.
 
 ## How to read the numbers
 
-- **Instructions decide; time is reported beside them.** `instructions:u` is
-  deterministic for a binary and a workload. Time also moves 3–7% from code
-  layout alone when unrelated code changes. A time change with flat
-  instructions is layout.
+- **Instructions decide the work gate.** Report time and cycles beside
+  `instructions:u`. Fewer instructions do not establish speed, and flat
+  instruction counts do not explain a time regression. Use profiles and
+  `layout` to investigate code placement; it has no fixed noise allowance.
 - **A time difference counts only above its A/A range.** The same binary run
   twice in the same schedule gives the noise; `paired` compares the
   candidate's interval with it.
@@ -81,6 +81,18 @@ CANDIDATE=$PWD/target/release/qjs
 For a Look run, `cargo build --release -p quickjs-oxide-cli --bin qjs` in each
 worktree is enough; Sweep, Claim and Publish runs use `build` for both sides,
 so the two binaries differ only in source.
+
+Source refactors can rename Rust's mangled symbols without changing their
+instructions. Keep the matching `apps/cli/qjs.order` entries current: stale
+names are silently ignored and can move unchanged code. For full regeneration,
+`scripts/release/gen-symbol-order.py --layout-reference <previous-qjs>` can
+preserve the previous binary's function placement.
+
+On the same bundled-lld target, `apps/cli/qjs-layout.ld` keeps the first
+interpreter entry at 16 modulo 64 bytes, matching the pre-TLS-removal binary's
+cache-line alignment. Read-only metadata growth must not move an otherwise
+unchanged dispatch loop across this boundary. This adds at most 79 bytes before
+the ordered text and does not change the loop's instructions.
 
 **Suite programs.** Check out the three pinned suites outside the repository
 and generate the 37 programs once per series:
@@ -186,9 +198,10 @@ python3 scripts/benchmark/bench.py paired --results /tmp/oxide-ab/results.json \
 
 `--gate net-gain` supports "faster": every case's interval clears its A/A
 noise. `--gate noninferior` supports "no slower" for refactors and
-correctness fixes: every case's interval stays above −1%. A gain within the
-3–7% layout range is checked against `relink` variants of both binaries before
-it is attributed to the code.
+correctness fixes: every case's interval stays above −1%. When code placement
+is suspected, measure `layout` variants of both binaries. Keep the original
+Claim results and its declared margin; placement diagnostics do not excuse a
+missed gate.
 
 ## Publish
 

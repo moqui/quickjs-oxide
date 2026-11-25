@@ -11,11 +11,59 @@ use super::flags::{FlagParseErrorKind, parse_flags};
 use super::group_name::GroupName;
 use super::group_name::{self, CaptureSummary};
 use super::opcode::{CharacterRange, Instruction};
-use std::collections::BTreeSet;
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+
+mod search;
+pub(super) use search::SearchPlan;
 
 const INFINITE_REPETITION: u32 = i32::MAX as u32;
 const MAX_CODE_POINT: u32 = 0x10_ffff;
 const MAX_GROUP_NESTING: usize = 256;
+
+/// ASCII membership after canonicalization. Only ASCII letter case changes
+/// for ASCII input; construct range masks once instead of folding 128 units.
+fn ascii_class_bitmap(
+    ranges: &[CharacterRange],
+    inverted: bool,
+    ignore_case: bool,
+    unicode: bool,
+) -> [u64; 2] {
+    let mut bits = [0u64; 2];
+    for range in ranges {
+        if range.start >= 128 {
+            continue;
+        }
+        let start = range.start;
+        let end = range.end.min(127);
+        if start / 64 == end / 64 {
+            bits[(start / 64) as usize] |=
+                (u64::MAX << (start % 64)) & (u64::MAX >> (63 - end % 64));
+        } else {
+            bits[0] |= u64::MAX << start;
+            bits[1] |= u64::MAX >> (127 - end);
+        }
+    }
+    if ignore_case {
+        const UPPER: u64 = ((1u64 << 26) - 1) << 1;
+        const LOWER: u64 = UPPER << 32;
+        bits[1] = if unicode {
+            (bits[1] & !UPPER) | ((bits[1] & LOWER) >> 32)
+        } else {
+            (bits[1] & !LOWER) | ((bits[1] & UPPER) << 32)
+        };
+    }
+    if inverted {
+        bits[0] = !bits[0];
+        bits[1] = !bits[1];
+    }
+    bits
+}
 
 /// One runtime-independent compiled regular-expression program.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,13 +78,11 @@ struct Program {
     capture_count: u8,
     register_count: u8,
     instructions: Box<[Instruction]>,
+    search: SearchPlan,
     /// Capture names aligned to captures 1..N. Capture zero is deliberately
     /// absent. `None` for the whole field means the pattern has no named
     /// captures and matches QuickJS's absent group-name trailer.
     group_names: Option<Box<[Option<GroupName>]>>,
-    /// The units a match can start with, when the first instruction that
-    /// reads input fixes them.
-    first: Option<super::executor::FirstUnits>,
 }
 
 impl CompiledRegExp {
@@ -47,14 +93,13 @@ impl CompiledRegExp {
         register_count: u8,
         instructions: Vec<Instruction>,
     ) -> Self {
-        let first = super::executor::FirstUnits::of(flags, &instructions);
         Self(Program {
             flags,
             capture_count,
             register_count,
             instructions: instructions.into_boxed_slice(),
+            search: SearchPlan::default(),
             group_names: None,
-            first,
         })
     }
 
@@ -64,19 +109,19 @@ impl CompiledRegExp {
         register_count: u8,
         instructions: Vec<Instruction>,
         group_names: Option<Box<[Option<GroupName>]>>,
+        search: SearchPlan,
     ) -> Result<Self, CompileError> {
         debug_assert!(group_names.as_ref().is_none_or(|names| {
             names.len() == usize::from(capture_count).saturating_sub(1)
                 && names.iter().any(Option::is_some)
         }));
-        let first = super::executor::FirstUnits::of(flags, &instructions);
         let program = Self(Program {
             flags,
             capture_count,
             register_count,
             instructions: instructions.into_boxed_slice(),
+            search,
             group_names,
-            first,
         });
         super::executor::validate_program(&program).map_err(|error| CompileError {
             kind: CompileErrorKind::Internal,
@@ -108,17 +153,8 @@ impl CompiledRegExp {
         &self.0.instructions
     }
 
-    pub(super) fn first_units(&self) -> Option<&super::executor::FirstUnits> {
-        self.0.first.as_ref()
-    }
-
-    /// The bytes the search's start filter owns beyond the program's size.
-    #[must_use]
-    pub fn first_units_bytes(&self) -> usize {
-        self.0
-            .first
-            .as_ref()
-            .map_or(0, super::executor::FirstUnits::owned_bytes)
+    pub(super) const fn search(&self) -> &SearchPlan {
+        &self.0.search
     }
 
     /// Names aligned to captures 1..N, or `None` when this program has no
@@ -131,6 +167,37 @@ impl CompiledRegExp {
     #[must_use]
     pub const fn has_named_captures(&self) -> bool {
         self.0.group_names.is_some()
+    }
+
+    /// Owned allocation capacity, excluding the inline program and allocator
+    /// overhead. Includes compiler search metadata and instruction payloads.
+    #[must_use]
+    pub fn owned_bytes(&self) -> usize {
+        core::mem::size_of_val(self.instructions())
+            + self
+                .instructions()
+                .iter()
+                .map(|instruction| match instruction {
+                    Instruction::Range { ranges, .. } => core::mem::size_of_val(&**ranges),
+                    Instruction::ClassRepeat(repeat) => {
+                        size_of::<super::ClassRepeat>() + core::mem::size_of_val(&*repeat.ranges)
+                    }
+                    Instruction::BackReference { captures, .. }
+                    | Instruction::BackwardBackReference { captures, .. } => {
+                        core::mem::size_of_val(&**captures)
+                    }
+                    _ => 0,
+                })
+                .sum::<usize>()
+            + self.group_names().map_or(0, |names| {
+                core::mem::size_of_val(names)
+                    + names
+                        .iter()
+                        .flatten()
+                        .map(|name| core::mem::size_of_val(&**name))
+                        .sum::<usize>()
+            })
+            + self.0.search.owned_bytes()
     }
 }
 
@@ -220,8 +287,8 @@ impl CompileError {
     }
 }
 
-impl std::fmt::Display for CompileError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for CompileError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             formatter,
             "{} at {:?} UTF-16 offset {}",
@@ -230,7 +297,7 @@ impl std::fmt::Display for CompileError {
     }
 }
 
-impl std::error::Error for CompileError {}
+impl core::error::Error for CompileError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Expression {
@@ -1783,6 +1850,7 @@ struct CodeBuilder {
     unicode: bool,
     multiline: bool,
     dot_all: bool,
+    fuse_repeats: bool,
 }
 
 impl CodeBuilder {
@@ -1795,6 +1863,7 @@ impl CodeBuilder {
             unicode: flags.is_unicode(),
             multiline: flags.contains(RegExpFlags::MULTILINE),
             dot_all: flags.contains(RegExpFlags::DOT_ALL),
+            fuse_repeats: true,
         }
     }
 
@@ -1803,7 +1872,7 @@ impl CodeBuilder {
         self.compile_expression(expression, false)?;
         self.emit(Instruction::SaveEnd { capture: 0 });
         self.emit(Instruction::Match);
-        mark_possessive_loops(&mut self.instructions);
+        mark_possessive_repeats(&mut self.instructions);
         let register_count =
             u8::try_from(self.max_registers).map_err(|_| CompileError::too_many_registers(0))?;
         Ok((self.instructions, register_count))
@@ -2089,20 +2158,28 @@ impl CodeBuilder {
             self.emit_capture_reset(capture_range);
             return Ok(());
         }
-        if !backward
-            && char_loops()
-            && quantifier.greedy
-            && !(quantifier.minimum == 1 && quantifier.maximum == Some(1))
-            && is_one_character(atom)
+
+        if self.fuse_repeats
+            && !backward
+            && let Atom::Class(class) = atom
+            && class.strings.is_empty()
         {
-            self.emit(Instruction::CharLoop {
-                min: quantifier.minimum,
-                max: quantifier.maximum.unwrap_or(u32::MAX),
+            let ascii = ascii_class_bitmap(
+                &class.ranges,
+                class.inverted,
+                self.ignore_case,
+                self.unicode,
+            );
+            self.emit(Instruction::ClassRepeat(Box::new(super::ClassRepeat {
+                ranges: class.ranges.clone().into_boxed_slice(),
+                ascii,
+                inverted: class.inverted,
+                ignore_case: self.ignore_case,
+                minimum: quantifier.minimum,
+                maximum: quantifier.maximum,
+                greedy: quantifier.greedy,
                 possessive: false,
-            });
-            let body = self.instructions.len();
-            self.compile_atom(atom, false)?;
-            debug_assert_eq!(self.instructions.len(), body + 1);
+            })));
             return Ok(());
         }
 
@@ -2318,161 +2395,13 @@ impl CodeBuilder {
 }
 
 #[cfg(test)]
-std::thread_local! {
-    /// Off, the compiler emits QuickJS's split loops for every quantifier:
-    /// the reference the character-loop tests compare against.
-    pub(super) static CHAR_LOOPS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
-#[inline]
-fn char_loops() -> bool {
-    #[cfg(test)]
-    return CHAR_LOOPS.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    true
-}
-
-/// Whether `atom` compiles to one instruction that reads one character
-/// forward: the body of an [`Instruction::CharLoop`].
-fn is_one_character(atom: &Atom) -> bool {
-    match atom {
-        Atom::Literal(_) | Atom::Dot | Atom::Space { .. } => true,
-        Atom::Class(class) => class.strings.is_empty(),
-        _ => false,
-    }
-}
-
-/// Makes each greedy [`Instruction::CharLoop`] possessive when what follows
-/// it cannot match where the loop gave a character back: the next
-/// character-reading instruction (past captures and forward jumps) reads a
-/// set disjoint from the loop's, or the pattern ends there. A character the
-/// loop gives back is one of its own, which that instruction rejects, so no
-/// shorter run leads to a match the longest did not.
-fn mark_possessive_loops(instructions: &mut [Instruction]) {
-    for pc in 0..instructions.len() {
-        if !matches!(instructions[pc], Instruction::CharLoop { .. }) {
-            continue;
-        }
-        let Some(own) = instructions.get(pc + 1).and_then(character_set) else {
-            continue;
-        };
-        if follow_is_disjoint(instructions, pc + 2, &own)
-            && let Instruction::CharLoop { possessive, .. } = &mut instructions[pc]
-        {
-            *possessive = true;
-        }
-    }
-}
-
-/// Whether every continuation from `pc` fails at once on a character of
-/// `own`, or succeeds whatever the loop leaves (the match's end).
-fn follow_is_disjoint(instructions: &[Instruction], mut pc: usize, own: &[CharacterRange]) -> bool {
-    // Bounded: forward jumps only, and a few steps.
-    for _ in 0..16 {
-        let Some(instruction) = instructions.get(pc) else {
-            return false;
-        };
-        match instruction {
-            Instruction::SaveStart { .. } | Instruction::SaveEnd { .. } => pc += 1,
-            Instruction::Jump { target } if *target > pc => pc = *target,
-            Instruction::Match => return true,
-            // The input's end: a loop that gave a character back is not there.
-            Instruction::LineEnd { multiline: false } => return true,
-            Instruction::CharLoop { min, .. } if *min > 0 => {
-                return instructions
-                    .get(pc + 1)
-                    .and_then(character_set)
-                    .is_some_and(|follow| disjoint(own, &follow));
-            }
-            _ => {
-                return character_set(instruction).is_some_and(|follow| disjoint(own, &follow));
-            }
-        }
-    }
-    false
-}
-
-/// The characters a one-character instruction matches, as sorted disjoint
-/// ranges; `None` for any other instruction and for a case-insensitive one,
-/// whose set is not its ranges.
-fn character_set(instruction: &Instruction) -> Option<Vec<CharacterRange>> {
-    const ALL: CharacterRange = CharacterRange::new(0, 0x10_ffff);
-    let set = match instruction {
-        Instruction::Char {
-            value,
-            ignore_case: false,
-        } => vec![CharacterRange::new(*value, *value)],
-        Instruction::Any => vec![ALL],
-        Instruction::Dot => complement(&[
-            CharacterRange::new(0x0a, 0x0a),
-            CharacterRange::new(0x0d, 0x0d),
-            CharacterRange::new(0x2028, 0x2029),
-        ]),
-        Instruction::Space { inverted } => {
-            let space = [
-                CharacterRange::new(0x09, 0x0d),
-                CharacterRange::new(0x20, 0x20),
-                CharacterRange::new(0xa0, 0xa0),
-                CharacterRange::new(0x1680, 0x1680),
-                CharacterRange::new(0x2000, 0x200a),
-                CharacterRange::new(0x2028, 0x2029),
-                CharacterRange::new(0x202f, 0x202f),
-                CharacterRange::new(0x205f, 0x205f),
-                CharacterRange::new(0x3000, 0x3000),
-                CharacterRange::new(0xfeff, 0xfeff),
-            ];
-            if *inverted {
-                complement(&space)
-            } else {
-                space.to_vec()
-            }
-        }
-        Instruction::Range {
-            ranges,
-            inverted,
-            ignore_case: false,
-        } => {
-            if *inverted {
-                complement(ranges)
-            } else {
-                ranges.to_vec()
-            }
-        }
-        _ => return None,
-    };
-    Some(set)
-}
-
-/// The characters up to U+10FFFF outside sorted disjoint `ranges`.
-fn complement(ranges: &[CharacterRange]) -> Vec<CharacterRange> {
-    let mut out = Vec::with_capacity(ranges.len() + 1);
-    let mut next = 0u32;
-    for range in ranges {
-        if range.start > next {
-            out.push(CharacterRange::new(next, range.start - 1));
-        }
-        next = range.end.saturating_add(1);
-    }
-    if next <= 0x10_ffff {
-        out.push(CharacterRange::new(next, 0x10_ffff));
-    }
-    out
-}
-
-/// Whether two sorted sets of ranges share no character.
-fn disjoint(left: &[CharacterRange], right: &[CharacterRange]) -> bool {
-    let (mut i, mut j) = (0, 0);
-    while i < left.len() && j < right.len() {
-        let (a, b) = (left[i], right[j]);
-        if a.end < b.start {
-            i += 1;
-        } else if b.end < a.start {
-            j += 1;
-        } else {
-            return false;
-        }
-    }
-    true
+pub(super) fn compile_unoptimized(pattern: &[u16], flags: &[u16]) -> CompiledRegExp {
+    let flags = parse_flags(flags).unwrap();
+    let parsed = Parser::new(pattern, flags).parse().unwrap();
+    let mut builder = CodeBuilder::new(flags);
+    builder.fuse_repeats = false;
+    let (instructions, registers) = builder.compile(&parsed.expression).unwrap();
+    CompiledRegExp::from_parts(flags, parsed.capture_count, registers, instructions)
 }
 
 pub(super) fn compile_units(
@@ -2490,12 +2419,14 @@ pub(super) fn compile_units(
         flags.insert(RegExpFlags::NAMED_GROUPS);
     }
     let (instructions, register_count) = CodeBuilder::new(flags).compile(&expression)?;
+    let search = SearchPlan::analyze(&expression, flags, capture_count == 1);
     CompiledRegExp::from_compiled_parts(
         flags,
         capture_count,
         register_count,
         instructions,
         group_names,
+        search,
     )
 }
 
@@ -2616,19 +2547,19 @@ fn canonicalize_unicode_set(set: &mut UnicodeSet, unicode: bool) {
     if set.strings.is_empty() {
         return;
     }
-    let strings = std::mem::take(&mut set.strings);
+    let strings = core::mem::take(&mut set.strings);
     for mut string in strings {
         for character in &mut string {
             *character = crate::unicode::case::regexp_canonicalize(*character, unicode);
         }
         add_unicode_set_sequence(set, &string);
     }
-    set.ranges = normalize_ranges(std::mem::take(&mut set.ranges));
+    set.ranges = normalize_ranges(core::mem::take(&mut set.ranges));
 }
 
 fn unicode_set_union(target: &mut UnicodeSet, mut operand: UnicodeSet) {
     target.ranges.append(&mut operand.ranges);
-    target.ranges = normalize_ranges(std::mem::take(&mut target.ranges));
+    target.ranges = normalize_ranges(core::mem::take(&mut target.ranges));
     target.strings.append(&mut operand.strings);
 }
 
@@ -2831,9 +2762,175 @@ fn combine_surrogates(high: u32, low: u32) -> u32 {
     0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)
 }
 
+/// Marks a greedy class repeat possessive when the instruction that reads
+/// after it (past captures and forward jumps) reads a set disjoint from the
+/// repeat's, or the pattern ends there, or the input's end must follow: a
+/// character the repeat gave back would be one of its own, which that
+/// follower rejects, so backtracking into the repeat never finds a match.
+fn mark_possessive_repeats(instructions: &mut [Instruction]) {
+    for pc in 0..instructions.len() {
+        let Instruction::ClassRepeat(repeat) = &instructions[pc] else {
+            continue;
+        };
+        if !repeat.greedy {
+            continue;
+        }
+        let Some(own) = repeat_set(repeat) else {
+            continue;
+        };
+        if follow_is_disjoint(instructions, pc + 1, &own)
+            && let Instruction::ClassRepeat(repeat) = &mut instructions[pc]
+        {
+            repeat.possessive = true;
+        }
+    }
+}
+
+fn follow_is_disjoint(instructions: &[Instruction], mut pc: usize, own: &[CharacterRange]) -> bool {
+    // Bounded: forward jumps only, and a few steps.
+    for _ in 0..16 {
+        let Some(instruction) = instructions.get(pc) else {
+            return false;
+        };
+        match instruction {
+            Instruction::SaveStart { .. } | Instruction::SaveEnd { .. } => pc += 1,
+            Instruction::Jump { target } if *target > pc => pc = *target,
+            Instruction::Match => return true,
+            // The input's end: a repeat that gave a character back is not
+            // there.
+            Instruction::LineEnd { multiline: false } => return true,
+            Instruction::ClassRepeat(follow) if follow.minimum > 0 => {
+                return repeat_set(follow).is_some_and(|follow| ranges_disjoint(own, &follow));
+            }
+            _ => {
+                return character_set(instruction)
+                    .is_some_and(|follow| ranges_disjoint(own, &follow));
+            }
+        }
+    }
+    false
+}
+
+/// The characters a class repeat reads, sorted; `None` for a
+/// case-insensitive one, whose set is not compared.
+fn repeat_set(repeat: &super::ClassRepeat) -> Option<Vec<CharacterRange>> {
+    if repeat.ignore_case {
+        return None;
+    }
+    let ranges = normalize_ranges(repeat.ranges.to_vec());
+    Some(if repeat.inverted {
+        complement_ranges(&ranges, 0x10_ffff)
+    } else {
+        ranges
+    })
+}
+
+/// The characters a one-character instruction reads, sorted; `None` for any
+/// other instruction or a case-insensitive one.
+fn character_set(instruction: &Instruction) -> Option<Vec<CharacterRange>> {
+    const ALL: CharacterRange = CharacterRange::new(0, 0x10_ffff);
+    let set = match instruction {
+        Instruction::Char {
+            value,
+            ignore_case: false,
+        } => vec![CharacterRange::new(*value, *value)],
+        Instruction::Any => vec![ALL],
+        Instruction::Dot => complement_ranges(
+            &[
+                CharacterRange::new(0x0a, 0x0a),
+                CharacterRange::new(0x0d, 0x0d),
+                CharacterRange::new(0x2028, 0x2029),
+            ],
+            0x10_ffff,
+        ),
+        Instruction::Space { inverted } => {
+            let space = [
+                CharacterRange::new(0x09, 0x0d),
+                CharacterRange::new(0x20, 0x20),
+                CharacterRange::new(0xa0, 0xa0),
+                CharacterRange::new(0x1680, 0x1680),
+                CharacterRange::new(0x2000, 0x200a),
+                CharacterRange::new(0x2028, 0x2029),
+                CharacterRange::new(0x202f, 0x202f),
+                CharacterRange::new(0x205f, 0x205f),
+                CharacterRange::new(0x3000, 0x3000),
+                CharacterRange::new(0xfeff, 0xfeff),
+            ];
+            if *inverted {
+                complement_ranges(&space, 0x10_ffff)
+            } else {
+                space.to_vec()
+            }
+        }
+        Instruction::Range {
+            ranges,
+            inverted,
+            ignore_case: false,
+        } => {
+            let ranges = normalize_ranges(ranges.to_vec());
+            if *inverted {
+                complement_ranges(&ranges, 0x10_ffff)
+            } else {
+                ranges
+            }
+        }
+        _ => return None,
+    };
+    Some(set)
+}
+
+/// Whether two sorted sets share no character.
+fn ranges_disjoint(left: &[CharacterRange], right: &[CharacterRange]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < left.len() && j < right.len() {
+        let (a, b) = (left[i], right[j]);
+        if a.end < b.start {
+            i += 1;
+        } else if b.end < a.start {
+            j += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_bitmaps_match_runtime_canonicalization() {
+        for start in 0..128 {
+            for end in start..=128 {
+                for unicode in [false, true] {
+                    for ignore_case in [false, true] {
+                        for inverted in [false, true] {
+                            let bits = ascii_class_bitmap(
+                                &[CharacterRange::new(start, end)],
+                                inverted,
+                                ignore_case,
+                                unicode,
+                            );
+                            for unit in 0..128 {
+                                let canonical = if ignore_case {
+                                    crate::unicode::case::regexp_canonicalize(unit, unicode)
+                                } else {
+                                    unit
+                                };
+                                let expected = (start <= canonical && canonical <= end) != inverted;
+                                assert_eq!(
+                                    bits[(unit / 64) as usize] & (1 << (unit % 64)) != 0,
+                                    expected,
+                                    "{start}..={end} {unit} i={ignore_case} u={unicode} inverted={inverted}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn compile_ascii(pattern: &str, flags: &str) -> Result<CompiledRegExp, CompileError> {
         compile_units(
@@ -2980,7 +3077,7 @@ mod tests {
 
     #[test]
     fn greedy_lazy_and_bounded_quantifiers_use_splits_loops_and_guards() {
-        let compiled = compile_ascii("(?:aa)*(?:bb)+?(?:cc){2}(?:dd){1,4}(?:ee){3,}", "").unwrap();
+        let compiled = compile_ascii("a*b+?c{2}d{1,4}e{3,}", "").unwrap();
         assert_eq!(compiled.register_count(), 1);
         assert!(
             compiled
@@ -2993,29 +3090,6 @@ mod tests {
                 .instructions()
                 .iter()
                 .any(|instruction| matches!(instruction, Instruction::Loop { .. }))
-        );
-
-        // A greedy one-character atom is a character loop over the atom's
-        // instruction; a lazy one keeps its split.
-        let loops = compile_ascii("a*b+?c{2}d{1,4}e{3,}f?", "").unwrap();
-        assert_eq!(loops.register_count(), 0);
-        let char_loops = loops
-            .instructions()
-            .iter()
-            .filter_map(|instruction| match instruction {
-                Instruction::CharLoop { min, max, .. } => Some((*min, *max)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            char_loops,
-            [(0, u32::MAX), (2, 2), (1, 4), (3, u32::MAX), (0, 1)]
-        );
-        assert!(
-            loops
-                .instructions()
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::Split { .. }))
         );
 
         let nullable = compile_ascii("(?:a?)*", "").unwrap();
@@ -3031,44 +3105,6 @@ mod tests {
                 .iter()
                 .any(|instruction| matches!(instruction, Instruction::CheckAdvance { .. }))
         );
-    }
-
-    #[test]
-    fn a_loop_is_possessive_only_where_its_follower_rejects_its_characters() {
-        let possessive = |pattern: &str, flags: &str| {
-            compile_ascii(pattern, flags)
-                .unwrap()
-                .instructions()
-                .iter()
-                .filter_map(|instruction| match instruction {
-                    Instruction::CharLoop { possessive, .. } => Some(*possessive),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        // A follower disjoint from the loop, through captures and the
-        // alternation's jump; the pattern's end; `$`.
-        assert_eq!(possessive(r"\d*:", ""), [true]);
-        assert_eq!(possessive(r"ERROR (\w+): (\d+)", ""), [true, true]);
-        assert_eq!(possessive(r"(?:x\d+|y):", ""), [true]);
-        assert_eq!(possessive(r"[a-z]+\d{2,}", ""), [true, true]);
-        assert_eq!(possessive(r"\s*\S", ""), [true]);
-        assert_eq!(possessive(r"[^\n]*\n", ""), [true]);
-        assert_eq!(possessive(r"a+$", ""), [true]);
-        // A follower that can match a character the loop took, or that the
-        // walk does not model.
-        assert_eq!(possessive(r"\d*1", ""), [false]);
-        assert_eq!(possessive(r"\w+\d", ""), [false]);
-        assert_eq!(possessive(r".*x", ""), [false]);
-        assert_eq!(possessive(r"a*a*b", ""), [false, true]);
-        assert_eq!(possessive(r"a+$", "m"), [false]);
-        assert_eq!(possessive(r"a+(?=b)", ""), [false]);
-        assert_eq!(possessive(r"(a+)\1", ""), [false]);
-        assert_eq!(possessive(r"a*(?:b|a)", ""), [false]);
-        assert_eq!(possessive(r"(?:a+b)*", ""), [true]);
-        assert_eq!(possessive(r"(?:a+)*b", ""), [false]);
-        // Case-insensitive sets are not compared.
-        assert_eq!(possessive(r"a+B", "i"), [false]);
     }
 
     #[test]
@@ -4058,18 +4094,11 @@ mod tests {
         assert_eq!(error.kind(), &CompileErrorKind::Syntax);
         assert_eq!(error.message(), "stack overflow");
 
-        let sequential = "(?:ab){2}".repeat(300);
+        let sequential = "a{2}".repeat(300);
         let compiled = compile_ascii(&sequential, "").unwrap();
         assert_eq!(compiled.register_count(), 1);
 
-        let nested = compile_ascii("(?:(?:(?:ab){2}){2}){2}", "").unwrap();
+        let nested = compile_ascii("(?:(?:a{2}){2}){2}", "").unwrap();
         assert_eq!(nested.register_count(), 3);
-        // A one-character atom's count is the character loop's, no register.
-        assert_eq!(
-            compile_ascii("(?:(?:a{2}){2}){2}", "")
-                .unwrap()
-                .register_count(),
-            2
-        );
     }
 }

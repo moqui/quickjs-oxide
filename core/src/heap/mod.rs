@@ -22,7 +22,8 @@ pub mod table;
 pub mod values;
 mod verify;
 
-use std::fmt;
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use core::fmt;
 
 use self::arena::Arena;
 use self::atom::{AtomTable, KEY_INDEX_LIMIT, PropertyKey};
@@ -63,7 +64,7 @@ impl fmt::Display for HeapError {
     }
 }
 
-impl std::error::Error for HeapError {}
+impl core::error::Error for HeapError {}
 
 /// One unit of the tree [`Heap::alloc_bytecode_function`] creates.
 #[derive(Clone, Copy, Debug)]
@@ -125,7 +126,7 @@ pub struct Heap {
     /// Every module record: modules live as long as the runtime.
     pub(crate) modules: Vec<Value>,
     /// Bytes of flattened ropes (the arena counts a rope as empty).
-    pub(crate) rope_bytes: std::cell::Cell<usize>,
+    pub(crate) rope_bytes: core::cell::Cell<usize>,
     /// Each unflattened rope's two halves, by string index (kept out of
     /// [`StringRecord`], which every string pays for).
     pub(crate) ropes: FxHashMap<u32, (StringId, StringId)>,
@@ -204,7 +205,7 @@ pub struct Heap {
     /// use, so a runtime that never asks costs one pointer.
     pub(crate) unit_strings: Option<Box<[Option<StringId>; 256]>>,
     /// The job queue: roots until each runs.
-    pub(crate) jobs: std::collections::VecDeque<crate::vm::jobs::Job>,
+    pub(crate) jobs: alloc::collections::VecDeque<crate::vm::jobs::Job>,
 }
 
 /// How long an atom [`Heap::intern`] returns is kept. Atoms are otherwise
@@ -244,7 +245,7 @@ impl Heap {
             rejections: Vec::new(),
             holey: Default::default(),
             modules: Vec::new(),
-            rope_bytes: std::cell::Cell::new(0),
+            rope_bytes: core::cell::Cell::new(0),
             ropes: FxHashMap::default(),
             html_dda: false,
             symbols: Arena::new(),
@@ -274,7 +275,7 @@ impl Heap {
             arguments_shapes: [None; 2],
             regexp_instance_shape: None,
             unit_strings: None,
-            jobs: std::collections::VecDeque::new(),
+            jobs: alloc::collections::VecDeque::new(),
         };
         let cell = heap
             .cells
@@ -1376,7 +1377,7 @@ impl Heap {
             self.retain_atom(id);
             return Ok(id);
         }
-        if let Some(id) = shared::find(&repr, hash) {
+        if let Some(id) = self.strings.shared().find(&repr, hash) {
             self.atoms.insert(hash, id);
             return Ok(id);
         }
@@ -1390,7 +1391,7 @@ impl Heap {
     /// id in a runtime.
     fn insert_atom(&mut self, repr: StringRepr, hash: u32) -> Result<StringId, HeapError> {
         let repr = if self.share_atoms {
-            match shared::find_or_insert(repr, hash) {
+            match self.strings.shared().find_or_insert(repr, hash) {
                 Ok(id) => {
                     self.atoms.insert(hash, id);
                     return Ok(id);
@@ -1453,7 +1454,7 @@ impl Heap {
 
     /// Sets how [`Heap::intern`] keeps its atoms; returns the mode before.
     pub fn set_atom_mode(&mut self, mode: AtomMode) -> AtomMode {
-        std::mem::replace(&mut self.atom_mode, mode)
+        core::mem::replace(&mut self.atom_mode, mode)
     }
 
     pub fn atom_mode(&self) -> AtomMode {
@@ -1556,7 +1557,7 @@ impl Heap {
             self.retain_atom(id);
             return Ok(id);
         }
-        if let Some(id) = shared::find_one_byte(bytes, hash) {
+        if let Some(id) = self.strings.shared().find_one_byte(bytes, hash) {
             self.atoms.insert(hash, id);
             return Ok(id);
         }

@@ -4,6 +4,8 @@
 //! Each method asserts (in debug builds) that the opcode has the format it is
 //! built with; the publication validator checks the operand values.
 
+use alloc::{boxed::Box, string::String, vec::Vec};
+
 use super::{Capture, CodeUnit, CodeUnitId, DebugInfo, Format, Handler, Insn, Opcode};
 use crate::heap::atom::PropertyKey;
 use crate::vm::ic::{FIELD_NO_SITE, GLOBAL_NO_SITE, IcKind};
@@ -85,6 +87,11 @@ impl CodeBuilder {
     #[track_caller]
     pub fn a_const(&mut self, op: Opcode, a: u8, index: u32) -> u32 {
         self.push(Format::AConst, Insn::new(op, a, 0, 0, index))
+    }
+
+    pub fn a_const_range(&mut self, op: Opcode, a: u8, first: u32, count: u16) -> u32 {
+        let [b, c] = count.to_le_bytes();
+        self.push(Format::AConstRange, Insn::new(op, a, b, c, first))
     }
 
     #[track_caller]
@@ -178,6 +185,18 @@ impl CodeBuilder {
         &self.code
     }
 
+    /// Keeps both PCs and their source/handler positions. The interpreter
+    /// may consume the read only when neither operation can throw or call JS.
+    pub fn hint_increment_element(&mut self) {
+        let n = self.code.len();
+        if n >= 2 {
+            let (increment, read) = (self.code[n - 2], self.code[n - 1]);
+            if increment.op == Opcode::Inc && read.op == Opcode::GetElem && increment.a == read.c {
+                self.code[n - 2].op = Opcode::IncGetElem;
+            }
+        }
+    }
+
     /// Turns every `Jmp` whose target is at or before it into `JmpBack`,
     /// once the targets are final: the loop polls for interrupts on
     /// back-edges only.
@@ -206,13 +225,13 @@ impl CodeBuilder {
             constant_count: layout.constant_count,
             spill_register: layout.spill_register.unwrap_or(super::NO_SPILL),
             spill_slots: layout.spill_slots,
-            ic_base: std::cell::Cell::new(super::IC_UNRESERVED),
+            ic_base: core::cell::Cell::new(super::IC_UNRESERVED),
             ic_count,
             children: layout.children.into(),
             name_atom: layout.name_atom,
             length: layout.length,
             atoms: Box::new([]),
-            body: std::sync::Arc::new(super::UnitBody {
+            body: alloc::sync::Arc::new(super::UnitBody {
                 handlers: self.handlers.into(),
                 captures: layout.captures.into(),
                 debug: DebugInfo {
@@ -270,7 +289,12 @@ fn key_table(code: &mut [Insn]) -> Box<[crate::PropertyKey]> {
 /// reserved and never filled. The global forms follow in `b | c << 8`, with
 /// the same rule at [`GLOBAL_NO_SITE`]; `New` sites come last, in `imm`.
 fn number_sites(code: &mut [Insn]) -> u32 {
-    let is_field = |insn: &Insn| matches!(IcKind::of(insn.op), Some(IcKind::Get | IcKind::Set));
+    let is_field = |insn: &Insn| {
+        matches!(
+            IcKind::of(insn.op),
+            Some(IcKind::Get | IcKind::Set | IcKind::Literal)
+        )
+    };
     let is_global = |insn: &Insn| IcKind::of(insn.op) == Some(IcKind::Global);
     let fields = code.iter().filter(|insn| is_field(insn)).count() as u32;
     let reserved = u32::from(FIELD_NO_SITE);
@@ -325,5 +349,5 @@ pub struct UnitLayout {
     /// its three-byte form, as QuickJS's `JS_ToCStringLen2` keeps it).
     pub source: Option<Box<[u8]>>,
     /// The script or module the function belongs to.
-    pub filename: Option<std::sync::Arc<str>>,
+    pub filename: Option<alloc::sync::Arc<str>>,
 }

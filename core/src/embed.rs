@@ -10,8 +10,9 @@
 //! and holds before its next entry). Results are unrooted; hold them before
 //! the next call that can allocate.
 
-use std::any::Any;
-use std::rc::Rc;
+use alloc::boxed::Box;
+use alloc::{rc::Rc, string::String, vec::Vec};
+use core::any::Any;
 
 use crate::bytecode::CodeStore;
 use crate::heap::atom::{KeyKind, PropertyKey};
@@ -306,8 +307,8 @@ impl<'a> NativeCx<'a> {
     /// A host function lends so that Rust code it calls, which has no way to
     /// reach its view, runs scripts on the same engine.
     pub fn lend(&mut self, Spare(mut parts): Spare) -> Lent {
-        std::mem::swap(self.heap, &mut parts.heap);
-        std::mem::swap(self.host, &mut parts.host);
+        core::mem::swap(self.heap, &mut parts.heap);
+        core::mem::swap(self.host, &mut parts.host);
         let code = match &self.code {
             CodeView::Owned(code) => Rc::clone(code),
             CodeView::Shared(code) => Rc::clone(code),
@@ -321,8 +322,8 @@ impl<'a> NativeCx<'a> {
 
     /// Takes back what [`NativeCx::lend`] lent and returns the spare.
     pub fn restore(&mut self, mut lent: Lent) -> Spare {
-        std::mem::swap(self.heap, &mut lent.parts.heap);
-        std::mem::swap(self.host, &mut lent.parts.host);
+        core::mem::swap(self.heap, &mut lent.parts.heap);
+        core::mem::swap(self.host, &mut lent.parts.host);
         Spare(lent.parts)
     }
 
@@ -384,14 +385,14 @@ impl<'a> NativeCx<'a> {
     }
 
     /// The flag another thread sets to interrupt the running script.
-    pub fn interrupt_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::clone(&self.host.interrupt)
+    pub fn interrupt_flag(&self) -> alloc::sync::Arc<core::sync::atomic::AtomicBool> {
+        alloc::sync::Arc::clone(&self.host.interrupt)
     }
 
     /// Starts the sampling profiler ([`crate::vm::Sampler`]): a poll that
     /// finds `flag` set counts the running stack. Started again, it keeps the
     /// counts and takes the new flag.
-    pub fn start_sampling(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    pub fn start_sampling(&mut self, flag: alloc::sync::Arc<core::sync::atomic::AtomicBool>) {
         match self.host.sampler.as_mut() {
             Some(sampler) => sampler.flag = flag,
             None => {

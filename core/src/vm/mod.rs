@@ -7,6 +7,8 @@
 //! argument is copied. Both tables live inside the [`Heap`] as fixed roots:
 //! a safepoint marks `registers[..top]` and every frame's function.
 
+use alloc::{boxed::Box, string::String, vec::Vec};
+
 pub(crate) mod arguments;
 pub(crate) mod async_generator;
 pub(crate) mod bigint;
@@ -29,13 +31,13 @@ pub(crate) mod proxy;
 pub(crate) mod suspend;
 pub(crate) mod typed;
 pub(crate) mod via;
-pub(crate) mod waiter;
+pub mod waiter;
 // Public for the root crate's differential test.
 #[doc(hidden)]
 pub mod radix;
 pub mod regexp;
 
-use std::fmt;
+use core::fmt;
 
 use crate::bytecode::{CodeStore, CodeUnitId, UnitRef};
 use crate::heap::Heap;
@@ -91,7 +93,7 @@ const _: () = assert!(size_of::<Frame>() == 32);
 
 /// Registers a frame addresses without a bounds check: an 8-bit operand, or
 /// a call's `b + 1` (see `interp::window`).
-pub(crate) const SPAN: usize = 512;
+pub(crate) const SPAN: usize = u8::MAX as usize + 2;
 
 /// Native stack bytes nested re-entries may use (debug builds have large
 /// loop frames; the default thread stack of a test is 2 MiB).
@@ -236,7 +238,7 @@ impl VmStack {
     #[inline]
     pub(crate) fn enter_native(&mut self) -> bool {
         let marker = 0u8;
-        let here = std::ptr::addr_of!(marker) as usize;
+        let here = core::ptr::addr_of!(marker) as usize;
         if self.nesting == 0 {
             self.native_base = here;
         } else if self.native_base.abs_diff(here) > self.native_budget
@@ -254,7 +256,7 @@ impl VmStack {
             return self.native_budget;
         }
         let marker = 0u8;
-        let here = std::ptr::addr_of!(marker) as usize;
+        let here = core::ptr::addr_of!(marker) as usize;
         self.native_budget
             .saturating_sub(self.native_base.abs_diff(here))
     }
@@ -295,16 +297,24 @@ pub struct Services {
     pub(crate) symbol_registry: crate::heap::hash::FxHashMap<Vec<u16>, crate::SymbolId>,
     /// Whether `Atomics.wait` may block this agent.
     pub can_block: bool,
+    /// The shared-memory ordering and blocking capability, when installed.
+    pub(crate) waiter: Option<&'static dyn waiter::Waiter>,
     /// The embedder's compiler.
     pub(crate) compile: Option<compile::CompileFn>,
     /// The embedder's module loader.
     pub(crate) module_host: Option<module::ModuleHost>,
     /// The module records by normalized name.
     pub(crate) modules: crate::heap::hash::FxHashMap<String, ObjectId>,
+    /// Async evaluation order shared by every module graph in this runtime.
+    pub(crate) module_async_order: u64,
+    /// One bounded workspace shared by this runtime's RegExp programs.
+    pub(crate) regexp_scratch: oxide_regexp::ScratchCache,
     /// The embedder's script runner, for `$262.agent.start`.
     pub(crate) script_runner: Option<crate::builtins::agent::ScriptRunner>,
-    /// The agents this (main) agent started.
-    pub(crate) agent_hub: Option<std::sync::Arc<crate::builtins::agent::AgentHub>>,
+    /// The host's agent execution and broadcast capability.
+    pub(crate) agent_host: Option<alloc::sync::Arc<dyn crate::builtins::agent::AgentHost>>,
+    /// A lazily initialized agent host for embeddings that may not use agents.
+    pub(crate) agent_host_factory: Option<crate::builtins::agent::AgentHostFactory>,
     /// This runtime as an agent of another.
     pub(crate) agent: Option<crate::builtins::agent::AgentSelf>,
     /// Whether unhandled rejected promises are kept in
@@ -312,12 +322,12 @@ pub struct Services {
     pub(crate) track_rejections: bool,
     /// Set from any thread to interrupt the running script at the next
     /// poll; it stays set until cleared.
-    pub(crate) interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) interrupt: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
     /// The embedder's sampling profiler, when one is started
     /// ([`Sampler`]).
     pub(crate) sampler: Option<Box<Sampler>>,
     /// The host exotic classes, by `vm::exotic::ExoticClass` index.
-    pub(crate) exotic_classes: Vec<std::rc::Rc<dyn exotic::ExoticHooks>>,
+    pub(crate) exotic_classes: Vec<alloc::rc::Rc<dyn exotic::ExoticHooks>>,
 }
 
 /// A sampling profiler of the running scripts. Another thread sets `flag`
@@ -332,7 +342,7 @@ pub struct Services {
 /// with `name (native)` innermost.
 #[derive(Debug, Default)]
 pub struct Sampler {
-    pub(crate) flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) flag: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
     pub(crate) counts: crate::heap::hash::FxHashMap<String, u64>,
     /// Polls until the next interrupt check.
     pub(crate) until_check: u32,
@@ -341,7 +351,7 @@ pub struct Sampler {
 /// Most frames a sample keeps, innermost first.
 pub(crate) const SAMPLE_FRAMES: usize = 48;
 
-impl std::fmt::Debug for Services {
+impl core::fmt::Debug for Services {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Services")
             .field("output", &self.output)
@@ -351,20 +361,21 @@ impl std::fmt::Debug for Services {
 
 impl Default for Services {
     fn default() -> Self {
-        // QuickJS seeds from the clock; programs that compare output replace
-        // `Math.random`, as the benchmark harness does.
-        let seed = crate::clock::time_seed();
         Services {
             output: Output::default(),
-            hooks: Box::new(crate::host::SystemHost),
-            random_state: seed.max(1),
+            hooks: Box::new(crate::host::NoHost),
+            random_state: 1,
             symbol_registry: Default::default(),
-            can_block: true,
+            can_block: false,
+            waiter: None,
             compile: None,
             module_host: None,
             modules: Default::default(),
+            module_async_order: 0,
+            regexp_scratch: oxide_regexp::ScratchCache::new(),
             script_runner: None,
-            agent_hub: None,
+            agent_host: None,
+            agent_host_factory: None,
             agent: None,
             track_rejections: false,
             interrupt: Default::default(),
@@ -402,8 +413,8 @@ pub(crate) struct Cx<'a> {
     pub host: &'a mut Box<Services>,
     /// The shared owners of `static_code` and `realm`, which a host
     /// function lending the engine hands on (`embed::Lent`).
-    pub code_owner: &'a std::rc::Rc<CodeStore>,
-    pub realm_owner: &'a std::rc::Rc<Realm>,
+    pub code_owner: &'a alloc::rc::Rc<CodeStore>,
+    pub realm_owner: &'a alloc::rc::Rc<Realm>,
 }
 
 impl<'a> Cx<'a> {

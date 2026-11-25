@@ -1,5 +1,8 @@
 //! Number conversions: `Number::toString(10)`, `StringToNumber`, `ToInt32`.
 
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+
 use crate::value::Value;
 
 /// A number result: an `Int32` when the double is one (not `-0`), so integer
@@ -28,8 +31,8 @@ pub(crate) fn to_uint32(value: f64) -> u32 {
     if !value.is_finite() {
         return 0;
     }
-    let truncated = value.trunc();
-    let modulo = truncated.rem_euclid(4_294_967_296.0);
+    let truncated = crate::float::trunc(value);
+    let modulo = crate::float::rem_euclid(truncated, 4_294_967_296.0);
     modulo as u32
 }
 
@@ -65,7 +68,7 @@ impl NumberText {
 
     #[inline]
     pub(crate) fn as_str(&self) -> &str {
-        std::str::from_utf8(self.as_bytes()).expect("ASCII")
+        core::str::from_utf8(self.as_bytes()).expect("ASCII")
     }
 }
 
@@ -126,7 +129,7 @@ pub(crate) fn text(value: f64) -> NumberText {
         return NumberText::of(b"0");
     }
     let magnitude = value.abs();
-    let decimal = if magnitude < 9_007_199_254_740_992.0 && magnitude.fract() == 0.0 {
+    let decimal = if magnitude < 9_007_199_254_740_992.0 && crate::float::fract(magnitude) == 0.0 {
         Decimal::of_u64(magnitude as u64)
     } else if let Some(decimal) = short_decimal(magnitude) {
         decimal
@@ -175,9 +178,9 @@ fn short_decimal(magnitude: f64) -> Option<Decimal> {
     }
     let scale = POWERS[places];
     let scaled = magnitude * scale;
-    let near = scaled.round() as u64;
-    let base = (scaled.floor() as u64).saturating_sub(1);
-    let n = std::iter::once(near)
+    let near = crate::float::round(scaled) as u64;
+    let base = (crate::float::floor(scaled) as u64).saturating_sub(1);
+    let n = core::iter::once(near)
         .chain((base..base + 4).filter(|&n| n != near))
         .find(|&n| n as f64 / scale == magnitude)?;
     let mut decimal = Decimal::of_u64(n);
@@ -189,15 +192,15 @@ fn short_decimal(magnitude: f64) -> Option<Decimal> {
 /// into a stack buffer. Where the value lies exactly halfway between two
 /// such digit strings Rust keeps the upper one; QuickJS rounds to even.
 fn shortest(magnitude: f64) -> Decimal {
-    use std::fmt::Write;
+    use core::fmt::Write;
     struct Buffer {
         bytes: [u8; 32],
         len: usize,
     }
     impl Write for Buffer {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
             let end = self.len + text.len();
-            let slot = self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+            let slot = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
             slot.copy_from_slice(text.as_bytes());
             self.len = end;
             Ok(())
@@ -365,7 +368,7 @@ pub(crate) fn parse(units: &[u16]) -> f64 {
         for (byte, &unit) in buffer.iter_mut().zip(units) {
             *byte = unit as u8;
         }
-        let text = std::str::from_utf8(&buffer[..units.len()]).expect("ASCII");
+        let text = core::str::from_utf8(&buffer[..units.len()]).expect("ASCII");
         return parse_trimmed(text);
     }
     let Ok(text) = String::from_utf16(units) else {
@@ -444,7 +447,7 @@ pub(crate) fn pow(base: f64, exponent: f64) -> f64 {
     if exponent.is_nan() || (base.abs() == 1.0 && exponent.is_infinite()) {
         return f64::NAN;
     }
-    base.powf(exponent)
+    crate::float::pow(base, exponent)
 }
 
 /// Decodes an IEEE-754 binary16 (QuickJS `cutils.h::fromfp16`): the half
@@ -489,6 +492,8 @@ pub(crate) fn to_float16_bits(value: f64) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
 
     #[test]

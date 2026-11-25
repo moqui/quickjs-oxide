@@ -313,6 +313,38 @@ compilation and lowering cancel. `--binary` uses the root crate's ignored
 ([`core/examples/workloads.rs`](../../core/examples/workloads.rs)) and their
 JavaScript counterparts, subtracting each side's empty loop.
 
+## layout
+
+```sh
+# Build each clean source with RUSTFLAGS='-C save-temps --print link-args'
+# and bench.py build before measuring. No build/test jobs during the run.
+python3 scripts/benchmark/bench.py layout \
+  --base-log /tmp/base-target/release/qjs.build.stdout.log \
+  --candidate-log /tmp/candidate-target/release/qjs.build.stdout.log \
+  --suite target/suite-matrix/manifest.json --repeat 4 --cpu 2 \
+  --max-spread-percent 3 --max-regression-percent 2 --output /tmp/oxide-layout
+```
+
+Relinks each build at offsets **0/16/32/48** from a fixed +64-byte origin
+(actual shifts 64/80/96/112), then measures each offset serially in ABBA order.
+All four `.text` sections within each engine must be byte-identical before
+sampling. Offsets separated only by 64 bytes would miss smaller alignment
+changes. The relinks can differ from the native release binary; retain its
+original Sweep and Claim results separately.
+
+The default workloads are all eight V8 v7 programs plus `numeric_local_loop`
+and `array_read`. `--case` selects suite cases and `--fixed-case` selects fixed
+probes. `summary.md` and `summary.json` retain each placement's time, cycles
+and instructions, plus each engine's minimum/median/maximum and spread
+(`max/min − 1` across placement medians). The diagnostic gate checks candidate
+time/cycles spread and the worst matched-offset regression against the limits
+declared before running. Failed or incomplete samples also fail.
+
+Offsets run in sequential blocks, so spread may include drift and process
+variation; it is not an A/A noise estimate or a confidence interval. Investigate
+large spreads with interleaved placements and profiles. These diagnostics do
+not replace paired A/A+A/B Claim gates or make a missed gate pass.
+
 ## relink
 
 ```sh
@@ -323,7 +355,8 @@ python3 scripts/benchmark/bench.py relink /tmp/oxide-relink/build.log /tmp/oxide
 
 Relinks one saved LTO build with `.text` placed at each offset from the
 default address, writing `PREFIX-d<delta>` binaries and `PREFIX-relinks.json`
-with each variant's `.text` address and SHA-256. The machine code is
-identical, so the spread of a `run` over the variants is the layout noise of
-that build. A variant whose `.text` bytes differ from the first offset variant
-is reported on stderr.
+with each variant's `.text` address, size and SHA-256. A variant whose `.text`
+bytes differ from the first offset variant is reported on stderr;
+`--require-identical` rejects it. Compare identical variants with `run` to
+investigate placement sensitivity, controlling measurement noise separately.
+Use `layout` for both-engine comparisons at finer offsets.

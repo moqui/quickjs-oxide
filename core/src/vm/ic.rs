@@ -16,6 +16,8 @@
 //! [`CodeUnit`]: crate::bytecode::CodeUnit
 //! [`Heap`]: crate::heap::Heap
 
+use alloc::vec::Vec;
+
 use crate::bytecode::{CodeUnit, Opcode};
 use crate::heap::arena::Arena;
 use crate::heap::object::{NONE, ObjectHeader, ObjectKind, flags};
@@ -36,6 +38,8 @@ pub enum IcKind {
     Global,
     /// `New`: `fn_shape`, `proto_slot`, `slots`.
     Construct,
+    /// `NewObjectLit`: the final shape, cached weakly in `w0`.
+    Literal,
 }
 
 impl IcKind {
@@ -48,6 +52,7 @@ impl IcKind {
                 Some(IcKind::Global)
             }
             Opcode::New => Some(IcKind::Construct),
+            Opcode::NewObjectLit => Some(IcKind::Literal),
             _ => None,
         }
     }
@@ -58,6 +63,7 @@ impl IcKind {
             IcKind::Set => "set",
             IcKind::Global => "global",
             IcKind::Construct => "construct",
+            IcKind::Literal => "literal",
         }
     }
 }
@@ -92,8 +98,6 @@ pub const EMPTY_TAG: u32 = NONE;
 /// `w0` of a `GetField` entry filled for a string receiver: the property was
 /// found on `%String.prototype%` or above it.
 pub const STRING_RECEIVER_TAG: u32 = NONE - 1;
-/// `w0` of a polymorphic site; `w1` indexes its row of [`POLY`] entries.
-pub const POLY_TAG: u32 = NONE - 2;
 /// `w0` of a megamorphic site: it saw more than [`POLY`] receiver shapes and
 /// records nothing more.
 pub const MEGA_TAG: u32 = NONE - 3;
@@ -120,8 +124,8 @@ impl IcEntry {
         self.w0 == EMPTY_TAG
     }
 
-    /// Whether the entry is a monomorphic fill rather than empty, a
-    /// polymorphic link or the megamorphic mark.
+    /// Whether the inline entry holds a shape rather than an empty or
+    /// megamorphic mark.
     #[inline]
     pub fn is_filled(&self) -> bool {
         self.w0 < LENGTH_TAG || self.w0 == STRING_RECEIVER_TAG || self.w0 == LENGTH_TAG
@@ -221,15 +225,15 @@ pub(crate) fn set_hit(
 /// carry no counter.
 #[derive(Clone, Debug, Default)]
 pub struct IcStats {
-    /// Monomorphic hits, by [`IcKind`].
-    pub mono_hits: [u64; 4],
+    /// Inline entry hits, including a polymorphic site's latest shape.
+    pub mono_hits: [u64; 5],
     /// Hits on the out-of-line probe of a polymorphic row.
-    pub poly_hits: [u64; 4],
+    pub poly_hits: [u64; 5],
     /// Misses that filled or refilled an entry.
-    pub fills: [u64; 4],
+    pub fills: [u64; 5],
     /// Misses that did not: an accessor, a dictionary, a complete miss, a
     /// megamorphic site.
-    pub unfilled: [u64; 4],
+    pub unfilled: [u64; 5],
     /// Misses per entry, both kinds.
     pub site_misses: Vec<u64>,
     /// `IterStart`s that walked a pristine array by index, and the ones that
@@ -249,6 +253,9 @@ pub struct IcStore {
     free: Vec<(u32, u32)>,
     /// The rows of polymorphic sites, each owned by one site.
     pub(crate) poly: Vec<[IcEntry; POLY]>,
+    /// Row indices by site, or NONE. Allocated only up to sites that turn
+    /// polymorphic; the inline entry keeps the latest successful shape.
+    poly_sites: Vec<u32>,
     /// The kind of each row's site.
     poly_kinds: Vec<IcKind>,
     /// Rows no site owns, reused first.
@@ -327,12 +334,15 @@ impl IcStore {
             return;
         }
         let range = start as usize..(start + count) as usize;
-        for entry in &mut self.entries[range.clone()] {
-            if entry.w0 == POLY_TAG {
-                self.poly[entry.w1 as usize] = [IcEntry::EMPTY; POLY];
-                self.poly_free.push(entry.w1);
+        for index in range.clone() {
+            if let Some(row) = self.poly_sites.get_mut(index)
+                && *row != NONE
+            {
+                self.poly[*row as usize] = [IcEntry::EMPTY; POLY];
+                self.poly_free.push(*row);
+                *row = NONE;
             }
-            *entry = IcEntry::EMPTY;
+            self.entries[index] = IcEntry::EMPTY;
         }
         #[cfg(any(feature = "ic-stats", debug_assertions))]
         self.stats.site_misses[range].fill(0);
@@ -381,7 +391,7 @@ impl IcStore {
                 unit.ic_count > 0 && unit.ic_base.get() != crate::bytecode::IC_UNRESERVED
             })
             .collect::<Vec<_>>();
-        held.sort_unstable_by_key(|unit| std::cmp::Reverse(unit.ic_base.get()));
+        held.sort_unstable_by_key(|unit| core::cmp::Reverse(unit.ic_base.get()));
         for unit in held {
             let (old, count) = (unit.ic_base.get(), unit.ic_count);
             let Some(position) = self
@@ -402,6 +412,9 @@ impl IcStore {
             self.entries.copy_within(from..from + count, to);
             self.entries[from..from + count].fill(IcEntry::EMPTY);
             self.kinds.copy_within(from..from + count, to);
+            // A polymorphic site's row goes with it; the old place keeps
+            // none, so a unit reserved there later starts monomorphic.
+            self.move_rows(from, to, count);
             #[cfg(any(feature = "ic-stats", debug_assertions))]
             {
                 self.stats.site_misses.copy_within(from..from + count, to);
@@ -409,6 +422,19 @@ impl IcStore {
             }
             unit.ic_base.set(start);
             self.free_range(old, count as u32);
+        }
+    }
+
+    /// Moves the row links of sites `from .. from + count` to `to ..`
+    /// (`to < from`), leaving the old sites without one.
+    fn move_rows(&mut self, from: usize, to: usize, count: usize) {
+        if self.poly_sites.len() <= from {
+            return;
+        }
+        let end = (from + count).min(self.poly_sites.len());
+        for index in from..end {
+            let row = core::mem::replace(&mut self.poly_sites[index], NONE);
+            self.poly_sites[to + index - from] = row;
         }
     }
 
@@ -424,6 +450,9 @@ impl IcStore {
             self.free.pop();
             self.entries.truncate(start as usize);
             self.kinds.truncate(start as usize);
+            // Free sites hold no row: only the links past the end go.
+            self.poly_sites
+                .truncate((start as usize).min(self.poly_sites.len()));
             #[cfg(any(feature = "ic-stats", debug_assertions))]
             self.stats.site_misses.truncate(start as usize);
         }
@@ -449,6 +478,7 @@ impl IcStore {
         shrink(&mut self.poly);
         shrink(&mut self.poly_kinds);
         shrink(&mut self.poly_free);
+        shrink(&mut self.poly_sites);
         #[cfg(any(feature = "ic-stats", debug_assertions))]
         shrink(&mut self.stats.site_misses);
     }
@@ -463,8 +493,14 @@ impl IcStore {
         for &(start, len) in &self.free {
             let range = start as usize..(start + len) as usize;
             assert!(
-                self.entries[range].iter().all(IcEntry::is_empty),
+                self.entries[range.clone()].iter().all(IcEntry::is_empty),
                 "gc verify: a free cache range at {start} is not empty"
+            );
+            assert!(
+                range
+                    .into_iter()
+                    .all(|index| { self.poly_sites.get(index).copied().unwrap_or(NONE) == NONE }),
+                "gc verify: a free cache range at {start} keeps a row"
             );
         }
         for &row in &self.poly_free {
@@ -487,8 +523,15 @@ impl IcStore {
     /// The row of a polymorphic site.
     #[inline]
     pub fn poly_row(&self, index: usize) -> Option<&[IcEntry; POLY]> {
-        let entry = self.entries[index];
-        (entry.w0 == POLY_TAG).then(|| &self.poly[entry.w1 as usize])
+        let row = self.poly_sites.get(index).copied().unwrap_or(NONE);
+        (row != NONE).then(|| &self.poly[row as usize])
+    }
+
+    /// A row hit becomes the inline entry, without changing its guards or
+    /// the weak references retained by the row.
+    #[inline]
+    pub(crate) fn promote(&mut self, index: usize, entry: IcEntry) {
+        self.entries[index] = entry;
     }
 
     /// Records a fill of site `index`. A shape-keyed site (`GetField`,
@@ -499,16 +542,16 @@ impl IcStore {
     pub(crate) fn record(&mut self, index: usize, fill: IcEntry) -> bool {
         let kind = self.kinds[index];
         let current = self.entries[index];
-        if !matches!(kind, IcKind::Get | IcKind::Set)
-            || (!current.is_filled() && current.w0 != POLY_TAG)
+        if current.w0 == MEGA_TAG {
+            return false;
+        }
+        let row_index = self.poly_sites.get(index).copied().unwrap_or(NONE);
+        if !matches!(kind, IcKind::Get | IcKind::Set) || (row_index == NONE && !current.is_filled())
         {
-            if current.w0 == MEGA_TAG {
-                return false;
-            }
             self.entries[index] = fill;
             return true;
         }
-        if current.is_filled() {
+        if row_index == NONE {
             if current.w0 == fill.w0 {
                 self.entries[index] = fill;
             } else {
@@ -525,16 +568,15 @@ impl IcStore {
                         self.poly.len() as u32 - 1
                     }
                 };
-                self.entries[index] = IcEntry {
-                    w0: POLY_TAG,
-                    w1: row,
-                    w2: NONE,
-                    w3: NONE,
-                };
+                if self.poly_sites.len() <= index {
+                    self.poly_sites.resize(index + 1, NONE);
+                }
+                self.poly_sites[index] = row;
+                self.entries[index] = fill;
             }
             return true;
         }
-        let row = &mut self.poly[current.w1 as usize];
+        let row = &mut self.poly[row_index as usize];
         let slot = row
             .iter()
             .position(|entry| entry.w0 == fill.w0)
@@ -542,12 +584,14 @@ impl IcStore {
         match slot {
             Some(slot) => {
                 row[slot] = fill;
+                self.entries[index] = fill;
                 true
             }
             None => {
-                let row = current.w1;
+                let row = row_index;
                 self.poly[row as usize] = [IcEntry::EMPTY; POLY];
                 self.poly_free.push(row);
+                self.poly_sites[index] = NONE;
                 self.entries[index] = IcEntry {
                     w0: MEGA_TAG,
                     ..IcEntry::EMPTY
@@ -606,6 +650,7 @@ impl IcStore {
             + self.kinds.capacity() * size_of::<IcKind>()
             + self.free.capacity() * size_of::<(u32, u32)>()
             + self.poly.capacity() * size_of::<[IcEntry; POLY]>()
+            + self.poly_sites.capacity() * size_of::<u32>()
             + self.poly_kinds.capacity() * size_of::<IcKind>()
             + self.poly_free.capacity() * size_of::<u32>()
             + self.mega.capacity() * size_of::<(u32, u32, IcEntry)>()
@@ -619,14 +664,18 @@ impl IcStore {
     pub fn filled(&self) -> usize {
         self.entries
             .iter()
-            .filter(|entry| entry.is_filled())
+            .enumerate()
+            .filter(|(index, entry)| {
+                entry.is_filled() && self.poly_sites.get(*index).copied().unwrap_or(NONE) == NONE
+            })
             .count()
     }
 
     /// Sites by state: monomorphic, polymorphic, megamorphic.
     pub fn site_states(&self) -> (usize, usize, usize) {
         let count = |tag: u32| self.entries.iter().filter(|entry| entry.w0 == tag).count();
-        (self.filled(), count(POLY_TAG), count(MEGA_TAG))
+        let poly = self.poly_sites.iter().filter(|&&row| row != NONE).count();
+        (self.filled(), poly, count(MEGA_TAG))
     }
 
     // ---- ic-stats ----
@@ -781,7 +830,7 @@ fn records(kind: IcKind, entry: IcEntry) -> impl Iterator<Item = Record> {
             }
         }
         IcKind::Global => {}
-        IcKind::Construct => found[0] = Some(Record::Shape(entry.w0)),
+        IcKind::Construct | IcKind::Literal => found[0] = Some(Record::Shape(entry.w0)),
     }
     found.into_iter().flatten()
 }
@@ -867,7 +916,41 @@ mod tests {
         assert_eq!(b.ic_base.get(), 0);
         assert!(store.record(0, fill(4)));
         assert!(store.record(0, fill(5)));
-        assert_eq!(store.entries[0].w1, 0, "the row is reused");
+        assert_eq!(store.poly_sites[0], 0, "the row is reused");
         assert_eq!(store.poly.len(), 1);
+    }
+
+    /// A polymorphic site that compaction moves keeps its row, and its old
+    /// place keeps none: a unit reserved there later starts monomorphic,
+    /// with no other unit's shapes.
+    #[test]
+    fn compaction_moves_a_polymorphic_sites_row() {
+        let mut store = IcStore::default();
+        let gone = reserve(&mut store, COMPACT_MIN as u32 + 100);
+        let kept = reserve(&mut store, 2);
+        let old = kept.ic_base.get() as usize;
+        let fill = |shape: u32| IcEntry {
+            w0: shape,
+            w1: NONE,
+            w2: 0,
+            w3: STATIC_CELL.index(),
+        };
+        assert!(store.record(old, fill(1)));
+        assert!(store.record(old, fill(2)));
+        let row = *store.poly_row(old).expect("a polymorphic site");
+        store.release(&gone);
+        store.compact([&kept]);
+        assert_eq!(kept.ic_base.get(), 0);
+        assert_eq!(store.poly_row(0), Some(&row));
+        assert!(store.poly_row(old).is_none());
+        store.verify_free();
+        let next = reserve(&mut store, 2);
+        assert_eq!(next.ic_base.get(), 2);
+        assert!(store.poly_row(2).is_none());
+        store.release(&next);
+        store.trim();
+        assert_eq!(store.len(), 2);
+        assert!(store.poly_sites.len() <= 2);
+        assert_eq!(store.poly_row(0), Some(&row));
     }
 }

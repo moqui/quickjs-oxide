@@ -11,7 +11,7 @@ use crate::engine::compiler::register::run_tests::{corpus, run_on_core};
 #[derive(Default)]
 struct Capture(Rc<RefCell<String>>);
 
-impl oxide_core::host::Host for Capture {
+impl super::Host for Capture {
     fn write(&mut self, _: oxide_core::host::Stream, text: &[u8]) {
         self.0.borrow_mut().push_str(&String::from_utf8_lossy(text));
     }
@@ -44,7 +44,7 @@ fn run_api(source: &str) -> String {
 #[test]
 fn the_corpus_prints_through_the_api_what_the_driver_prints() {
     let programs = corpus();
-    assert_eq!(programs.len(), 50);
+    assert_eq!(programs.len(), 53);
     let mut failures = Vec::new();
     for (name, source) in programs {
         let expected = run_on_core(&source);
@@ -101,6 +101,544 @@ fn transient_code_is_freed_once_nothing_names_it() {
         runtime.memory_report().unwrap().code.static_units,
         before.static_units + 2
     );
+}
+
+#[test]
+fn call_entry_keeps_static_and_dynamic_units_through_rewrites_and_construction() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let context = runtime.context();
+    context
+        .eval(
+            "function staticStep(next, n) { return n ? next(staticStep, n - 1) + 1 : 1; }
+             function StaticCtor(x) { this.x = x; this.target = new.target; }
+             function sloppy() { return typeof this + ':' + this.valueOf(); }
+             function strict() { 'use strict'; return this; }",
+        )
+        .unwrap();
+    let transient = EvalOptions::default().transient();
+    let result = context
+        .eval_with_options(
+            "(function () {
+                function dynamicStep(next, n) { return n ? next(dynamicStep, n - 1) + 1 : 1; }
+                function DynamicCtor(x) { this.x = x; this.target = new.target; }
+                function collect(a, ...rest) { return a + rest.length + arguments.length; }
+                class Derived extends StaticCtor {}
+                var a = new StaticCtor(11);
+                var b = new DynamicCtor(...[13]);
+                var c = new Derived(...[17]);
+                return staticStep(dynamicStep, 20) === 21
+                    && dynamicStep(staticStep, 21) === 22
+                    && sloppy.call(7) === 'object:7'
+                    && (function temporary() { return temporary; }).call(7).name === 'temporary'
+                    && strict.apply(null, []) === null
+                    && Function.prototype.call.call(collect, null, 3, 4, 5) === 8
+                    && collect(...[5, 6, 7, 8]) === 12
+                    && a.x === 11 && a.target === StaticCtor
+                    && b.x === 13 && b.target === DynamicCtor
+                    && c.x === 17 && c.target === Derived;
+             })()",
+            &transient,
+        )
+        .unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn failed_call_entry_keeps_the_callers_handlers_and_code() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let context = runtime.context();
+    context
+        .eval("var notConstructor = () => 1; function staticThrow() { throw 23; }")
+        .unwrap();
+    let result = context
+        .eval_with_options(
+            "(function () {
+                var caught = 0;
+                try { staticThrow(); } catch (e) { caught += e; }
+                try { new notConstructor(); } catch (e) { caught += e instanceof TypeError; }
+                try { new notConstructor(...[]); } catch (e) { caught += e instanceof TypeError; }
+                try { (0)(...[]); } catch (e) { caught += e instanceof TypeError; }
+                return caught;
+             })()",
+            &EvalOptions::default().transient(),
+        )
+        .unwrap();
+    assert_eq!(result, Value::Int(26));
+}
+
+#[test]
+fn call_returns_restore_callers_after_native_calls_and_suspension() {
+    assert_eq!(
+        run_api(
+            "function tailNative(n) { return Math.abs(n); }
+             function tailConstruct(n) { return new Number(n); }
+             function actual(a, b) { return [a, b, arguments.length].join(':'); }
+             function* values(n) { yield n; return n + 1; }
+             async function ready(n) { return n + 2; }
+             function caller() {
+                 var keep = { value: 19 };
+                 var a = tailNative(-7);
+                 var b = tailConstruct(11);
+                 var c = actual(3, 5, 8, 13);
+                 var it = values(17);
+                 var d = it.next().value + it.next().value;
+                 ready(23).then(function (e) { print(keep.value, a, b.valueOf(), c, d, e); });
+             }
+             caller();"
+        ),
+        "19 7 11 3:5:4 35 25\n"
+    );
+}
+
+#[test]
+fn element_hits_and_reentrant_misses_preserve_the_register_window() {
+    assert_eq!(
+        run_api(
+            "function grow(n) { return n ? grow(n - 1) + 1 : 1; }
+             var bump = (function () { var n = 0; return function () { return ++n; }; })();
+             var written = 0;
+             Object.defineProperty(Array.prototype, '1', {
+                 configurable: true,
+                 get: function () { bump(); return grow(600); },
+                 set: function (v) { bump(); written = v + grow(400); }
+             });
+             var a = [2, , 4];
+             a[1] = 5;
+             var total = a[0] + a[1] + a[2];
+             delete Array.prototype[1];
+             var t = new Int16Array(2);
+             t[0] = 7;
+             t[1] = { valueOf: function () { return grow(700); } };
+             function mapped(x) { arguments[0] = 3; return x; }
+             print(total, written, t[0], t[1], mapped(9), bump());"
+        ),
+        "607 406 7 701 3 3\n"
+    );
+}
+
+#[test]
+fn short_calls_publish_at_the_first_unexecuted_operation() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime
+        .context()
+        .eval(
+            "function grow(n) { return n ? grow(n - 1) + 1 : 1; }
+         function read(o) { return o.x; }
+         function step(o) { o.n++; return o.x; }
+         function store(o, x) { o.n++; o.x = x; }
+         function add(o, x) { o.n++; return x + 1; }
+         function callback(o, f) { o.n++; return f(); }
+         var o = { n: 0, x: 3 }, ok = true;
+         for (var i = 0; i < 20; ++i) {
+             ok = ok && read(o) === i + 3 && step(o) === i + 3;
+             store(o, i + 4);
+             ok = ok && add(o, i) === i + 1;
+         }
+         var seen = 0;
+         Object.defineProperty(o, 'x', {
+             configurable: true,
+             get: function () { ++seen; return grow(400); },
+             set: function (v) { seen += v + grow(300); }
+         });
+         ok = ok && step(o) === 401 && seen === 1;
+         store(o, 7);
+         ok = ok && seen === 309;
+         ok = ok && add(o, { valueOf: function () { return grow(200); } }) === 202;
+         ok = ok && callback(o, function () { return grow(100); }) === 101;
+         Object.defineProperty(o, 'x', { get: function () { throw 17; } });
+         try { step(o); } catch (e) { ok = ok && e === 17; }
+         ok && o.n === 65;",
+        )
+        .unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn short_calls_keep_numeric_identity_and_receiver_semantics() {
+    assert_eq!(
+        run_api(
+            "function id(x) { return x; }
+             function sum(x, y) { return x + y; }
+             function sub(x, y) { return x - y; }
+             function lt(x, y) { return x < y; }
+             function eq(x, y) { return x === y; }
+             function choose(x, y) { return x ? x : y; }
+             function receiver() { 'use strict'; return this; }
+             function self() { return self; }
+             var a = {}, b = {};
+             print(1 / id(-0), sum(2147483647, 1), sub(-2147483648, 1),
+                 sum('a', 2), lt(NaN, 1), eq(a, a), eq(a, b),
+                 eq('ab', ['a', 'b'].join('')), eq(1n, BigInt('1')),
+                 choose('', 7), choose(NaN, 9), receiver.call(null), self() === self);"
+        ),
+        "-Infinity 2147483648 -2147483649 a2 false true false true true 7 9 null true\n"
+    );
+}
+
+#[test]
+fn calls_follow_replaced_collected_and_dynamic_functions() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let context = runtime.context();
+    let result = context
+        .eval(
+            "function apply(f, x) { return f(x); }
+         function method(o, x) { return o.f(x); }
+         function make(n) { return function (x) { return n + x; }; }
+         var o = { f: make(0) }, ok = true;
+         for (var n = 0; n < 60; ++n) {
+             var f = make(n); o.f = f;
+             for (var i = 0; i < 4; ++i) {
+                 ok = ok && apply(f, i) === n + i && method(o, i) === n + i;
+             }
+             o.f = Math.abs;
+             ok = ok && apply(Math.abs, -n) === n && method(o, -n) === n;
+             o.f = Function('x', 'return x + 2');
+             ok = ok && method(o, n) === n + 2;
+             try { apply({}, n); ok = false; } catch (e) { ok = ok && e instanceof TypeError; }
+         }
+         ok;",
+        )
+        .unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn planned_reads_and_writes_miss_before_observable_callbacks() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime.context().eval(
+        "var Mode = { none: 0 };
+         function active(o) { return o.x !== Mode.none; }
+         function clear(o) { o.x = Mode.none; }
+         function mark(o) { o.x = false; }
+         function set(o, v) { o.x = v; }
+         function at(o, i) { return o.a[i]; }
+         var o = { x: 1, a: [3, 5] }, ok = true, seen = 0;
+         for (var i = 0; i < 20; ++i) {
+             set(o, 1); ok = ok && active(o) && at(o, 1) === 5;
+             clear(o); ok = ok && !active(o);
+             mark(o); ok = ok && o.x === false;
+         }
+         Mode.none = 2; clear(o); ok = ok && o.x === 2;
+         Object.defineProperty(o, 'x', { set: function (v) { ++seen; }, configurable: true });
+         set(o, 7); clear(o); mark(o);
+         ok = ok && seen === 3;
+         Object.defineProperty(Mode, 'none', { get: function () { ++seen; return 9; } });
+         clear(o); ok = ok && seen === 5;
+         Object.defineProperty(Array.prototype, '1', { get: function () { ++seen; return 11; }, configurable: true });
+         delete o.a[1]; ok = ok && at(o, 1) === 11 && seen === 6;
+         delete Array.prototype[1]; o.a.length = 1;
+         ok && at(o, 1) === undefined;"
+    ).unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn planned_field_choices_read_only_the_selected_branch() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime
+        .context()
+        .eval(
+            "var Mode = { value: 1 }, o = { k: 0, a: 3, b: 5 }, seen = 0, ok = true;
+         function pick(o) { return o.k == Mode.value ? o.a : o.b; }
+         for (var i = 0; i < 20; ++i) {
+             o.k = 0; ok = ok && pick(o) === 5;
+             o.k = 1; ok = ok && pick(o) === 3;
+         }
+         Object.defineProperty(o, 'a', { get: function () { ++seen; return 17; } });
+         o.k = 0; ok = ok && pick(o) === 5 && seen === 0;
+         o.k = 1; ok = ok && pick(o) === 17 && seen === 1;
+         Mode.value = { valueOf: function () { ++seen; return 1; } };
+         ok = ok && pick(o) === 17 && seen === 3;
+         Object.defineProperty(Mode, 'value', { get: function () { ++seen; return 0; } });
+         ok && pick(o) === 5 && seen === 4;",
+        )
+        .unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn conditional_backedges_poll_numeric_and_truthiness_loops() {
+    struct Stop;
+    impl super::Host for Stop {
+        fn interrupt(&mut self) -> bool {
+            true
+        }
+    }
+    for source in [
+        "function f(n) { for(var i=0;i<n;i++) {} return i; } f(3000)",
+        "function f(n,s) { for(var i=0;i<n;i+=s) {} return i; } f(3000,1)",
+        "function f(n) { for(var i=0;i<n;i+=1) {} return i; } f(3000)",
+        "function f(n) { var x; for(var i=0;i<n;) { i++; x=i*i; } return x; } f(3000)",
+        "function f(n) { while(n) --n; return n; } f(3000)",
+        "function f(n) { var i=0,done=false; while(!done) { i++; done=i>=n; } return i; } f(3000)",
+    ] {
+        let runtime = Runtime::with_host(Stop, RuntimeOptions::default());
+        assert_eq!(
+            runtime.context().eval(source),
+            Err(RuntimeError::Interrupted),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn planned_bit_tests_keep_short_circuit_reads_and_coercions() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime
+        .context()
+        .eval(
+            "globalThis.BITS_MASK=4; globalThis.BITS_TARGET=2;
+         var reads=0, conversions=0;
+         function ready() { return (this.bits & BITS_MASK)!==0 || this.other===BITS_TARGET; }
+         var o={bits:0,other:2,ready:ready},ok=true;
+         for(var i=0;i<30;i++) {
+             o.bits=i&7;o.other=i&3;
+             ok=ok&&o.ready()===(((i&7)&4)!==0||(i&3)===2);
+         }
+         Object.defineProperty(o,'other',{get:function(){ ++reads; return 2; }});
+         Object.defineProperty(globalThis,'BITS_TARGET',{get:function(){ ++reads; return 2; }});
+         o.bits=4; ok=ok&&o.ready()&&reads===0;
+         o.bits=0; ok=ok&&o.ready()&&reads===2;
+         BITS_MASK={valueOf:function(){ ++conversions; return 4; }};
+         o.bits=4; ok=ok&&o.ready()&&conversions===1&&reads===2;
+         o.bits=0; ok&&o.ready()&&conversions===2&&reads===4;",
+        )
+        .unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn planned_bit_updates_fall_back_before_any_observable_write() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime.context().eval(
+        "globalThis.BITS_MASK=4;
+         var reads=0,writes=0,conversions=0,stored=0;
+         function update() { 'use strict'; this.bits=this.bits|BITS_MASK; }
+         function grow(n) { return n?grow(n-1)+1:1; }
+         var o={bits:0,update:update},ok=true;
+         for(var i=0;i<30;i++) { o.bits=i; o.update(); ok=ok&&o.bits===(i|4); }
+         Object.defineProperty(o,'bits',{get:function(){ ++reads; return stored; },set:function(v){ ++writes; stored=v; },configurable:true});
+         o.update(); ok=ok&&reads===1&&writes===1&&stored===4;
+         BITS_MASK={valueOf:function(){ ++conversions; grow(400); return 8; }};
+         o.update(); ok=ok&&reads===2&&writes===2&&conversions===1&&stored===12;
+         Object.defineProperty(o,'bits',{value:1,writable:false});
+         var threw=false;
+         try { o.update(); } catch(e) { threw=e instanceof TypeError; }
+         ok&&threw&&conversions===2&&writes===2&&o.bits===1;"
+    ).unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn planned_bit_updates_preserve_unsigned_results_and_shift_counts() {
+    let runtime = Runtime::new();
+    let result = runtime
+        .context()
+        .eval(
+            "globalThis.BITS_SHIFT=1;
+         function shl() { this.bits=this.bits<<BITS_SHIFT; }
+         function sar() { this.bits=this.bits>>BITS_SHIFT; }
+         function shr() { this.bits=this.bits>>>BITS_SHIFT; }
+         function xor() { this.bits=this.bits^BITS_SHIFT; }
+         var o={bits:0,shl:shl,sar:sar,shr:shr,xor:xor},ok=true;
+         for(var i=0;i<30;i++) {
+             o.bits=-1; o.shr(); ok=ok&&o.bits===2147483647;
+             o.bits=-2; o.sar(); ok=ok&&o.bits===-1;
+             o.bits=1073741824; o.shl(); ok=ok&&o.bits===-2147483648;
+             o.bits=7; o.xor(); ok=ok&&o.bits===6;
+         }
+         BITS_SHIFT=0; o.bits=-1; o.shr(); ok=ok&&o.bits===4294967295;
+         BITS_SHIFT=33; o.shr(); ok=ok&&o.bits===2147483647;
+         BITS_SHIFT=-1; o.bits=1; o.shl(); ok&&o.bits===-2147483648;",
+        )
+        .unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn delegated_read_plans_follow_live_methods_and_fall_back_before_callbacks() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime.context().eval(
+        "function size(){return this.a.length;}
+         function at(i){return this.a[i];}
+         function forwardSize(){return this.inner.size();}
+         function forwardAt(i){return this.inner.at(i);}
+         function grow(n){return n?grow(n-1)+1:1;}
+         var leaf={a:[11,17],size:size,at:at},p={inner:leaf,size:forwardSize,at:forwardAt},ok=true,seen=0;
+         for(var i=0;i<30;i++) { ok=ok&&p.size()===2&&p.at(1)===17&&p.at()===undefined; }
+         Object.defineProperty(leaf,'a',{get:function(){++seen;grow(400);return [19,23];},configurable:true});
+         ok=ok&&p.at(1)===23&&seen===1&&p.size()===2&&seen===2;
+         Object.defineProperty(leaf,'a',{value:[29,31],writable:true});
+         leaf.at=Function('i','return this.a[i]+1');
+         ok=ok&&p.at(1)===32;
+         leaf.at=Array.prototype.at; leaf[0]=37; leaf.length=1;
+         ok=ok&&p.at(0)===37;
+         leaf.at=at.bind({a:[41]}); ok=ok&&p.at(0)===41;
+         leaf.at=at;
+         var other={a:[43],at:at,size:size};
+         Object.defineProperty(leaf,'at',{get:function(){++seen;grow(400);p.inner=other;return at;}});
+         ok=ok&&p.at(0)===29&&seen===3&&p.at(0)===43;
+         delete other.a[0];
+         Object.defineProperty(Array.prototype,'0',{get:function(){++seen;return 47;},configurable:true});
+         var hole=p.at(0);delete Array.prototype[0];
+         ok&&hole===47&&seen===4;"
+    ).unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn delegated_read_calls_poll_without_loop_backedges() {
+    struct Stop;
+    impl super::Host for Stop {
+        fn interrupt(&mut self) -> bool {
+            true
+        }
+    }
+    let runtime = Runtime::with_host(Stop, RuntimeOptions::default());
+    let source = "var leaf={a:[3],at:function(i){return this.a[i];}};
+                  var p={inner:leaf,at:function(i){return this.inner.at(i);}};"
+        .to_owned()
+        + &"p.at(0);".repeat(2000);
+    assert_eq!(
+        runtime.context().eval(&source),
+        Err(RuntimeError::Interrupted)
+    );
+}
+
+#[test]
+fn planned_transfers_commit_once_after_selector_and_property_guards() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime.context().eval(
+        "var Mode={forward:1},reads=0,writes=0,coercions=0,stored;
+         function output(){return this.direction==Mode.forward?this.out:this.inputObject;}
+         function input(){return this.direction==Mode.forward?this.inputObject:this.out;}
+         function execute(){'use strict';this.output().value=this.input().value;}
+         function grow(n){return n?grow(n-1)+1:1;}
+         var x={tag:7},a={value:x},b={value:x};
+         var p={direction:1,inputObject:a,out:b,input:input,output:output,execute:execute},ok=true;
+         for(var i=0;i<30;i++) {
+             p.direction=i&1;
+             if(p.direction){a.value=i;b.value=-1;}else{b.value=i;a.value=-1;}
+             p.execute();ok=ok&&a.value===i&&b.value===i;
+         }
+         p.direction=1;a.value=x;b.value=null;p.execute();ok=ok&&b.value===x;
+         Object.defineProperty(a,'value',{get:function(){++reads;grow(300);return x;},configurable:true});
+         Object.defineProperty(b,'value',{set:function(v){++writes;stored=v;},configurable:true});
+         p.execute();ok=ok&&reads===1&&writes===1&&stored===x;
+         Mode.forward={valueOf:function(){++coercions;grow(300);return 1;}};
+         p.execute();ok=ok&&reads===2&&writes===2&&coercions===2;
+         Object.defineProperty(b,'value',{value:0,writable:false});
+         var threw=false;try{p.execute();}catch(e){threw=e instanceof TypeError;}
+         ok&&threw&&reads===3&&writes===2&&coercions===4&&b.value===0;"
+    ).unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn planned_transfers_preserve_method_lookup_order_and_live_replacements() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime.context().eval(
+        "var Mode={forward:1},seen=0;
+         function output(){return this.direction==Mode.forward?this.out:this.inputObject;}
+         function input(){return this.direction==Mode.forward?this.inputObject:this.out;}
+         function execute(){this.output().value=this.input().value;}
+         var a={value:13},b={value:7};
+         var p={direction:1,inputObject:a,out:b,input:input,output:output,execute:execute},ok=true;
+         for(var i=0;i<30;i++){p.execute();ok=ok&&b.value===13;}
+         b.value=7;
+         Object.defineProperty(p,'input',{get:function(){++seen;p.direction=0;return input;},configurable:true});
+         p.execute();ok=ok&&seen===1&&b.value===7&&a.value===13;
+         Object.defineProperty(p,'input',{value:Function('return this.inputObject'),writable:true});
+         p.direction=1;p.execute();ok=ok&&b.value===13;
+         p.input=input.bind({direction:1,inputObject:{value:17},out:b});
+         p.execute();ok&&b.value===17;"
+    ).unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn arithmetic_comparisons_complete_each_conversion_once() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime
+        .context()
+        .eval(
+            "function grow(n) { return n ? grow(n-1)+1 : 1; }
+         function inc(n) { for(var i=0;i<n;i++) {} return i; }
+         function add(n,s) { for(var i=0;i<n;i+=s) {} return i; }
+         function imm(n) { for(var i=2147483646;i<n;i+=1) {} return i; }
+         function text() { for(var i='';i<3;i+=1) {} return i; }
+         function big() { for(var i=0n;i<3n;i++) {} return i; }
+         var reads=0;
+         var bound={valueOf:function(){ ++reads; grow(600); return 3; }};
+         var step={valueOf:function(){ ++reads; grow(400); return 1; }};
+         inc(bound)===3 && reads===4 && add(3,step)===3 && reads===7
+             && imm(2147483650)===2147483650 && text()==='11' && big()===3n;",
+        )
+        .unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn read_only_call_plans_fall_back_on_accessor_invalidation_and_coercion() {
+    let runtime = Runtime::new();
+    if Runtime::GC_STRESS_AVAILABLE {
+        runtime.set_gc_stress(Some(1)).unwrap();
+    }
+    let result = runtime
+        .context()
+        .eval(
+            "function read(o) { return o.x; }
+         function chain(o) { return o.x.y; }
+         function less(a, b) { return a.x < b.x; }
+         var proto = { x: 3 }, a = Object.create(proto), b = { x: 7 }, c = { x: { y: 11 } };
+         var ok = true, reads = 0, conversions = 0;
+         for (var i = 0; i < 20; ++i) { ok = ok && read(a) === 3 && chain(c) === 11 && less(a, b); }
+         Object.defineProperty(proto, 'x', { get: function () { ++reads; return 5; } });
+         ok = ok && read(a) === 5 && less(a, b) && reads === 2;
+         b.x = { valueOf: function () { ++conversions; return 9; } };
+         ok = ok && less(a, b) && reads === 3 && conversions === 1;
+         Object.defineProperty(c.x, 'y', { get: function () { ++reads; throw 23; } });
+         try { chain(c); ok = false; } catch (e) { ok = ok && e === 23; }
+         ok && reads === 4;",
+        )
+        .unwrap();
+    assert_eq!(result, Value::Bool(true));
 }
 
 /// Defines a core host function as the global `name`, as the API's host
@@ -299,5 +837,41 @@ fn capture_stack_trace_and_the_limit_shape_a_backtrace() {
     assert_eq!(
         text,
         "h,<eval> k,<eval> TypeError TypeError <eval> \"\" 64:true:true:true 3 2 \"\" 64"
+    );
+}
+
+/// Runtimes made on several threads at once share their builtin names: the
+/// same atom for a name in each, from the process's table.
+/// (`ProcessAtoms`).
+#[test]
+fn runtimes_on_threads_share_the_builtin_names() {
+    let names = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    // The embedding API's host brings the process's table.
+                    let mut runtime = oxide_core::Runtime::with_host(
+                        oxide_core::RuntimeOptions::default(),
+                        Box::new(super::Host::into_core(super::SystemHost)),
+                    )
+                    .unwrap();
+                    let heap = runtime.heap_mut();
+                    ["length", "prototype", "toString", "fromCharCode"]
+                        .map(|name| heap.intern(name).unwrap())
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for other in &names[1..] {
+        assert_eq!(other, &names[0]);
+    }
+    assert!(
+        names[0]
+            .iter()
+            .all(|id| id.index() >= oxide_core::heap::shared::SHARED_BASE)
     );
 }

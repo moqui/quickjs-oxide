@@ -24,7 +24,11 @@ pub(super) fn install(cx: &mut Cx<'_>) -> Result<(), HeapError> {
         } else {
             error_constructor = Some(constructor);
             cx.set_intrinsic(crate::Intrinsic::Error, constructor);
-            methods(cx, constructor, &[Native::ErrorIsError, Native::ErrorCaptureStackTrace])?;
+            methods(
+                cx,
+                constructor,
+                &[Native::ErrorIsError, Native::ErrorCaptureStackTrace],
+            )?;
             // V8's `Error.stackTraceLimit`, a plain data property each
             // backtrace reads; it starts at the most frames a backtrace
             // lists, so a stack is QuickJS's until a script sets it.
@@ -173,7 +177,10 @@ pub(super) fn capture_stack_trace(cx: &mut Cx<'_>, site: CallSite) -> Result<Val
     let filter = site.arg(cx, 1);
     let frames = cx.heap.vm.frames.len();
     let omit = match filter.as_object() {
-        Some(function) => cx.heap.vm.frames
+        Some(function) => cx
+            .heap
+            .vm
+            .frames
             .iter()
             .rposition(|frame| frame.function == function)
             .map_or(frames, |index| frames - index),

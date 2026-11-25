@@ -10,11 +10,13 @@
 //! or job reaches it.
 
 pub mod builder;
+pub(crate) mod call_plan;
 pub mod disasm;
 pub mod opcode;
 pub mod validate;
 
-use std::fmt;
+use alloc::{boxed::Box, vec, vec::Vec};
+use core::fmt;
 
 pub use self::builder::CodeBuilder;
 pub use self::disasm::disassemble;
@@ -65,7 +67,7 @@ impl Insn {
     #[inline]
     pub const fn site(self) -> Option<u32> {
         match self.op {
-            Opcode::GetField | Opcode::SetField => Some(self.c as u32),
+            Opcode::GetField | Opcode::SetField | Opcode::NewObjectLit => Some(self.c as u32),
             Opcode::GetGlobal | Opcode::GetGlobalOrUndefined | Opcode::SetGlobal => {
                 Some(self.b as u32 | (self.c as u32) << 8)
             }
@@ -188,7 +190,7 @@ pub const NO_SPILL: u16 = u16::MAX;
 pub struct DebugInfo {
     pub name: Box<str>,
     /// The script or module the function belongs to, for `import()`.
-    pub filename: Option<std::sync::Arc<str>>,
+    pub filename: Option<alloc::sync::Arc<str>>,
     /// Where the instructions came from, sorted by `pc`: each entry holds
     /// for its instruction and the ones after it up to the next. Empty when
     /// the producer recorded none.
@@ -227,7 +229,7 @@ pub struct CodeUnit {
     /// They name nothing of the runtime, so every runtime that loaded the
     /// unit from one code image shares them (one hop from the unit, as the
     /// loop reads them at every frame entry).
-    pub code: std::sync::Arc<[Insn]>,
+    pub code: alloc::sync::Arc<[Insn]>,
     pub register_count: u16,
     pub parameter_count: u16,
     pub local_count: u16,
@@ -246,7 +248,7 @@ pub struct CodeUnit {
     /// The unit's first entry in the cache store, reserved when the unit is
     /// first entered ([`IC_UNRESERVED`] until then): a function that never
     /// runs holds no cache entries.
-    pub ic_base: std::cell::Cell<u32>,
+    pub ic_base: core::cell::Cell<u32>,
     /// Cache sites, numbered by [`CodeBuilder::finish`](builder::CodeBuilder::finish).
     pub ic_count: u32,
     /// Inner functions, by `MakeClosure` index. Published before the unit.
@@ -265,11 +267,11 @@ pub struct CodeUnit {
     /// the body. A unit loaded from a code image shares the image's table
     /// when its keys are the process's shared atoms
     /// ([`crate::image`]'s key tables).
-    pub keys: std::sync::Arc<[PropertyKey]>,
+    pub keys: alloc::sync::Arc<[PropertyKey]>,
     /// The tables that name nothing of a runtime, shared by every runtime
     /// that loaded the unit from one code image ([`crate::image`]); the
     /// unit reads them as its own fields ([`CodeUnit`] derefs to them).
-    pub body: std::sync::Arc<UnitBody>,
+    pub body: alloc::sync::Arc<UnitBody>,
 }
 
 /// The parts of a unit that name nothing of a runtime: held once for every
@@ -295,16 +297,16 @@ impl UnitBody {
     /// Bytes the tables hold.
     pub fn bytes(&self) -> usize {
         size_of::<UnitBody>()
-            + std::mem::size_of_val(&*self.handlers)
-            + std::mem::size_of_val(&*self.captures)
-            + std::mem::size_of_val(&*self.debug.positions)
+            + core::mem::size_of_val(&*self.handlers)
+            + core::mem::size_of_val(&*self.captures)
+            + core::mem::size_of_val(&*self.debug.positions)
             + self.debug.name.len()
             + self.source.as_ref().map_or(0, |source| source.len())
-            + std::mem::size_of_val(&*self.direct_eval_sites)
+            + core::mem::size_of_val(&*self.direct_eval_sites)
     }
 }
 
-impl std::ops::Deref for CodeUnit {
+impl core::ops::Deref for CodeUnit {
     type Target = UnitBody;
 
     #[inline(always)]
@@ -316,23 +318,23 @@ impl std::ops::Deref for CodeUnit {
 impl CodeUnit {
     /// The body to fill in while the unit is built (unshared then).
     pub fn body_mut(&mut self) -> &mut UnitBody {
-        std::sync::Arc::make_mut(&mut self.body)
+        alloc::sync::Arc::make_mut(&mut self.body)
     }
 
     /// Bytes the unit holds itself, without its body or its cache entries.
     pub fn own_bytes(&self) -> usize {
         size_of::<CodeUnit>()
             + self.own_keys_bytes()
-            + std::mem::size_of_val(&*self.children)
-            + std::mem::size_of_val(&*self.atoms)
+            + core::mem::size_of_val(&*self.children)
+            + core::mem::size_of_val(&*self.atoms)
     }
 }
 
 impl CodeUnit {
     /// The bytes of the key table when it is the unit's alone.
     pub fn own_keys_bytes(&self) -> usize {
-        if std::sync::Arc::strong_count(&self.keys) == 1 {
-            std::mem::size_of_val(&*self.keys)
+        if alloc::sync::Arc::strong_count(&self.keys) == 1 {
+            core::mem::size_of_val(&*self.keys)
         } else {
             0
         }
@@ -376,10 +378,10 @@ impl CodeUnitId {
 /// alive while the loop runs it across a collection.
 pub enum UnitRef<'a> {
     Static(&'a CodeUnit),
-    Dynamic(std::rc::Rc<CodeUnit>),
+    Dynamic(alloc::rc::Rc<CodeUnit>),
 }
 
-impl std::ops::Deref for UnitRef<'_> {
+impl core::ops::Deref for UnitRef<'_> {
     type Target = CodeUnit;
 
     #[inline(always)]
@@ -407,15 +409,28 @@ impl std::ops::Deref for UnitRef<'_> {
 /// every id.
 #[derive(Default)]
 pub struct CodeStore {
-    units: Vec<CodeUnit>,
+    units: Vec<StoredUnit>,
     overflow: Overflow,
+}
+
+/// A published unit with the short completion planned for it at publication.
+struct StoredUnit {
+    unit: CodeUnit,
+    call: call_plan::CallPlan,
+}
+
+impl StoredUnit {
+    fn new(unit: CodeUnit) -> Self {
+        let call = call_plan::CallPlan::of(&unit);
+        StoredUnit { unit, call }
+    }
 }
 
 /// Units published while the store was shared, in id order after the
 /// settled ones: `CHUNKS` chunks of `CHUNK` cells, each filled once.
 struct Overflow {
-    chunks: [std::cell::OnceCell<Box<[std::cell::OnceCell<CodeUnit>]>>; CHUNKS],
-    len: std::cell::Cell<u32>,
+    chunks: [core::cell::OnceCell<Box<[core::cell::OnceCell<StoredUnit>]>>; CHUNKS],
+    len: core::cell::Cell<u32>,
 }
 
 /// Units per overflow chunk.
@@ -428,15 +443,15 @@ const CHUNKS: usize = 256;
 impl Default for Overflow {
     fn default() -> Self {
         Overflow {
-            chunks: std::array::from_fn(|_| std::cell::OnceCell::new()),
-            len: std::cell::Cell::new(0),
+            chunks: core::array::from_fn(|_| core::cell::OnceCell::new()),
+            len: core::cell::Cell::new(0),
         }
     }
 }
 
 impl Overflow {
     #[inline]
-    fn get(&self, index: usize) -> Option<&CodeUnit> {
+    fn get(&self, index: usize) -> Option<&StoredUnit> {
         self.chunks
             .get(index / CHUNK)?
             .get()?
@@ -465,8 +480,8 @@ impl CodeStore {
         let index = self.overflow.len.get() as usize;
         let id = (self.units.len() + index) as u32;
         let cells = self.overflow.chunks[index / CHUNK]
-            .get_or_init(|| (0..CHUNK).map(|_| std::cell::OnceCell::new()).collect());
-        if cells[index % CHUNK].set(unit).is_err() {
+            .get_or_init(|| (0..CHUNK).map(|_| core::cell::OnceCell::new()).collect());
+        if cells[index % CHUNK].set(StoredUnit::new(unit)).is_err() {
             unreachable!("an overflow cell is filled once");
         }
         self.overflow.len.set(index as u32 + 1);
@@ -487,7 +502,7 @@ impl CodeStore {
             .ok()
             .filter(|&id| id < DYNAMIC)
             .expect("code store overflow");
-        self.units.push(unit);
+        self.units.push(StoredUnit::new(unit));
         CodeUnitId(id)
     }
 
@@ -503,7 +518,7 @@ impl CodeStore {
     #[cold]
     #[inline(never)]
     fn settle_overflow(&mut self) {
-        let overflow = std::mem::take(&mut self.overflow);
+        let overflow = core::mem::take(&mut self.overflow);
         let count = overflow.len.get() as usize;
         self.units.reserve(count);
         for chunk in overflow.chunks {
@@ -526,8 +541,11 @@ impl CodeStore {
             return None;
         }
         match self.units.get(id.0 as usize) {
-            Some(unit) => Some(unit),
-            None => self.overflow.get(id.0 as usize - self.units.len()),
+            Some(entry) => Some(&entry.unit),
+            None => self
+                .overflow
+                .get(id.0 as usize - self.units.len())
+                .map(|entry| &entry.unit),
         }
     }
 
@@ -537,15 +555,28 @@ impl CodeStore {
         debug_assert!(!id.is_dynamic(), "a unit of the code store");
         let index = id.0 as usize;
         if index >= self.units.len() {
-            return self.get_overflow(id);
+            return &self.get_overflow(id).unit;
         }
-        &self.units[index]
+        &self.units[index].unit
     }
 
     #[cold]
     #[inline(never)]
-    fn get_overflow(&self, id: CodeUnitId) -> &CodeUnit {
-        self.lookup(id).expect("a published unit")
+    fn get_overflow(&self, id: CodeUnitId) -> &StoredUnit {
+        self.overflow
+            .get(id.0 as usize - self.units.len())
+            .expect("a published unit")
+    }
+
+    #[inline]
+    pub(crate) fn call_entry(&self, id: CodeUnitId) -> (&CodeUnit, &call_plan::CallPlan) {
+        debug_assert!(!id.is_dynamic(), "a static call plan");
+        let index = id.0 as usize;
+        let entry = match self.units.get(index) {
+            Some(entry) => entry,
+            None => self.get_overflow(id),
+        };
+        (&entry.unit, &entry.call)
     }
 
     pub fn len(&self) -> usize {
@@ -655,12 +686,12 @@ impl CodeUnit {
 
     /// Bytes of what a code image shares: the instructions and the body.
     pub fn shared_bytes(&self) -> usize {
-        std::mem::size_of_val(&*self.code) + self.body.bytes()
+        core::mem::size_of_val(&*self.code) + self.body.bytes()
     }
 
     /// Whether the instructions and the body are this unit's alone.
     pub fn owns_shared(&self) -> bool {
-        std::sync::Arc::strong_count(&self.body) == 1
-            && std::sync::Arc::strong_count(&self.code) == 1
+        alloc::sync::Arc::strong_count(&self.body) == 1
+            && alloc::sync::Arc::strong_count(&self.code) == 1
     }
 }

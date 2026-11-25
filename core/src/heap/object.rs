@@ -1,5 +1,7 @@
 //! Object headers and the kind-specific payload arenas.
 
+use alloc::{boxed::Box, vec::Vec};
+
 use super::arena::{Arena, Record};
 use super::values::Range;
 use crate::value::{ShapeId, Value};
@@ -355,7 +357,7 @@ pub enum InternalData {
     /// A collection's index; its entries are the record's slots.
     Table(Box<super::table::Table>),
     /// A collection iterator's position, moved by compactions.
-    Cursor(std::rc::Rc<std::cell::Cell<u32>>),
+    Cursor(alloc::rc::Rc<core::cell::Cell<u32>>),
     /// An `ArrayBuffer` or `SharedArrayBuffer`.
     Buffer(Box<super::buffer::Buffer>),
     /// A typed array's or `DataView`'s window; slot 0 is the buffer.
@@ -369,7 +371,7 @@ pub enum InternalData {
     HostFn(crate::vm::native::HostBody),
     /// An embedder's value attached to a host object
     /// (`InternalTag::HostData`).
-    HostData(std::rc::Rc<dyn std::any::Any>),
+    HostData(alloc::rc::Rc<dyn core::any::Any>),
     /// A host exotic object's class and datum (`InternalTag::HostData` of
     /// an `ObjectKind::HostExotic`).
     HostExotic(crate::vm::exotic::HostExotic),

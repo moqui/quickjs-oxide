@@ -37,6 +37,13 @@ The shared table is a segmented array: segment `k` holds `2^k` records and is se
 record with no lock, and a record never moves. Inserting takes a mutex around a text-to-id map. This is safe Rust; the
 workspace forbids `unsafe`.
 
+The core is `no_std` and has no lock of its own, so the table is the host's: the core defines the
+`heap::shared::SharedAtoms` trait and `Host::shared_atoms` hands a runtime its table as the runtime is made, before the
+first atom. The embedding API's `ProcessAtoms` (`src/engine/api/core/shared_atoms.rs`) is the segmented array above,
+with std's `OnceLock` and `Mutex`, and its host adapter gives it to every runtime it makes. A core runtime made without
+a table keeps every atom to itself. A code image unit's shared key table is a set-once slot the table makes
+(`SharedAtoms::key_slot`).
+
 `StringRecord` must be `Sync` to live in the shared table:
 - its `hash: Cell<u32>` becomes an `AtomicU32`, read `Relaxed`;
 - its `flat: OnceCell` becomes a `OnceLock`, whose `get` is one acquire load;

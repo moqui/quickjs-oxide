@@ -17,7 +17,10 @@
 //! image is `Send + Sync` and cheap to clone: a process keeps one per script
 //! and every thread's runtime loads it.
 
-use std::sync::Arc;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::bytecode::{CodeUnit, CodeUnitId, Format, Insn, UnitBody};
 use crate::heap::Heap;
@@ -30,8 +33,8 @@ use crate::value::{BytecodeId, Kind, ObjectId, Value};
 #[derive(Clone)]
 pub struct CodeImage(pub(crate) Arc<ImageData>);
 
-impl std::fmt::Debug for CodeImage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for CodeImage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CodeImage")
             .field("units", &self.0.units.len())
             .field("atoms", &self.0.atoms.len())
@@ -60,7 +63,8 @@ pub(crate) struct ImageUnit {
     /// first load whose keys are all the process's shared atoms (or array
     /// indices), so the same in every runtime that has no atom of its own
     /// for one of their texts. Such a runtime builds its own table.
-    pub(crate) shared_keys: std::sync::OnceLock<Arc<[crate::PropertyKey]>>,
+    /// The slot comes from the shared table ([`crate::heap::shared::KeySlot`]).
+    pub(crate) shared_keys: Arc<dyn crate::heap::shared::KeySlot>,
     /// The instructions, shared with every runtime that loads the image.
     pub(crate) code: Arc<[Insn]>,
     pub(crate) counts: Counts,
@@ -128,8 +132,8 @@ pub enum LoadError {
     Heap(crate::HeapError),
 }
 
-impl std::fmt::Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             LoadError::Malformed(what) => write!(f, "malformed code image: {what}"),
             LoadError::Invalid(error) => write!(f, "invalid code image: {error}"),
@@ -138,7 +142,7 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-impl std::error::Error for LoadError {}
+impl core::error::Error for LoadError {}
 
 impl From<crate::HeapError> for LoadError {
     fn from(error: crate::HeapError) -> Self {
@@ -155,8 +159,8 @@ pub enum EncodeError {
     Constant(&'static str),
 }
 
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             EncodeError::NotBytecode => f.write_str("not a compiled script"),
             EncodeError::Constant(kind) => write!(f, "a constant of kind {kind}"),
@@ -164,7 +168,7 @@ impl std::fmt::Display for EncodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl core::error::Error for EncodeError {}
 
 impl CodeImage {
     /// A copy of the image with one part broken, for the loader's tests:
@@ -272,11 +276,11 @@ impl CodeImage {
             .units
             .iter()
             .map(|unit| {
-                std::mem::size_of::<ImageUnit>()
-                    + std::mem::size_of_val(&*unit.keys)
-                    + std::mem::size_of_val(&*unit.children)
-                    + std::mem::size_of_val(&*unit.constants)
-                    + std::mem::size_of_val(&*unit.code)
+                core::mem::size_of::<ImageUnit>()
+                    + core::mem::size_of_val(&*unit.keys)
+                    + core::mem::size_of_val(&*unit.children)
+                    + core::mem::size_of_val(&*unit.constants)
+                    + core::mem::size_of_val(&*unit.code)
                     + unit.body.bytes()
             })
             .sum();
@@ -387,7 +391,7 @@ impl Encoder<'_> {
         }
         self.out[index as usize] = Some(ImageUnit {
             keys: keys.into(),
-            shared_keys: std::sync::OnceLock::new(),
+            shared_keys: Arc::from(self.heap.strings.shared().key_slot()),
             code,
             counts,
             body,
@@ -647,7 +651,7 @@ impl<'i> Loader<'i> {
             constant_count: counts.constant_count,
             spill_register: counts.spill_register,
             spill_slots: counts.spill_slots,
-            ic_base: std::cell::Cell::new(crate::bytecode::IC_UNRESERVED),
+            ic_base: core::cell::Cell::new(crate::bytecode::IC_UNRESERVED),
             ic_count: counts.ic_count,
             children: unit
                 .children
@@ -728,7 +732,7 @@ impl<'i> Loader<'i> {
         if shareable {
             // Another thread's load may have set it meanwhile: either holds
             // the same keys.
-            return Ok(Arc::clone(source.shared_keys.get_or_init(|| keys)));
+            return Ok(source.shared_keys.get_or_init(keys));
         }
         Ok(keys)
     }

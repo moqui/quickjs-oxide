@@ -3,7 +3,7 @@
 //! A failure is an internal error of the lowering, never a JavaScript
 //! exception.
 
-use std::fmt;
+use core::fmt;
 
 use super::{Capture, CodeUnit, Format, NO_SPILL, Opcode, flags};
 
@@ -64,7 +64,7 @@ impl fmt::Display for ValidateError {
     }
 }
 
-impl std::error::Error for ValidateError {}
+impl core::error::Error for ValidateError {}
 
 fn fail<T>(at: Option<u32>, kind: ValidateErrorKind) -> Result<T, ValidateError> {
     Err(ValidateError { at, kind })
@@ -160,8 +160,11 @@ pub fn validate<'a>(
             Format::AConst => {
                 register(insn.a)?;
                 // A regular expression reads its source and its flags.
-                let last = insn.imm as u64 + u64::from(insn.op == Opcode::NewRegExp);
-                if last >= u64::from(unit.constant_count) {
+                let count = match insn.op {
+                    Opcode::NewRegExp => 2,
+                    _ => 1,
+                };
+                if u64::from(insn.imm) + count > u64::from(unit.constant_count) {
                     return fail(at, E::Constant(insn.imm));
                 }
             }
@@ -169,6 +172,13 @@ pub fn validate<'a>(
                 register(insn.a)?;
                 if insn.imm > 0 && insn.b as u64 + insn.imm as u64 > registers as u64 {
                     return fail(at, E::RegisterRange);
+                }
+            }
+            Format::AConstRange => {
+                register(insn.a)?;
+                let count = u16::from_le_bytes([insn.b, insn.c]);
+                if u64::from(insn.imm) + u64::from(count) > u64::from(unit.constant_count) {
+                    return fail(at, E::Constant(insn.imm));
                 }
             }
             Format::AChild => {
@@ -206,6 +216,14 @@ pub fn validate<'a>(
                     return fail(at, E::WideRegister(insn.imm));
                 }
             }
+        }
+        if insn.op == Opcode::FinishObjectLit
+            && !unit
+                .code
+                .get(insn.imm as usize)
+                .is_some_and(|creator| creator.op == Opcode::NewObjectLit && creator.a == insn.a)
+        {
+            return fail(at, E::Target(insn.imm));
         }
         // A spill access names the unit's spill register and one of its slots.
         if matches!(

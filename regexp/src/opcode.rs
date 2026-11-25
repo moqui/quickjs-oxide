@@ -2,14 +2,33 @@
 //!
 //! The instruction families are a typed Rust analogue of pinned QuickJS
 //! `libregexp-opcode.h`. Absolute instruction indices replace the C engine's
-//! packed relative byte offsets; greediness is represented by `Split` branch
-//! order instead of separate `split_*_first` opcodes.
+//! packed relative byte offsets. General quantifiers encode greediness through
+//! `Split` branch order; eligible class quantifiers use a fused scan descriptor.
+
+use alloc::boxed::Box;
 
 /// Inclusive Unicode scalar or UTF-16 code-unit interval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CharacterRange {
     pub start: u32,
     pub end: u32,
+}
+
+/// A capture-free, single-character class repeated in the forward direction.
+/// The bitmap includes case folding for ASCII input; other input uses ranges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassRepeat {
+    pub(crate) ranges: Box<[CharacterRange]>,
+    pub(crate) ascii: [u64; 2],
+    pub(crate) inverted: bool,
+    pub(crate) ignore_case: bool,
+    pub(crate) minimum: u32,
+    pub(crate) maximum: Option<u32>,
+    pub(crate) greedy: bool,
+    /// A greedy repeat whose continuation cannot read a character of its
+    /// set: a character given back would be rejected at once, so it keeps
+    /// no backtrack frame. Set by the compiler's last pass.
+    pub(crate) possessive: bool,
 }
 
 impl CharacterRange {
@@ -39,6 +58,9 @@ pub enum Instruction {
         inverted: bool,
         ignore_case: bool,
     },
+    /// Fused fixed, greedy or lazy class repetition. Box the cold descriptor
+    /// to keep the common instruction representation from growing.
+    ClassRepeat(Box<ClassRepeat>),
     LineStart {
         multiline: bool,
     },
@@ -114,18 +136,5 @@ pub enum Instruction {
     /// Fail this branch if the input position still equals the saved value.
     CheckAdvance {
         register: u8,
-    },
-    /// A greedy loop over the one-character instruction after it (`Char`,
-    /// `Dot`, `Any`, `Space` or `Range`, at `pc + 1`): matches it as often
-    /// as it can, at least `min` and at most `max` times (`u32::MAX` for no
-    /// bound), and goes on at `pc + 2`. One backtrack record gives the
-    /// characters past `min` back one at a time, where QuickJS keeps a
-    /// `split` frame for each; a `possessive` loop keeps none, the compiler
-    /// having shown that no continuation can match once one is given back.
-    /// Not in QuickJS's set.
-    CharLoop {
-        min: u32,
-        max: u32,
-        possessive: bool,
     },
 }

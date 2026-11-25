@@ -13,7 +13,8 @@
 //! atoms whose record caches the index, so key ordering still treats them as
 //! indices.
 
-use std::fmt;
+use alloc::{vec, vec::Vec};
+use core::fmt;
 
 use super::hash::FxHashMap;
 use super::string::{StringRepr, Strings};

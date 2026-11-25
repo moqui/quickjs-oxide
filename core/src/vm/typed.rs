@@ -1,10 +1,13 @@
 //! Typed-array elements: the integer-indexed exotic object's element reads and
 //! writes, the element conversions, and the loop's inline paths.
 
+use alloc::vec::Vec;
+
 use super::{Cx, Throw, error, number, ops};
 use crate::heap::Heap;
+use crate::heap::arena::Arena;
 use crate::heap::buffer::{Buffer, ElementKind, View};
-use crate::heap::object::InternalData;
+use crate::heap::object::{Internal, InternalData, ObjectHeader};
 use crate::value::{ObjectId, Value};
 use crate::vm::bigint::Big;
 use crate::{KeyKind, PropertyKey};
@@ -86,7 +89,10 @@ pub(crate) fn numeric_index(heap: &Heap, key: PropertyKey) -> Option<f64> {
 /// `IsValidIntegerIndex(O, index)`: the element position.
 #[inline]
 pub(crate) fn valid_index(heap: &Heap, object: ObjectId, index: f64) -> Option<usize> {
-    if index.fract() != 0.0 || (index == 0.0 && index.is_sign_negative()) || index < 0.0 {
+    if crate::float::fract(index) != 0.0
+        || (index == 0.0 && index.is_sign_negative())
+        || index < 0.0
+    {
         return None;
     }
     let length = length(heap, object)?;
@@ -151,7 +157,7 @@ fn uint8_clamp(value: f64) -> u8 {
     if value >= 255.0 {
         return 255;
     }
-    let floor = value.floor();
+    let floor = crate::float::floor(value);
     let half = floor + 0.5;
     if value < half {
         floor as u8
@@ -243,16 +249,38 @@ pub(crate) fn write_converted(heap: &mut Heap, object: ObjectId, index: f64, byt
 
 // ---- the loop's inline paths ----
 
+/// The fast paths borrow no register storage and perform no allocation or
+/// JavaScript call. The loop can keep its register window across a hit.
+#[inline(always)]
+fn fast_internal<'a>(
+    objects: &Arena<ObjectHeader>,
+    internals: &'a Arena<Internal>,
+    object: ObjectId,
+) -> &'a Internal {
+    let header = objects.get(object.index());
+    debug_assert!(header.kind.has_internal(), "{:?}", header.kind);
+    internals.get(header.payload)
+}
+
 /// `a[i]` for a typed array and an int32 index: the element, or `None` to
 /// take the slow path (BigInt kinds, out-of-range or detached reads, which
 /// give `undefined` there).
 #[inline(never)]
-pub(crate) fn fast_get(heap: &Heap, object: ObjectId, index: u32) -> Option<Value> {
-    let internal = heap.internal(object);
+pub(crate) fn fast_get(
+    objects: &Arena<ObjectHeader>,
+    internals: &Arena<Internal>,
+    object: ObjectId,
+    index: u32,
+) -> Option<Value> {
+    let internal = fast_internal(objects, internals, object);
     let InternalData::View(view) = internal.data else {
         return None;
     };
-    let store = buffer(heap, internal.slots[0].as_object()?);
+    let InternalData::Buffer(store) =
+        &fast_internal(objects, internals, internal.slots[0].as_object()?).data
+    else {
+        unreachable!("a buffer");
+    };
     let size = view.kind.size();
     let length = view.current_length(store.len(), store.detached, size)?;
     if index as usize >= length {
@@ -285,11 +313,17 @@ pub(crate) fn fast_get(heap: &Heap, object: ObjectId, index: u32) -> Option<Valu
 /// `a[i] = v` for a typed array, an int32 index and a number: whether it
 /// was done (otherwise the slow path converts and writes).
 #[inline(never)]
-pub(crate) fn fast_set(heap: &mut Heap, object: ObjectId, index: u32, value: Value) -> bool {
+pub(crate) fn fast_set(
+    objects: &Arena<ObjectHeader>,
+    internals: &mut Arena<Internal>,
+    object: ObjectId,
+    index: u32,
+    value: Value,
+) -> bool {
     let Some(number) = value.as_f64() else {
         return false;
     };
-    let internal = heap.internal(object);
+    let internal = fast_internal(objects, internals, object);
     let InternalData::View(view) = internal.data else {
         return false;
     };
@@ -299,7 +333,11 @@ pub(crate) fn fast_set(heap: &mut Heap, object: ObjectId, index: u32, value: Val
     let Some(store) = internal.slots[0].as_object() else {
         return false;
     };
-    let buffer = buffer_mut(heap, store);
+    let header = objects.get(store.index());
+    debug_assert!(header.kind.has_internal(), "{:?}", header.kind);
+    let InternalData::Buffer(buffer) = &mut internals.get_mut(header.payload).data else {
+        unreachable!("a buffer");
+    };
     let size = view.kind.size();
     let Some(length) = view.current_length(buffer.len(), buffer.detached, size) else {
         // A write to an out-of-bounds view is dropped, after `ToNumber`,

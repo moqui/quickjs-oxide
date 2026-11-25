@@ -9,6 +9,12 @@
 //! slow paths call them through the re-entrant [`call`](super::call). No
 //! accessor is cached.
 
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+
 use super::error;
 use super::ic::{IcEntry, IcKind, STRING_RECEIVER_TAG};
 use super::{Cx, Throw};
@@ -333,6 +339,7 @@ pub(crate) fn get_cached(
             );
             if let Some(value) = hit {
                 cx.heap.ics.count_poly_hit(IcKind::Get);
+                cx.heap.ics.promote(site, entry);
                 return Ok(value);
             }
         }
@@ -488,6 +495,7 @@ pub(crate) fn set_cached(
                 value,
             ) {
                 heap.ics.count_poly_hit(IcKind::Set);
+                heap.ics.promote(site, entry);
                 return Ok(());
             }
         }
